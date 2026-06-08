@@ -2,6 +2,10 @@
    Wonder DQ Console — Variant B (Guided Triage)
    Warm, friendly, low-cognitive-load styling.
    ========================================================= */
+/* The `hidden` attribute must always win over component display rules
+   (e.g. .modal-overlay sets display:flex). Without this, hidden modals
+   render on load and intercept all clicks. */
+[hidden] { display: none !important; }
 :root {
   --bg: #f6f4ef;            /* warm paper */
   --surface: #ffffff;

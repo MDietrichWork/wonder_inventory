@@ -28,3 +28,6 @@ A living log of the project. **Updated at every step** with what was completed (
 - Each variant lives in its own folder so the losing options can simply be deleted after selection.
 - Wrote `README.md` (project overview), `prototypes/README.md` (how to open + how to choose), and this `PROCESS.md`.
 - Validated all prototype JS files parse cleanly (JavaScriptCore) with no external/CDN dependencies and only local asset references.
+- Set up a headless-browser QA harness (Python venv at `~/.wonder-tools-venv` + Playwright/Chromium; driver script at `tooling/shoot.py`) and drove all three prototypes end-to-end — clicking through every nav screen, screenshotting each, and capturing console/runtime errors.
+  - Result: **all four screens render in every variant with zero console errors and zero runtime errors.**
+  - **Bug found & fixed in Variant B:** three modal overlays were rendering on load and intercepting all clicks because `.modal-overlay { display:flex }` overrode the `hidden` attribute. Fixed with a global `[hidden] { display: none !important; }` rule in `variant-b-guided-triage/styles.css`; re-verified clean.

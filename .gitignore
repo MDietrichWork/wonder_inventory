@@ -1,0 +1,43 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Node (future frontend)
+node_modules/
+dist/
+build/
+npm-debug.log*
+yarn-error.log*
+
+# Environment / secrets — never commit these
+.env
+.env.*
+*.local
+secrets.json
+service-account*.json
+*.pem
+*.key
+
+# Local tooling artifacts
+/tmp/
+*.log
+
+# Playwright (browsers are cached in ~/Library/Caches, not the repo)
+playwright-report/
+test-results/
