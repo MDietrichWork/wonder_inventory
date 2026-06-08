@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Wonder Inventory Data-Quality Console — Variant A</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div class="app">
+  <!-- Brand -->
+  <div class="brand">
+    <div class="logo">W</div>
+    <div>
+      <div class="name">Wonder DQ Console</div>
+      <div class="sub">Inventory Data-Quality</div>
+    </div>
+  </div>
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <span class="run-pill"><span class="dot"></span> Validation run <b id="run-date">2026-06-07</b> · processed <b id="today-date">2026-06-08</b></span>
+    <span class="run-pill">JIRA project <b>WIQ</b></span>
+    <span class="spacer"></span>
+    <span class="tip">Press <span class="kbd">1</span>–<span class="kbd">4</span> to switch screens · <span class="kbd">/</span> to search · <span class="kbd">Esc</span> to close</span>
+    <span class="user"><span class="avatar">MD</span> Mike Dietrich · Accounting</span>
+  </header>
+
+  <!-- Sidebar nav -->
+  <nav class="sidebar" aria-label="Primary">
+    <div class="nav-section">Workspace</div>
+    <button class="nav-item active" data-view="home"><span class="nico">▣</span> Home</button>
+    <button class="nav-item" data-view="workbench"><span class="nico">▤</span> Exception Workbench <span class="badge" id="nav-open-count">0</span></button>
+    <button class="nav-item" data-view="dashboard"><span class="nico">▦</span> Reporting Dashboard</button>
+    <button class="nav-item" data-view="sla"><span class="nico">◷</span> Turnaround / SLA</button>
+    <div class="nav-section">Configuration</div>
+    <button class="nav-item" data-view="admin"><span class="nico">⚙</span> Rule &amp; Routing Admin</button>
+    <div class="grow"></div>
+    <div class="legend">
+      Severity
+      <div class="lg"><span class="sev-dot Critical"></span> Critical · 1d SLA</div>
+      <div class="lg"><span class="sev-dot High"></span> High · 3d SLA</div>
+      <div class="lg"><span class="sev-dot Medium"></span> Medium · 5d SLA</div>
+      <div class="lg"><span class="sev-dot Low"></span> Low · 10d SLA</div>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- HOME -->
+    <section class="view active" id="view-home">
+      <div class="page-head">
+        <h1>Wonder Inventory Data-Quality Console</h1>
+        <p>
+          Wonder Group has no central ERP. A synthetic <b>unified inventory ledger</b> plus a <b>purchase-order (PO) table</b> in
+          BigQuery serve as the sub-ledger that Accounting uses to book the general ledger at month-end. Each morning a batch job
+          validates the <b>prior day's</b> data, flags errors, and auto-creates JIRA tickets routed to the right team and person. It
+          tracks how long tickets take to resolve (turnaround / SLA), spots recurring errors, and <b>auto-closes</b> tickets once Data
+          Engineering fixes the underlying table and the issue stops reproducing. This console is where staff across the company triage
+          those exceptions and where managers track performance.
+        </p>
+      </div>
+      <div class="scroll-pad">
+        <div class="kpi-row" id="home-kpis"></div>
+        <div class="panels">
+          <div class="card">
+            <h2>Start here <span class="hint">jump into a screen</span></h2>
+            <div class="hbars" id="home-jump"></div>
+          </div>
+          <div class="card">
+            <h2>Today at a glance</h2>
+            <div class="kv" id="home-glance"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>How the daily pipeline works</h2>
+          <ol style="margin:0;padding-left:18px;color:var(--text-dim);line-height:1.9;font-size:12.5px;">
+            <li><b>Ingest &amp; validate:</b> overnight batch reads the prior day's <code style="font-family:var(--mono)">unified_ledger</code> &amp; <code style="font-family:var(--mono)">po_table</code> and runs configured rules (NOT_NULL, REFERENTIAL, RECONCILIATION, RANGE).</li>
+            <li><b>Flag &amp; route:</b> each failing row becomes an exception and is routed by error type to a team / default assignee, with a JIRA ticket auto-created in project <b>WIQ</b>.</li>
+            <li><b>Triage:</b> owners work tickets in the <b>Exception Workbench</b> — reassign, override routing, add notes, open in JIRA.</li>
+            <li><b>Track:</b> managers watch turnaround &amp; SLA breaches per team / person and recurring-error fingerprints.</li>
+            <li><b>Auto-close:</b> when a fixed issue no longer reproduces on the next run, its ticket is <b>auto-closed</b> by the validator.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- WORKBENCH -->
+    <section class="view" id="view-workbench">
+      <div class="page-head">
+        <h1>Exception Workbench</h1>
+        <p>Triage flagged validation errors from the latest runs. Filter, sort, multi-select for bulk actions, and click any row for the full snapshot, rule, and JIRA timeline.</p>
+      </div>
+
+      <div class="toolbar" id="wb-toolbar">
+        <label class="flt">Search <input type="search" id="f-search" placeholder="Error ID, SKU, PO, JIRA…" /></label>
+        <span class="vline"></span>
+        <label class="flt">Facility <select id="f-facility"></select></label>
+        <label class="flt">System <select id="f-system"></select></label>
+        <label class="flt">Error type <select id="f-errortype"></select></label>
+        <label class="flt">Severity <select id="f-severity"></select></label>
+        <label class="flt">Status <select id="f-status"></select></label>
+        <label class="flt">Team <select id="f-team"></select></label>
+        <span class="vline"></span>
+        <button class="btn ghost sm" id="f-clear">Clear filters</button>
+        <span class="spacer"></span>
+        <span class="result-meta" id="wb-result-meta"></span>
+      </div>
+
+      <div class="bulkbar" id="bulkbar">
+        <span class="count" id="bulk-count">0 selected</span>
+        <button class="btn sm" id="bulk-reassign">Reassign…</button>
+        <button class="btn sm" id="bulk-comment">Bulk comment…</button>
+        <button class="btn sm" id="bulk-resolve">Mark resolved</button>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" id="bulk-clear">Clear selection</button>
+      </div>
+
+      <div class="grid-wrap">
+        <table class="grid" id="wb-grid">
+          <thead><tr id="wb-head"></tr></thead>
+          <tbody id="wb-body"></tbody>
+        </table>
+        <div class="empty" id="wb-empty" style="display:none;">No exceptions match the current filters.</div>
+      </div>
+    </section>
+
+    <!-- DASHBOARD -->
+    <section class="view" id="view-dashboard">
+      <div class="page-head">
+        <h1>Reporting Dashboard</h1>
+        <p>Volume, trend, and composition of data-quality exceptions across facilities and systems.</p>
+      </div>
+      <div class="scroll-pad">
+        <div class="kpi-row" id="dash-kpis"></div>
+        <div class="panels">
+          <div class="card">
+            <h2>Error trend <span class="hint">new exceptions / day · last 14 days</span></h2>
+            <div id="trend-chart"></div>
+          </div>
+          <div class="card">
+            <h2>Errors by severity</h2>
+            <div class="hbars" id="sev-bars"></div>
+          </div>
+        </div>
+        <div class="panels equal">
+          <div class="card">
+            <h2>Errors by type</h2>
+            <div class="hbars" id="type-bars"></div>
+          </div>
+          <div class="card">
+            <h2>Errors by facility</h2>
+            <div class="hbars" id="facility-bars"></div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Recurring-error leaderboard <span class="hint">same fingerprint (error type @ facility) over 30 days</span></h2>
+          <table class="mini" id="recurring-table">
+            <thead><tr><th>Fingerprint</th><th>Routed team</th><th>Last seen</th><th class="num">Recurrences (30d)</th><th style="width:30%">Frequency</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- SLA -->
+    <section class="view" id="view-sla">
+      <div class="page-head">
+        <h1>Ticket Turnaround / SLA</h1>
+        <p>Resolution performance per team and per person, aging of open tickets, and who is falling behind on SLA targets.</p>
+      </div>
+      <div class="scroll-pad">
+        <h2 style="font-size:12px;color:var(--text-faint);text-transform:uppercase;letter-spacing:.7px;margin:0 0 10px;">Open ticket aging</h2>
+        <div class="buckets" id="aging-buckets"></div>
+
+        <div class="panels equal">
+          <div class="card">
+            <h2>By team <span class="hint">avg turnaround &amp; SLA compliance</span></h2>
+            <table class="mini" id="team-sla">
+              <thead><tr><th>Team</th><th class="num">Open</th><th class="num">Avg turnaround</th><th class="num">Within SLA</th><th class="num">Breaching</th><th class="num">% within</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <h2>By person <span class="hint">who is falling behind</span></h2>
+            <table class="mini" id="person-sla">
+              <thead><tr><th>Assignee</th><th>Team</th><th class="num">Open</th><th class="num">Breaching</th><th class="num">Avg age (open)</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Overdue open tickets <span class="hint">age exceeds severity SLA target</span></h2>
+          <table class="mini" id="overdue-table">
+            <thead><tr><th>Error ID</th><th>JIRA</th><th>Type</th><th>Severity</th><th>Assignee</th><th class="num">Age</th><th class="num">SLA</th><th class="num">Over by</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ADMIN -->
+    <section class="view" id="view-admin">
+      <div class="page-head">
+        <h1>Rule &amp; Routing Admin</h1>
+        <p>The configurable layer: validation rules, the error-type → team → assignee → JIRA routing map, and SLA targets per severity. Editing is mocked in this prototype.</p>
+      </div>
+      <div class="scroll-pad">
+        <div class="admin-grid">
+          <div class="card">
+            <h2>Validation rules</h2>
+            <table class="mini" id="rules-table">
+              <thead><tr><th>Rule</th><th>Type</th><th>Target table</th><th>Severity</th><th class="num">Enabled</th></tr></thead>
+              <tbody></tbody>
+            </table>
+            <div class="muted-note">Click a rule to load it into the editor (read-only mock).</div>
+          </div>
+          <div class="card" id="rule-editor">
+            <h2>Rule editor</h2>
+            <div id="rule-form"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+          <h2>Routing map <span class="hint">error type → team → assignee → JIRA project / component</span></h2>
+          <table class="mini" id="routing-table">
+            <thead><tr><th>Error type</th><th>Routed team</th><th>Default assignee</th><th>JIRA project</th><th>Component</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+          <h2>SLA targets per severity</h2>
+          <table class="mini" id="sla-targets-table" style="max-width:420px;">
+            <thead><tr><th>Severity</th><th class="num">Resolution target</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Detail drawer -->
+<div class="drawer-scrim" id="drawer-scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true" role="dialog" aria-label="Exception detail">
+  <div class="drawer-head">
+    <div>
+      <div class="drawer-title" id="dr-id">ERR-0000</div>
+      <div class="drawer-sub" id="dr-sub"></div>
+    </div>
+    <button class="btn ghost sm x" id="dr-close" aria-label="Close detail">✕ Esc</button>
+  </div>
+  <div class="drawer-body" id="dr-body"></div>
+  <div class="drawer-actions">
+    <button class="btn primary sm" id="dr-jira">Open in JIRA ↗</button>
+    <button class="btn sm" id="dr-reassign">Reassign</button>
+    <button class="btn sm" id="dr-override">Override routing</button>
+    <button class="btn sm" id="dr-note">Add note</button>
+  </div>
+</aside>
+
+<div class="proto-banner">PROTOTYPE · <b>Variant A (Dense Workbench)</b> · sample data</div>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

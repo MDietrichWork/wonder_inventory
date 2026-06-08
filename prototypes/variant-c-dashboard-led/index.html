@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Wonder Inventory Data-Quality Console — Variant C</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="proto-badge" role="note">PROTOTYPE · Variant C (Dashboard-Led) · sample data</div>
+
+<div class="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">WIQ</div>
+      <div class="brand-text">
+        <div class="brand-title">Wonder DQ Console</div>
+        <div class="brand-sub">Inventory Data-Quality</div>
+      </div>
+    </div>
+
+    <nav class="nav" aria-label="Primary">
+      <button class="nav-item active" data-view="dashboard">
+        <span class="nav-ico">▦</span> Reporting Dashboard
+      </button>
+      <button class="nav-item" data-view="exceptions">
+        <span class="nav-ico">▤</span> Exception List
+      </button>
+      <button class="nav-item" data-view="sla">
+        <span class="nav-ico">◴</span> Turnaround / SLA
+      </button>
+      <button class="nav-item" data-view="admin">
+        <span class="nav-ico">⚙</span> Rule &amp; Routing Admin
+      </button>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="run-pill">
+        <span class="dot ok"></span>
+        <div>
+          <div class="run-label">Last validation run</div>
+          <div class="run-date" id="runDate">run_date 2026-06-07</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <div class="crumb" id="crumb">Reporting</div>
+        <h1 class="page-title" id="pageTitle">Reporting Dashboard</h1>
+      </div>
+      <div class="topbar-right">
+        <div class="search"><span>⌕</span><input placeholder="Search exceptions, JIRA keys…" disabled /></div>
+        <div class="user"><div class="avatar">MD</div><span>Mike Dietrich</span></div>
+      </div>
+    </header>
+
+    <div class="scroll">
+      <!-- ============ DASHBOARD ============ -->
+      <section class="view active" id="view-dashboard"></section>
+
+      <!-- ============ EXCEPTIONS ============ -->
+      <section class="view" id="view-exceptions"></section>
+
+      <!-- ============ SLA ============ -->
+      <section class="view" id="view-sla"></section>
+
+      <!-- ============ ADMIN ============ -->
+      <section class="view" id="view-admin"></section>
+    </div>
+  </main>
+</div>
+
+<!-- Detail drawer (exception detail) -->
+<div class="drawer-scrim" id="drawerScrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true"></aside>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
