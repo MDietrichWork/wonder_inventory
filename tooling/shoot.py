@@ -5,7 +5,7 @@ from playwright.sync_api import sync_playwright
 
 ROOT = pathlib.Path("/Users/mikedietrich/Eliassen Clients/Wonder Group/prototypes")
 OUT = pathlib.Path("/tmp/wonder-shots")
-VARIANTS = ["variant-a-dense-workbench", "variant-b-guided-triage", "variant-c-dashboard-led"]
+VARIANTS = ["variant-a-dense-workbench", "variant-b-inbox", "variant-c-dashboard-led"]
 NAV_SEL = ("[data-view],[data-screen],[data-target],[data-tab],[role=tab],"
            "nav a,nav button,aside a,aside button,.nav a,.nav button,.nav-item,"
            ".sidebar a,.sidebar button,.menu a,.menu button")
@@ -22,7 +22,8 @@ def run():
             page = browser.new_context(viewport={"width": 1440, "height": 900}).new_page()
             page.on("pageerror", lambda e: errors.append(str(e)))
             page.on("console", lambda m: console.append((m.type, m.text)) if m.type in ("error", "warning") else None)
-            uri = (ROOT / v / "index.html").as_uri()
+            html = next(iter(sorted((ROOT / v).glob("*.html"))))
+            uri = html.as_uri()
             page.goto(uri, wait_until="networkidle")
             page.wait_for_timeout(600)
             outdir = OUT / v

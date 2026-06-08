@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Wonder Data-Quality Console — Inbox</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <!-- Brand -->
+  <header class="brand">
+    <span class="logo" aria-hidden="true">W</span>
+    <div class="brand-text">
+      <div class="name">Data-Quality Console</div>
+      <div class="sub">Wonder Inventory</div>
+    </div>
+  </header>
+
+  <!-- Topbar -->
+  <div class="topbar">
+    <span class="run-pill">
+      <span class="dot" aria-hidden="true"></span>
+      Validation run <b>2026-06-07</b>
+    </span>
+    <span class="run-pill subtle">Today <b>2026-06-08</b></span>
+    <span class="spacer"></span>
+    <span class="user">
+      <span class="uname">Mike Dietrich · Accounting</span>
+      <span class="avatar" aria-hidden="true">MD</span>
+    </span>
+  </div>
+
+  <!-- Sidebar nav -->
+  <nav class="sidebar" aria-label="Primary">
+    <div class="nav-section">Workspace</div>
+    <button class="nav-item active" data-view="inbox" aria-current="page">
+      <span class="nico" aria-hidden="true"></span>
+      <span class="nlabel">Exception Inbox</span>
+      <span class="badge" id="navInboxCount">0</span>
+    </button>
+    <button class="nav-item" data-view="reporting">
+      <span class="nico" aria-hidden="true"></span>
+      <span class="nlabel">Reporting Dashboard</span>
+    </button>
+    <button class="nav-item" data-view="sla">
+      <span class="nico" aria-hidden="true"></span>
+      <span class="nlabel">Turnaround / SLA</span>
+    </button>
+    <button class="nav-item" data-view="admin">
+      <span class="nico" aria-hidden="true"></span>
+      <span class="nlabel">Rule &amp; Routing Admin</span>
+    </button>
+
+    <div class="grow"></div>
+
+    <div class="legend">
+      <div class="lg-title">Severity</div>
+      <div class="lg"><span class="sev-dot Critical" aria-hidden="true"></span> Critical · SLA 1d</div>
+      <div class="lg"><span class="sev-dot High" aria-hidden="true"></span> High · SLA 3d</div>
+      <div class="lg"><span class="sev-dot Medium" aria-hidden="true"></span> Medium · SLA 5d</div>
+      <div class="lg"><span class="sev-dot Low" aria-hidden="true"></span> Low · SLA 10d</div>
+    </div>
+  </nav>
+
+  <!-- Main -->
+  <main class="main">
+
+    <!-- ============ VIEW: INBOX ============ -->
+    <section class="view active" id="view-inbox" aria-label="Exception Inbox">
+      <div class="inbox">
+
+        <!-- Middle: list -->
+        <div class="list-col">
+          <div class="list-head">
+            <div class="folders" role="tablist" aria-label="Inbox folders" id="folders">
+              <button class="folder active" data-folder="open" role="tab" aria-selected="true">All open <span class="fcount" id="fc-open">0</span></button>
+              <button class="folder" data-folder="myteam" role="tab" aria-selected="false">My team <span class="fcount" id="fc-myteam">0</span></button>
+              <button class="folder" data-folder="critical" role="tab" aria-selected="false">Critical <span class="fcount" id="fc-critical">0</span></button>
+              <button class="folder" data-folder="recurring" role="tab" aria-selected="false">Recurring <span class="fcount" id="fc-recurring">0</span></button>
+              <button class="folder" data-folder="autoclosed" role="tab" aria-selected="false">Auto-closed <span class="fcount" id="fc-autoclosed">0</span></button>
+            </div>
+            <div class="list-search">
+              <span class="search-ico" aria-hidden="true"></span>
+              <input type="search" id="inboxSearch" placeholder="Search facility, SKU, JIRA key, error…" aria-label="Search exceptions" />
+            </div>
+            <div class="list-meta"><span id="listMeta">0 exceptions</span><span class="tip">Use ↑ ↓ to move · Enter to open</span></div>
+          </div>
+          <ul class="rows" id="rows" tabindex="0" role="listbox" aria-label="Exception list"></ul>
+        </div>
+
+        <!-- Right: detail -->
+        <div class="detail-col" id="detailCol">
+          <div class="detail-empty" id="detailEmpty">
+            <div class="empty-mark" aria-hidden="true"></div>
+            <h2>No exception selected</h2>
+            <p>Select a row from the inbox to see plain-language context, the offending records, routing, and the JIRA timeline.</p>
+          </div>
+          <div class="detail-body" id="detailBody" hidden></div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ============ VIEW: REPORTING ============ -->
+    <section class="view" id="view-reporting" aria-label="Reporting Dashboard" hidden>
+      <div class="page-head">
+        <h1>Reporting Dashboard</h1>
+        <p>Snapshot of data-quality across systems of origin for the 2026-06-07 validation run.</p>
+      </div>
+      <div class="scroll-pad" id="reportingBody"></div>
+    </section>
+
+    <!-- ============ VIEW: SLA ============ -->
+    <section class="view" id="view-sla" aria-label="Turnaround and SLA" hidden>
+      <div class="page-head">
+        <h1>Turnaround / SLA</h1>
+        <p>Time-to-resolution by team and person, aging of open tickets, and who needs attention.</p>
+      </div>
+      <div class="scroll-pad" id="slaBody"></div>
+    </section>
+
+    <!-- ============ VIEW: ADMIN ============ -->
+    <section class="view" id="view-admin" aria-label="Rule and Routing Admin" hidden>
+      <div class="page-head">
+        <h1>Rule &amp; Routing Admin</h1>
+        <p>Validation rules, error-to-team routing, and SLA targets. Changes here are mock-only in this prototype.</p>
+      </div>
+      <div class="scroll-pad" id="adminBody"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Prototype badge -->
+<div class="proto-banner">PROTOTYPE · <b>Variant B (Inbox)</b> · sample data</div>
+
+<!-- Toast -->
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

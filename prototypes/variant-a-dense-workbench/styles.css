@@ -208,6 +208,9 @@ table.grid tbody tr.row:hover td { background: var(--surface-2); }
 table.grid tbody tr.row.selected td { background: #15233d; }
 table.grid tbody tr.row.active td { background: #1a2c4d; }
 table.grid .num { text-align: right; }
+/* Keep the last column (Recurrence) off the right edge */
+table.grid thead th:last-child,
+table.grid tbody td:last-child { padding-right: 20px; }
 table.grid .mono { font-family: var(--mono); font-size: 11.5px; }
 .checkcol { width: 30px; text-align: center; }
 .checkcol input { accent-color: var(--accent); }

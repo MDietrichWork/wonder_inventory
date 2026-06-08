@@ -4,15 +4,15 @@ These are **clickable, throwaway UI mockups** for stakeholder review. They are *
 
 ## How to open
 
-Each variant is fully self-contained. Just **double-click `index.html`** inside any variant folder — it opens in your browser with no server, no install, and works offline.
+Each variant is fully self-contained. Just **double-click the `Prototype*.html` file** inside any variant folder (`PrototypeA.html`, `PrototypeB.html`, `PrototypeC.html`) — it opens in your browser with no server, no install, and works offline.
 
 ## The three directions
 
 | Folder | Direction | Best for |
 |---|---|---|
-| [`variant-a-dense-workbench/`](variant-a-dense-workbench/index.html) | **Dense Workbench** — information-dense data grid, heavy filtering/sorting, bulk actions, keyboard-friendly | Power users (data engineering, inventory ops) triaging many exceptions fast |
-| [`variant-b-guided-triage/`](variant-b-guided-triage/index.html) | **Guided Triage** — one exception at a time as a friendly card, plain-language explanations, big obvious actions, queue/inbox metaphor | Occasional & non-expert users across the company (lowest learning curve) |
-| [`variant-c-dashboard-led/`](variant-c-dashboard-led/index.html) | **Dashboard-Led** — metrics & charts first, click a tile/chart to drill into the underlying exceptions | Managers & accounting leadership wanting the big picture, then drill-down |
+| [`variant-a-dense-workbench/`](variant-a-dense-workbench/PrototypeA.html) | **Dense Workbench** — information-dense data grid, heavy filtering/sorting, bulk actions, keyboard-friendly | Power users (data engineering, inventory ops) triaging many exceptions fast |
+| [`variant-b-inbox/`](variant-b-inbox/PrototypeB.html) | **Inbox + Detail** — a clean, light, email-style 3-pane layout (folders → exception list → full detail panel), professional and approachable | Occasional & non-expert users across the company; familiar inbox metaphor |
+| [`variant-c-dashboard-led/`](variant-c-dashboard-led/PrototypeC.html) | **Dashboard-Led** — metrics & charts first, click a tile/chart to drill into the underlying exceptions | Managers & accounting leadership wanting the big picture, then drill-down |
 
 All three cover the **same four screens**: Exception list/triage, Reporting dashboard, Ticket turnaround / SLA, and Rule & routing admin — and all three demonstrate the flagship features (auto-created JIRA tickets, **auto-closed** tickets when data is fixed, recurring-error detection, SLA/turnaround tracking).
 

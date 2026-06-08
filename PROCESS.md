@@ -17,6 +17,14 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-08 — Phase 0: Feedback iteration (pre-socialization)
+- **Variant A:** clarified the Exception Workbench "Recur" column — renamed to **Recurrence**, added header + per-cell tooltips explaining it (times the same error recurred in 30 days), and added right padding so it isn't flush to the edge.
+- **Variant B fully reworked.** The earlier guided-triage design read as too "cartoony" (emoji, warm playful theme). Replaced it with a new **light, professional 3-pane Inbox + Detail** design in `prototypes/variant-b-inbox/` (folders → exception list → full detail panel; monochrome inline-SVG icons; **no emoji**). Old `variant-b-guided-triage/` removed.
+  - Fixed a runtime bug (`data.js` declared `const DATA` but `app.js` read `window.DATA`) by exposing `window.DATA`.
+  - Made the **Auto-closed** folder showcase the flagship auto-close feature: added 3 recently-auto-closed exception records linked to their tickets (WIQ-1027/1031/1002); kept dashboard run-breakdowns and folder counts consistent (open 21, auto-closed 3) by excluding historical auto-closed from the current-run breakdowns and making My-team/Recurring folders open-only.
+- Re-verified both variants with the Playwright harness: all screens render, **zero console/runtime errors**.
+- Set up a headless QA workflow (Playwright/Chromium via `~/.wonder-tools-venv`) used to click through and screenshot prototypes.
+
 ### 2026-06-08 — Phase 0: Mockups built
 - Established the project plan (mockup-first; daily batch validation; BigQuery source; Cloud SQL app DB; Python/FastAPI + React; Entra ID SSO; Jira Cloud with webhook+polling; hybrid routing; auto-close on re-validation). Full plan: `~/.claude/plans/i-will-be-creating-delegated-jellyfish.md`.
 - Captured the domain model from the stakeholder walkthrough (unified ledger: systems of origin Pantry/Ship Hero/Fishbowl; facilities Infinite Kitchen/CK/DIS/Transfer Warehouse; location hierarchy; action types incl. Correction; reference order types; Transfer Warehouse balancing; Lot Expiration IDs; PO table + 3-way matching; weighted-avg cost / BOM via Cookbook↔Dynamics).

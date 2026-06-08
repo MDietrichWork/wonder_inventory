@@ -77,7 +77,7 @@
     { key: "jira", label: "JIRA Key", cls: "mono" },
     { key: "jiraStatus", label: "JIRA Status" },
     { key: "age", label: "Age (d)", cls: "num", num: true },
-    { key: "recurrence", label: "Recur", cls: "num", num: true }
+    { key: "recurrence", label: "Recurrence", cls: "num", num: true, title: "How many times this same error (same rule + entity) has recurred in the last 30 days. ×4 or more is flagged as a repeat offender." }
   ];
   var sortKey = "severity", sortDir = 1; // default: most severe / oldest first handled below
   var selected = {}; // id -> true
@@ -138,6 +138,7 @@
     tr.appendChild(th0);
     COLS.forEach(function (c) {
       var th = el("th", { class: c.cls && c.num ? "num" : "" }, [c.label]);
+      if (c.title) th.title = c.title;
       if (sortKey === c.key) th.appendChild(el("span", { class: "arr" }, [sortDir > 0 ? "▲" : "▼"]));
       th.addEventListener("click", function () {
         if (sortKey === c.key) sortDir *= -1; else { sortKey = c.key; sortDir = 1; }
@@ -185,6 +186,7 @@
         else if (c.key === "recurrence") {
           td.className = "num recur" + (v >= 4 ? " hot" : "");
           td.textContent = "×" + v;
+          td.title = "Recurred " + v + " time" + (v === 1 ? "" : "s") + " in the last 30 days";
         }
         else td.textContent = v;
         tr.appendChild(td);

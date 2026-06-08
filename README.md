@@ -26,7 +26,7 @@ Wonder Group has **no centralized ERP**. A synthetic **unified inventory ledger*
 
 ## Project status
 
-**Phase 0 — UI mockups (current).** Per stakeholder process, visual mockups are built and socialized for approval **before** any production code. Three competing clickable prototypes live in [`prototypes/`](prototypes/README.md) — open any `index.html` to try them.
+**Phase 0 — UI mockups (current).** Per stakeholder process, visual mockups are built and socialized for approval **before** any production code. Three competing clickable prototypes live in [`prototypes/`](prototypes/README.md) — open any variant's `Prototype*.html` to try them.
 
 See [`PROCESS.md`](PROCESS.md) for the running log of what's done and what's next, and the full plan referenced there.
 
