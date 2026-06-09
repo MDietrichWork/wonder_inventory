@@ -34,6 +34,11 @@ service-account*.json
 *.pem
 *.key
 
+# Internal framework source — do not publish (folded into the local PLAN.md instead)
+docs/framework.xlsx
+docs/validation-tests.csv
+docs/validation-tests.md
+
 # Local tooling artifacts
 /tmp/
 *.log
