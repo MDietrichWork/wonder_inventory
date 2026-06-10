@@ -49,6 +49,7 @@ export interface Bootstrap {
   exceptions: Exception[];
   trend: { date: string; count: number; autoClosed: number }[];
   recurring: { fingerprint: string; errorType: string; facility: string; count30d: number; team: string; lastSeen: string; trend: string }[];
+  wasteByLocation?: { facility: string; day: string; dollars: number; skus: number }[];
 }
 
 export type Drill = { label: string; test: (e: Exception) => boolean } | null;

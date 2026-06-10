@@ -82,6 +82,27 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
         </div>
 
         <div className="card">
+          <h2>Daily waste over $10K by location <span className="hint">prior day · valued at consumable-unit cost · excludes implausible-qty rows (those become tickets)</span></h2>
+          <div className="card-sub">Monitoring metric, not tickets — where a location's waste (Lost / Expiration / Damage / Recall) topped the daily $ threshold.</div>
+          {(() => {
+            const w = data.wasteByLocation || [];
+            const mx = Math.max(...w.map((x) => x.dollars), 1);
+            if (!w.length) return <div className="tip" style={{ padding: "16px 4px" }}>No location exceeded the daily waste threshold for {data.meta.runDate}.</div>;
+            return (
+              <div className="hbars">
+                {w.map((x, i) => (
+                  <div key={i} className="hbar" title={`${x.facility}: $${x.dollars.toLocaleString()} across ${x.skus} SKUs`}>
+                    <div className="hlabel">{x.facility}</div>
+                    <div className="track"><div className="fill" style={{ width: Math.round((100 * x.dollars) / mx) + "%", background: "var(--bad)" }} /></div>
+                    <div className="hval">${Number(x.dollars).toLocaleString()}</div>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+        </div>
+
+        <div className="card">
           <h2>Recurring-error leaderboard <span className="hint">same fingerprint over 30 days · click to drill</span></h2>
           <div className="card-sub">Where the same defect keeps coming back — prime candidates for an upstream fix.</div>
           <div className="lb">

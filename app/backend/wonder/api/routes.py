@@ -53,9 +53,30 @@ def health():
     return {"ok": True}
 
 
+_WASTE_CACHE = {}  # run_date -> waste-by-location (live BQ aggregation; cache so /bootstrap stays fast)
+
+
 @router.get("/bootstrap")
 def bootstrap(db=Depends(get_db)):
-    return build_bootstrap(db)
+    data = build_bootstrap(db)
+    data["wasteByLocation"] = _waste_by_location(data["meta"]["runDate"])
+    return data
+
+
+def _waste_by_location(run_date: str):
+    """Daily waste $ by location (dashboard metric, not tickets). Live BQ aggregation, cached per
+    run_date; resilient (returns [] off-BigQuery or on error)."""
+    if settings.data_source != "bigquery":
+        return []
+    if run_date in _WASTE_CACHE:
+        return _WASTE_CACHE[run_date]
+    try:
+        from ..rules.bq_finder import waste_by_location
+        rows = waste_by_location(get_datasource([run_date]), run_date)
+    except Exception:  # pragma: no cover - network/perm
+        rows = []
+    _WASTE_CACHE[run_date] = rows
+    return rows
 
 
 @router.post("/run")

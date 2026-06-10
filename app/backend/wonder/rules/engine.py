@@ -88,7 +88,9 @@ def _referential(rule, ds, run_date) -> List[Finding]:
 
 
 def _range(rule, ds, run_date) -> List[Finding]:
-    col = L[rule.params["column"]]
+    col = L.get(rule.params.get("column"))
+    if col is None:
+        return []  # BigQuery-only rule (column not in the logical ledger map) — skip in fixtures
     op, val = rule.params["op"], rule.params["value"]
     out = []
     for r in ds.fetch_table(rule.target_table, run_date):

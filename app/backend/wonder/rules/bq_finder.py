@@ -436,8 +436,129 @@ def recheck_to_exists(ds, to_ids):
     return {r.id for r in ds.client.query(sql, job_config=cfg).result()}
 
 
+# Waste adjustment reasons (loss-side l1='Adjust'); counting/reconciliation actions excluded.
+WASTE_L2 = ("Lost", "Missing Items", "Expiration", "Damage", "Recall", "Recall Production", "DISH Issue/Received Damaged")
+
+
+def _cost_cte() -> str:
+    """SQL CTE `cost` = per-consumable-sku unit cost. Same UoM -> supplier_price; else convert the
+    supplier-unit price down to a consumable-unit price via the order qty ratio."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    return f"""cost AS (
+  SELECT consumable_sku, AVG(CASE
+           WHEN supplier_uom = consumable_uom THEN supplier_price
+           WHEN consumable_sku_qty > 0 THEN supplier_price * SAFE_DIVIDE(supplier_sku_qty, consumable_sku_qty)
+         END) AS unit_cost
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND supplier_price > 0 AND consumable_sku IS NOT NULL
+  GROUP BY consumable_sku)"""
+
+
+def _build_implausible_adjustment_sql(backfill: bool, lookback: int, cap: int, ceiling: int) -> str:
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    waste_in = ", ".join("'%s'" % w for w in WASTE_L2)
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH {_cost_cte()},
+adj AS (
+  SELECT consumable_sku, facility_name, DATE(datetime_utc) AS day,
+         ANY_VALUE(item_name) AS item_name, ANY_VALUE(system_of_origin) AS system,
+         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
+         ANY_VALUE(l2_action HAVING MIN consumable_quantity_change) AS reason  -- reason of the biggest single removal
+  FROM `{proj}.{dset}.{led}`
+  WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) {date_filter}
+  GROUP BY consumable_sku, facility_name, day
+  HAVING waste_qty > {ceiling}),
+flagged AS (
+  SELECT a.*, c.unit_cost, a.waste_qty * c.unit_cost AS est_value
+  FROM adj a LEFT JOIN cost c USING (consumable_sku)),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY waste_qty DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY waste_qty DESC"""
+
+
+def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """ADJ_IMPLAUSIBLE_QTY (High, SC Product (IMS)) — a single (sku,location,day) waste qty over the ceiling."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    ceiling = settings.adjust_implausible_qty
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_implausible_adjustment_sql(backfill, lookback, cap, ceiling)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        day = str(r.day)
+        ek = f"{r.facility_name}:{r.consumable_sku}:{day}"
+        snap = {
+            "facility": r.facility_name or "—", "consumable_sku": r.consumable_sku, "item_name": r.item_name,
+            "system": r.system or "—", "adjustment_date": day, "reason": r.reason,
+            "waste_qty": r.waste_qty, "implausible_ceiling": ceiling,
+            "unit_cost": (round(r.unit_cost, 4) if r.unit_cost is not None else None),
+            "est_value": (round(r.est_value, 2) if r.est_value is not None else None),
+            "movement": "Adjust / %s" % r.reason if r.reason else "Adjust",
+            "breached_at": day,
+        }
+        findings.append(Finding("ADJ-IMPL", "ADJ_IMPLAUSIBLE_QTY", "High", src, ek, snap))
+    return findings, total
+
+
+def recheck_implausible_adjustment(ds, keys):
+    """For each open (facility~~sku~~day) ticket, the current waste qty — close once it's back under the ceiling."""
+    if not keys:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    waste_in = ", ".join("'%s'" % w for w in WASTE_L2)
+    kk = ["%s~~%s~~%s" % k for k in keys if all(x is not None for x in k)]
+    if not kk:
+        return {}
+    sql = f"""SELECT CONCAT(facility_name, '~~', consumable_sku, '~~', CAST(DATE(datetime_utc) AS STRING)) AS key,
+       SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS qty
+    FROM `{proj}.{dset}.{led}`
+    WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in})
+      AND CONCAT(facility_name, '~~', consumable_sku, '~~', CAST(DATE(datetime_utc) AS STRING)) IN UNNEST(@keys)
+    GROUP BY key"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", kk)])
+    return {r.key: r.qty for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def waste_by_location(ds, run_date):
+    """Dashboard metric (NOT a ticket): daily waste $ per location for run_date, valued at the
+    derived consumable-unit cost, EXCLUDING implausible (>ceiling) per-sku rows. Returns the
+    locations whose waste exceeds the $ threshold, biggest first."""
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    waste_in = ", ".join("'%s'" % w for w in WASTE_L2)
+    ceiling, threshold = settings.adjust_implausible_qty, settings.daily_waste_threshold_usd
+    sql = f"""WITH {_cost_cte()},
+adj AS (
+  SELECT facility_name, DATE(datetime_utc) AS day, consumable_sku,
+         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS qty
+  FROM `{proj}.{dset}.{led}`
+  WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) AND DATE(datetime_utc) = @run_date
+  GROUP BY facility_name, day, consumable_sku
+  HAVING qty > 0 AND qty <= {ceiling}),   -- exclude the implausible rows (handled by ADJ-IMPL)
+costed AS (
+  SELECT facility_name, day, SUM(adj.qty * cost.unit_cost) AS dollars, COUNT(*) AS skus
+  FROM adj JOIN cost USING (consumable_sku) GROUP BY facility_name, day)
+SELECT facility_name, CAST(day AS STRING) AS day, ROUND(dollars, 0) AS dollars, skus
+FROM costed WHERE dollars > {threshold} ORDER BY dollars DESC"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    return [{"facility": r.facility_name or "—", "day": r.day, "dollars": r.dollars, "skus": r.skus}
+            for r in ds.client.query(sql, job_config=cfg).result()]
+
+
 _FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
-            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing}
+            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing, "ADJ-IMPL": _implausible_adjustment}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:

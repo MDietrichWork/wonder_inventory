@@ -71,6 +71,8 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but that SKU isn't on the PO's lines — a 3-way-match break: wrong item received, an undocumented substitution, or a PO line never set up. (Framework catalog PO-02.)"},
     {"type": "TRANSFER_ORDER_MISSING", "rule": "Picked Transfer Order exists", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
+    {"type": "ADJ_IMPLAUSIBLE_QTY", "rule": "Adjustment quantity is plausible", "ruleType": "RANGE",
+     "owner": "SC Product (IMS)", "desc": "A single item's waste adjustment at one location in a day exceeds 100,000 units — a physically implausible quantity (e.g. the SKU number leaking into the qty field). Almost certainly bad data, not real waste; pulled out of the waste metric and flagged for review."},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -127,6 +129,20 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
      "expression": "running_on_hand >= 0", "enabled": True},
+    {"id": "ADJ-IMPL", "name": "Adjustment quantity is plausible", "primitive": "RANGE", "error_type": "ADJ_IMPLAUSIBLE_QTY",
+     "target_table": "consolidated_inventory_ledger", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
+     "params": {"column": "adjustment_qty", "op": ">", "value": 100000},  # BigQuery aggregate; skipped by the fixtures engine
+     "expression": (
+        "-- A single (consumable_sku, location, day) WASTE adjustment exceeding the implausible-qty\n"
+        "-- ceiling (default 100,000 units) — physically impossible, pulled out of the waste metric.\n"
+        "SELECT consumable_sku, facility_name, DATE(datetime_utc) AS day,\n"
+        "       SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty\n"
+        "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "WHERE l1_action = 'Adjust'\n"
+        "  AND l2_action IN ('Lost','Missing Items','Expiration','Damage','Recall','Recall Production','DISH Issue/Received Damaged')\n"
+        "GROUP BY consumable_sku, facility_name, day\n"
+        "HAVING waste_qty > 100000"
+     ), "enabled": True},
     {"id": "XFER-01", "name": "Picked Transfer Order exists", "primitive": "REFERENTIAL", "error_type": "TRANSFER_ORDER_MISSING",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {},
@@ -199,6 +215,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "3-Way Match"},
     {"error_type": "TRANSFER_ORDER_MISSING", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_project": "WIQ", "jira_component": "Transfer Orders"},
+    {"error_type": "ADJ_IMPLAUSIBLE_QTY", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
+     "jira_project": "WIQ", "jira_component": "Adjustment Integrity"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team
