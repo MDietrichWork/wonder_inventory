@@ -107,13 +107,14 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
     else:
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
-        from ..rules.bq_finder import recheck, recheck_price, recheck_null_po, recheck_sku_on_po
+        from ..rules.bq_finder import recheck, recheck_price, recheck_null_po, recheck_sku_on_po, recheck_to_exists
         high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
         price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
+        to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
 
         # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
@@ -164,6 +165,15 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if "%s~~%s" % (snap.get("po"), snap.get("consumable_sku")) in now_on_po:
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: SKU now listed on the PO — auto-closed." % run_date)
+                autoclosed += 1
+
+        # transfer order missing: close once the transfer order exists in the population
+        to_ids = list({(e.data_snapshot or {}).get("transfer_order") for e in to_errs if (e.data_snapshot or {}).get("transfer_order")})
+        now_exist = recheck_to_exists(ds, to_ids) if to_ids else set()
+        for e in to_errs:
+            if (e.data_snapshot or {}).get("transfer_order") in now_exist:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: transfer order now exists — auto-closed." % run_date)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

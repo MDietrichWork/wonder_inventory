@@ -365,7 +365,73 @@ def recheck_sku_on_po(ds, pairs):
     return {r.key for r in ds.client.query(sql, job_config=cfg).result()}
 
 
-_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po, "PO-14": _sku_not_on_po}
+def _build_transfer_order_missing_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """XFER-01: a Transfer Out pick references a Transfer Order id not in the transfer-order
+    population (orders table, order_type='Transfer'). One row per orphan transfer order."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH picks AS (
+  SELECT ref_order_id AS to_id,
+         COUNT(DISTINCT consumable_sku) AS skus_picked, ANY_VALUE(item_name) AS sample_item,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system,
+         SUM(consumable_quantity_change) AS net_qty,
+         DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen,
+         ANY_VALUE(l1_action) AS move_l1, ANY_VALUE(l2_action) AS move_l2
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL {date_filter}
+  GROUP BY to_id),
+to_pop AS (SELECT DISTINCT po AS to_id FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer'),
+flagged AS (SELECT p.* FROM picks p LEFT JOIN to_pop t USING (to_id) WHERE t.to_id IS NULL),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_seen DESC"""
+
+
+def _transfer_order_missing(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """TRANSFER_ORDER_MISSING (High, SC Product (IMS)) — pick against a non-existent transfer order."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_transfer_order_missing_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "transfer_order": r.to_id, "transfer_order_exists": False,
+            "skus_picked": r.skus_picked, "sample_item": r.sample_item, "net_qty_change": r.net_qty,
+            "facility": r.facility or "—", "system": r.system or "—",
+            "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if r.move_l1 else None,
+            "first_receipt": _d(r.first_seen), "last_receipt": _d(r.last_seen),
+            "breached_at": _d(r.first_seen),
+        }
+        findings.append(Finding("XFER-01", "TRANSFER_ORDER_MISSING", "High", src, r.to_id, snap))
+    return findings, total
+
+
+def recheck_to_exists(ds, to_ids):
+    """Which transfer-order ids now exist in the transfer population — those can be auto-closed."""
+    if not to_ids:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    ids = [str(i) for i in to_ids if i is not None]
+    if not ids:
+        return set()
+    sql = f"""SELECT DISTINCT po AS id FROM `{proj}.{dset}.{po}`
+    WHERE order_type='Transfer' AND po IN UNNEST(@ids)"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
+    return {r.id for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
+            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:
