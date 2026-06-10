@@ -568,10 +568,9 @@
     ];
     kpis.forEach(function (t) {
       var tile = el("div", { class: "kpi" + (t.drill ? " clickable" : "") }, [
-        el("div", { class: "kpi-accent", style: "background:" + t.color }),
         el("div", { class: "label" }, [t.label]),
         el("div", { class: "value" }, [String(t.val)]),
-        el("div", { class: "kpi-sub" }, [el("span", { class: "chip-trend " + (t.good ? "good" : "bad") }, [t.chip])])
+        el("div", { class: "kpi-sub" }, [t.chip])
       ]);
       if (t.drill) tile.addEventListener("click", function () { drillTo(t.drill[0], t.drill[1]); });
       k.appendChild(tile);
