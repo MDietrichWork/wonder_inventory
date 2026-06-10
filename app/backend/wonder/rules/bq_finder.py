@@ -161,7 +161,8 @@ def _build_price_sql(backfill: bool, lookback: int, cap: int) -> str:
                    f"AND po_date_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
     return f"""WITH flagged AS (
   SELECT po, supplier_sku,
-         ANY_VALUE(po_source_system) AS system, ANY_VALUE(order_type) AS order_type,
+         ANY_VALUE(po_source_system) AS system, ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(order_type) AS order_type,
          ANY_VALUE(supplier_name) AS supplier_name, ANY_VALUE(supplier_sku_name) AS supplier_sku_name,
          ANY_VALUE(status) AS status, MIN(supplier_price) AS supplier_price, MIN(po_date_utc) AS po_date_utc
   FROM `{proj}.{dset}.{po}`
@@ -191,8 +192,8 @@ def _missing_price(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
         ek = f"{r.po}:{r.supplier_sku}"
         # display fields in the order the detail drawer should show them
         snap = {
-            "po": r.po, "system": r.system, "order_type": r.order_type,
-            "po_date_utc": str(r.po_date_utc) if r.po_date_utc else None,
+            "po": r.po, "system": r.system, "facility": r.facility or "—",  # PO-side facility = destination
+            "order_type": r.order_type, "po_date_utc": str(r.po_date_utc) if r.po_date_utc else None,
             "supplier_name": r.supplier_name, "supplier_sku": r.supplier_sku,
             "supplier_sku_name": r.supplier_sku_name,
             "supplier_price": r.supplier_price,   # NULL or 0 — the offending value
