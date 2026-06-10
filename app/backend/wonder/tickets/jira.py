@@ -154,6 +154,32 @@ class JiraTicketSink(TicketSink):
             log.warning("Jira set-assignee failed for %s: %s", error.jira_issue_key, e)
             return False
 
+    def fetch_issue_states(self) -> dict:
+        """Current status / assignee / resolution date for all wonder-dq tickets (for the poller)."""
+        out, token = {}, None
+        try:
+            for _ in range(20):  # page through (token-based)
+                params = {"jql": 'labels = "wonder-dq" ORDER BY updated DESC', "maxResults": 100,
+                          "fields": "status,assignee,resolutiondate"}
+                if token:
+                    params["nextPageToken"] = token
+                r = self.client.get(self.base + "/rest/api/3/search/jql", params=params)
+                r.raise_for_status()
+                data = r.json()
+                for i in data.get("issues", []):
+                    f = i.get("fields", {})
+                    out[i["key"]] = {
+                        "status": (f.get("status") or {}).get("name"),
+                        "assignee": (f.get("assignee") or {}).get("displayName"),
+                        "resolutiondate": f.get("resolutiondate"),
+                    }
+                token = data.get("nextPageToken")
+                if not token:
+                    break
+        except Exception as e:  # pragma: no cover - network
+            log.warning("Jira poll (fetch states) failed: %s", e)
+        return out
+
     def comment(self, error, text: str) -> None:
         if not error.jira_issue_key:
             return

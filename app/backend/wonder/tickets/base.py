@@ -22,3 +22,8 @@ class TicketSink:
     def transition(self, error, status_name: str) -> bool:
         """Move the ticket to the named status/transition. Returns True if applied."""
         return False
+
+    def fetch_issue_states(self) -> dict:
+        """Return {issue_key: {status, assignee, resolutiondate}} for all tracked tickets.
+        Used by the Jira -> app poller. Empty for non-external sinks."""
+        return {}

@@ -13,6 +13,7 @@ from ..config import settings
 from ..datasource import get_datasource
 from ..tickets import get_ticket_sink
 from ..jobs import run_validation
+from ..status_map import APP_TO_JIRA, CLOSED_STATES as CLOSED_AT_STATES
 from .contract import build_bootstrap
 
 router = APIRouter(prefix="/api")
@@ -43,12 +44,6 @@ class TransitionBody(BaseModel):
     to: str
 
 
-# App-facing statuses ↔ Jira statuses. The app keeps its own friendlier wording (Open/Resolved);
-# we translate to the Jira transition name when pushing.
-APP_TO_JIRA = {"Open": "To Do", "In Progress": "In Progress", "In Review": "In Review", "Resolved": "Done"}
-CLOSED_AT_STATES = ("Resolved", "Closed", "Auto-Closed", "Done")
-
-
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -69,6 +64,13 @@ def run(db=Depends(get_db)):
     run = run_validation(db, dates[-1], ds, sink)
     return {"ran": run.run_date, "scanned": run.rows_scanned, "seen": run.error_count,
             "new": run.new_count, "autoClosed": run.autoclosed_count}
+
+
+@router.post("/sync")
+def sync(db=Depends(get_db)):
+    """Pull status / assignee / resolution changes made directly in Jira back into the app."""
+    from ..jobs.sync_jira import sync_from_jira
+    return sync_from_jira(db, get_ticket_sink())
 
 
 def _get_error(db, pk: int) -> Error:

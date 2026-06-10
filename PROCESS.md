@@ -20,6 +20,11 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — Phase 4: Jira → app sync (poller)
+- **Two-way now closed.** A poller (`wonder/jobs/sync_jira.py`, `POST /api/sync`, ⟲ Sync-from-Jira button, or CLI) reads Jira (`labels = wonder-dq` via JQL) and reconciles changes made **directly in Jira** back into the app: status moves (To Do/In Progress/In Review/Done → Open/In Progress/In Review/Resolved), and **resolution → turnaround from the real Jira `resolutiondate`**. Verified: moving a ticket to In Progress / Done in Jira → the console reflects it (status, resolved date, turnaround) with a `jira-sync` timeline entry; reopening clears resolved_at.
+- **Assignee sync intentionally deferred** — in a single-user sandbox the Jira assignee never matches the fictional routed names, so syncing it false-flags every ticket. Needs real Jira users mapped to the owner model + last-known-assignee tracking (production). Status sync is the valuable, unambiguous part and is on.
+- Centralized the status vocabulary in `wonder/status_map.py` (APP↔Jira both directions). Webhook is the deployment version of this poller.
+
 ### 2026-06-10 — JIRA automation live (real Jira Cloud sandbox)
 - Connected the **real Jira Cloud REST adapter** to a sandbox site (`dietrichcoding.atlassian.net`, project **KAN**) via API token in `.env`. Proven end-to-end: **create → route → fingerprint-label → dedup on re-run (0 duplicates) → auto-close via the Done transition.**
 - **Ticket formatting cleaned** (human-readable, not app-only): **priority mapped to severity** (Urgent→Highest / High→High / Medium→Medium / Low→Low), **summary = `error_type // entity_key`**, and a **readable description** (labelled bullet list of the key facts + fingerprint) instead of raw JSON. Create is resilient (drops `priority`/`components` and retries if a team-managed project rejects them).

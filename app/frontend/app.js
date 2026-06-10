@@ -842,6 +842,15 @@
       location.reload();
     }).catch(function (e) { alert("Run failed: " + e); runBtn.disabled = false; runBtn.textContent = "↻ Run validation"; });
   });
+  var syncBtn = $("#sync-btn");
+  if (syncBtn) syncBtn.addEventListener("click", function () {
+    syncBtn.disabled = true; syncBtn.textContent = "Syncing…";
+    fetch(API + "/sync", { method: "POST" }).then(function (r) { return r.json(); }).then(function (res) {
+      alert("Synced from Jira — polled " + res.polled + " issue(s): " + res.status_updates + " status update(s), " +
+        res.closed + " closed, " + res.reopened + " reopened.");
+      location.reload();
+    }).catch(function (e) { alert("Sync failed: " + e); syncBtn.disabled = false; syncBtn.textContent = "⟲ Sync from Jira"; });
+  });
   buildHead();
   renderBody();
   showView("dashboard");
