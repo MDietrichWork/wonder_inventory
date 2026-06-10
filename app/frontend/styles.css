@@ -381,6 +381,7 @@ table.mini { width: 100%; border-collapse: collapse; font-size: 12px; }
 table.mini th { text-align: left; color: var(--text-faint); font-weight: 600; font-size: 11px; padding: 5px 8px; border-bottom: 1px solid var(--line); }
 table.mini td { padding: 6px 8px; border-bottom: 1px solid var(--line-soft); font-variant-numeric: tabular-nums; }
 table.mini tr:hover td { background: var(--surface-2); }
+table.mini tr.clickrow { cursor: pointer; }
 
 /* aging buckets */
 .buckets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }

@@ -125,6 +125,7 @@
         <label class="flt">Severity <select id="f-severity"></select></label>
         <label class="flt">Status <select id="f-status"></select></label>
         <label class="flt">Team <select id="f-team"></select></label>
+        <label class="flt" title="Everything this person is accountable for — including tickets they've handed off to someone else.">Primary owner <select id="f-owner"></select></label>
         <span class="vline"></span>
         <button class="btn ghost sm" id="f-clear">Clear filters</button>
         <span class="spacer"></span>
@@ -170,12 +171,22 @@
             </table>
           </div>
           <div class="card">
-            <h2>By person <span class="hint">who is falling behind</span></h2>
+            <h2>By owner <span class="hint">accountable · who is falling behind · click a name for their queue</span></h2>
             <table class="mini" id="person-sla">
-              <thead><tr><th>Assignee</th><th>Team</th><th class="num">Open</th><th class="num">Breaching</th><th class="num">Avg age (open)</th></tr></thead>
+              <thead><tr><th>Primary owner</th><th>Team</th><th class="num">Open</th><th class="num">Handed off</th><th class="num">Breaching</th><th class="num">Avg age (open)</th></tr></thead>
               <tbody></tbody>
             </table>
+            <div class="muted-note">Accountability stays with the primary owner even after a hand-off — these counts include handed-off tickets.</div>
           </div>
+        </div>
+
+        <div class="card">
+          <h2>By holder <span class="hint">who is actively doing the work right now · held-time attributed to the current holder · click a name to drill</span></h2>
+          <table class="mini" id="holder-sla">
+            <thead><tr><th>Current holder</th><th class="num">Holding</th><th class="num">Handed to them</th><th class="num">Breaching</th><th class="num">Avg held</th><th class="num">Total held-days</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="muted-note">A handed-off ticket appears under its holder here, but the SLA clock still belongs to the primary owner and does not reset.</div>
         </div>
 
         <div class="card">

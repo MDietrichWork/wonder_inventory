@@ -20,6 +20,12 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — Accountability queue + SLA-by-holder views
+- **Accountability queue (primary owner).** New **Primary owner** filter on the Exception Workbench shows everything a person is accountable for — *including tickets they've handed off*. The SLA "By owner" table is now keyed on the primary owner (accountable, never moves on hand-off), gained a **Handed off** column, and each name is **clickable → opens that owner's full accountability queue** in the workbench.
+- **SLA-by-holder (held-time).** New **"By holder"** table on the Turnaround/SLA screen, keyed on whoever *currently holds* each open ticket: Holding · Handed-to-them · Breaching · Avg held · Total held-days. Held-time is attributed to the current holder while the SLA clock still belongs to the primary owner and does not reset. Clicking a holder drills the workbench to the tickets they're holding. Verified: Tom Becker (a non-owner who received a hand-off) correctly appears as a holder with his handed-off count.
+- Frontend-only (`index.html`, `app.js`, `styles.css`) — the contract already exposed `primaryOwner`/`currentHolder`/`heldDays`. Headless check: zero JS errors, both tables render, owner-row click lands on a pre-filtered workbench.
+- **Note:** with BigQuery as the source the demo seed is a single backfill sweep, so held-time/aging/trend read 0 until data spans multiple days (the views are correct; the seed is flat).
+
 ### 2026-06-10 — Phase 4: Jira → app sync (poller)
 - **Two-way now closed.** A poller (`wonder/jobs/sync_jira.py`, `POST /api/sync`, ⟲ Sync-from-Jira button, or CLI) reads Jira (`labels = wonder-dq` via JQL) and reconciles changes made **directly in Jira** back into the app: status moves (To Do/In Progress/In Review/Done → Open/In Progress/In Review/Resolved), and **resolution → turnaround from the real Jira `resolutiondate`**. Verified: moving a ticket to In Progress / Done in Jira → the console reflects it (status, resolved date, turnaround) with a `jira-sync` timeline entry; reopening clears resolved_at.
 - **Assignee sync intentionally deferred** — in a single-user sandbox the Jira assignee never matches the fictional routed names, so syncing it false-flags every ticket. Needs real Jira users mapped to the owner model + last-known-assignee tracking (production). Status sync is the valuable, unambiguous part and is on.

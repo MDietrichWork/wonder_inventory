@@ -99,6 +99,7 @@
   fillSelect($("#f-severity"), ["Urgent", "High", "Medium", "Low"], "All severities");
   fillSelect($("#f-status"), exVals("jiraStatus"), "All statuses");
   fillSelect($("#f-team"), Object.keys(D.teams), "All teams");
+  fillSelect($("#f-owner"), exVals("primaryOwner"), "All owners");
 
   /* ============================ WORKBENCH GRID ============================ */
   var COLS = [
@@ -131,7 +132,8 @@
       errortype: $("#f-errortype").value,
       severity: $("#f-severity").value,
       status: $("#f-status").value,
-      team: $("#f-team").value
+      team: $("#f-team").value,
+      owner: $("#f-owner").value
     };
   }
 
@@ -145,6 +147,7 @@
       if (f.severity && e.severity !== f.severity) return false;
       if (f.status && e.jiraStatus !== f.status) return false;
       if (f.team && e.team !== f.team) return false;
+      if (f.owner && e.primaryOwner !== f.owner) return false;
       if (f.q) {
         var hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
         if (hay.indexOf(f.q) === -1) return false;
@@ -274,6 +277,13 @@
     drill = { label: label, test: test };
     showView("workbench");
     renderDrillChip();
+    renderBody();
+  }
+  // Accountability queue: everything a person is the primary owner of (handed-off included).
+  function ownerQueue(name) {
+    clearSelects(); drill = null; renderDrillChip();
+    $("#f-owner").value = name;
+    showView("workbench");
     renderBody();
   }
 
@@ -729,25 +739,61 @@
       ]));
     });
 
+    // ---- By owner (accountability): keyed on primary owner; includes handed-off tickets ----
     var pb = $("#person-sla tbody"); clear(pb);
-    var people = [];
-    Object.keys(D.teams).forEach(function (team) { D.teams[team].forEach(function (p) { people.push({ name: p, team: team }); }); });
-    people.map(function (p) {
-      var theirs = EXC.filter(function (e) { return e.assignee === p.name; });
+    var owners = {};
+    EXC.forEach(function (e) {
+      var o = e.primaryOwner; if (!o) return;
+      (owners[o] = owners[o] || []).push(e);
+    });
+    Object.keys(owners).map(function (name) {
+      var theirs = owners[name];
       var openP = theirs.filter(function (e) { return e.isOpen; });
+      var handed = openP.filter(function (e) { return e.currentHolder && e.currentHolder !== name; }).length;
       var breach = openP.filter(function (e) { return !e.withinSla; }).length;
       var avgAge = openP.length ? (openP.reduce(function (s, e) { return s + e.age; }, 0) / openP.length) : null;
-      return { p: p, total: theirs.length, open: openP.length, breach: breach, avgAge: avgAge };
+      return { name: name, team: theirs[0].team, total: theirs.length, open: openP.length, handed: handed, breach: breach, avgAge: avgAge };
     }).filter(function (r) { return r.total > 0; })
       .sort(function (a, b) { return b.breach - a.breach || (b.avgAge || 0) - (a.avgAge || 0); })
       .forEach(function (r) {
-        pb.appendChild(el("tr", {}, [
-          el("td", {}, [el("b", { class: r.breach > 0 ? "behind" : "" }, [r.p.name])]),
-          el("td", {}, [r.p.team]),
+        var tr = el("tr", { class: "clickrow", title: "Open " + r.name + "'s accountability queue (everything they own, handed-off included)" }, [
+          el("td", {}, [el("b", { class: r.breach > 0 ? "behind" : "" }, [r.name])]),
+          el("td", {}, [r.team]),
           el("td", { class: "num" }, [String(r.open)]),
+          el("td", { class: "num" }, [r.handed ? el("span", { class: "subtag" }, ["↳ " + r.handed]) : document.createTextNode("—")]),
           el("td", { class: "num" }, [el("span", { class: r.breach > 0 ? "sla-bad" : "" }, [String(r.breach)])]),
           el("td", { class: "num" }, [r.avgAge == null ? "—" : r.avgAge.toFixed(1) + "d"])
-        ]));
+        ]);
+        tr.addEventListener("click", function () { ownerQueue(r.name); });
+        pb.appendChild(tr);
+      });
+
+    // ---- By holder (active work): keyed on whoever currently holds each OPEN ticket ----
+    var hb = $("#holder-sla tbody"); clear(hb);
+    var holders = {};
+    openExc().forEach(function (e) {
+      var h = e.currentHolder || e.primaryOwner; if (!h) return;
+      (holders[h] = holders[h] || []).push(e);
+    });
+    Object.keys(holders).map(function (name) {
+      var held = holders[name];
+      var handedToThem = held.filter(function (e) { return e.primaryOwner && e.primaryOwner !== name; }).length;
+      var breach = held.filter(function (e) { return !e.withinSla; }).length;
+      var totalHeld = held.reduce(function (s, e) { return s + (e.heldDays || 0); }, 0);
+      var avgHeld = held.length ? totalHeld / held.length : 0;
+      return { name: name, holding: held.length, handedToThem: handedToThem, breach: breach, avgHeld: avgHeld, totalHeld: totalHeld };
+    }).sort(function (a, b) { return b.totalHeld - a.totalHeld || b.holding - a.holding; })
+      .forEach(function (r) {
+        var tr = el("tr", { class: "clickrow", title: "Show the tickets " + r.name + " is currently holding" }, [
+          el("td", {}, [el("b", {}, [r.name])]),
+          el("td", { class: "num" }, [String(r.holding)]),
+          el("td", { class: "num" }, [r.handedToThem ? el("span", { class: "subtag" }, ["↳ " + r.handedToThem]) : document.createTextNode("—")]),
+          el("td", { class: "num" }, [el("span", { class: r.breach > 0 ? "sla-bad" : "" }, [String(r.breach)])]),
+          el("td", { class: "num" }, [r.avgHeld.toFixed(1) + "d"]),
+          el("td", { class: "num" }, [String(r.totalHeld) + "d"])
+        ]);
+        tr.addEventListener("click", function () { drillTo("Currently held by: " + r.name, function (e) { return e.isOpen && (e.currentHolder || e.primaryOwner) === r.name; }); });
+        hb.appendChild(tr);
       });
 
     var ob = $("#overdue-table tbody"); clear(ob);
