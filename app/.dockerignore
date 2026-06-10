@@ -1,0 +1,8 @@
+# Keep the image small and free of local state / secrets.
+backend/.venv
+backend/.env
+backend/*.db
+backend/tests
+**/__pycache__
+*.pyc
+.DS_Store

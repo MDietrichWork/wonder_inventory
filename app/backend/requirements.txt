@@ -1,4 +1,4 @@
-# Wonder Inventory DQ — backend (runs on Python 3.9+)
+# Wonder Inventory DQ — backend runtime deps (Python 3.11 in prod; runs on 3.9+ locally)
 fastapi>=0.110
 uvicorn[standard]>=0.27
 SQLAlchemy>=2.0
@@ -7,6 +7,10 @@ pydantic-settings>=2.1
 httpx>=0.26
 python-dotenv>=1.0
 
-# Optional — only needed when DATA_SOURCE=bigquery (kept out of the base install so
-# fixtures mode runs with no GCP dependency). Install with:
-#   pip install "google-cloud-bigquery>=3.17"
+# Schema migrations (prod/Postgres) — `alembic upgrade head` owns the prod schema.
+alembic>=1.13
+# Postgres driver (Cloud SQL). SQLite (local/dev) needs no driver.
+psycopg[binary]>=3.1
+
+# BigQuery — required when DATA_SOURCE=bigquery (prod). Harmless to install in fixtures mode.
+google-cloud-bigquery>=3.17

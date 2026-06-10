@@ -15,7 +15,11 @@ class Base(DeclarativeBase):
 
 def init_db():
     from . import models  # noqa: F401  (register mappers)
-    Base.metadata.create_all(engine)
+    # Local SQLite/dev: create tables on startup for zero-friction. Postgres/prod: the schema is
+    # owned by Alembic (`alembic upgrade head` runs before the app starts), so don't create_all
+    # there or it would drift from the migration history.
+    if settings.app_db_url.startswith("sqlite"):
+        Base.metadata.create_all(engine)
 
 
 def reset_db():

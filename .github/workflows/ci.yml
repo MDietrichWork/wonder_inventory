@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Tests (SQLite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: app/backend/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+        env:
+          APP_DB_URL: sqlite:///./test_wonder.db
+          DATA_SOURCE: fixtures
+
+  postgres:
+    name: Migrations + lifecycle (Postgres)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app/backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: wonder
+          POSTGRES_PASSWORD: wonder
+          POSTGRES_DB: wonderdq
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U wonder -d wonderdq"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      APP_DB_URL: postgresql+psycopg://wonder:wonder@localhost:5432/wonderdq
+      DATA_SOURCE: fixtures
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: app/backend/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Apply migrations on Postgres
+        run: alembic upgrade head
+      - name: Run the lifecycle suite on Postgres
+        run: pytest -q
+
+  docker:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f app/Dockerfile -t wonder-dq:ci app

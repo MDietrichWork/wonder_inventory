@@ -20,6 +20,14 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — Phase 1 start: production foundation (Docker · CI · Postgres parity)
+- Began hardening for deployment **without changing the local code-edit loop** (the user keeps editing validations in code, not a UI — [[wonder-rules-in-code-not-ui]]). All three pieces need no cloud creds and are CI-provable.
+- **Containerized:** `app/Dockerfile` (single image = FastAPI API + static console, build context `./app`) + `.dockerignore`. CMD runs `alembic upgrade head` then uvicorn; honors Cloud Run's `$PORT`.
+- **CI:** `.github/workflows/ci.yml` with three jobs — **Tests (SQLite)**, **Migrations + lifecycle (Postgres 16 service container)** (real round-trip: `alembic upgrade head` + the full pytest lifecycle on Postgres), and **Docker build**. Added `requirements-dev.txt` (runtime + pytest).
+- **Postgres parity:** introduced **Alembic** (`alembic/`, env wired to `settings.app_db_url` + the models' metadata; `render_as_batch` for SQLite). Initial migration `d43ff7a17b74` creates all 7 tables. `db.init_db()` now `create_all`s only on SQLite; Postgres/prod schema is owned by Alembic (`alembic upgrade head`). `docker-compose.yml` runs the console on Postgres locally (fixtures + memory sink by default — no creds).
+- **Verified locally:** migration applies cleanly on a fresh SQLite DB (7 tables + `alembic_version`); renders valid **Postgres DDL** offline (`SERIAL`/`JSON`/sized `VARCHAR`) — dialect-compatible; tests green (3 passed). The full Postgres round-trip + image build run in CI on push (couldn't run a local Postgres — Homebrew is permission-broken, see [[homebrew-installed]]).
+- **What's next (Phase 1 cloud, needs access):** Terraform for Cloud Run + Cloud SQL + Secret Manager (scaffold-then-apply with the user's GCP project); wire the GitHub repo's Actions to deploy. Then Phase 5 (React rebuild, Entra SSO/RBAC).
+
 ### 2026-06-10 — Second live rule: PO-09 vendor price missing
 - **Broadened the live rule catalog beyond over-receipt.** Until now only PO-03 (over-receipt) fired on real data; everything in the demo rode on one rule. Added **PO-09 — `order_type='Purchase' AND (supplier_price IS NULL OR supplier_price = 0)` AND `UPPER(status)='CLOSED'`** (a *finalized* PO that was never priced — a definite defect, not a still-in-progress draft). New error type **PO_MISSING_PRICE** (Urgent / Hard), routed to **Procurement / Tom Becker**, JIRA component *Vendor Pricing*. The demo now spans **4 rule types across 4 owners** (over-receipt, implausible qty, UoM mismatch, missing price).
 - **Why it matters:** ~130k all-time *closed* Purchase lines lack a usable vendor price — a closed receipt can't be costed into the GL without one. A clean, deterministic, single-table check; a genuinely new owner/category the console didn't surface before.

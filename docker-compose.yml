@@ -1,0 +1,35 @@
+# Local Postgres parity: run the console on Postgres exactly as prod will (Cloud SQL).
+#   docker compose up --build
+# Then open http://localhost:8000. Defaults to fixtures + in-memory tickets so it needs no
+# BigQuery/Jira creds; point DATA_SOURCE/TICKET_SINK + the BQ_*/JIRA_* vars at real services
+# (or an env_file) to run against live data.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: wonder
+      POSTGRES_PASSWORD: wonder
+      POSTGRES_DB: wonderdq
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wonder -d wonderdq"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    environment:
+      APP_DB_URL: postgresql+psycopg://wonder:wonder@db:5432/wonderdq
+      DATA_SOURCE: fixtures
+      TICKET_SINK: memory
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
