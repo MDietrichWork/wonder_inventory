@@ -8,6 +8,7 @@ from sqlalchemy import select
 
 from ..models import Error, TicketEvent, ValidationRun
 from .. import reference
+from ..config import settings
 
 OPEN_STATES = ("Open", "In Progress", "In Review")
 PRIMITIVE_DISPLAY = {"OVER_RECEIPT": "RANGE", "RECON_TRANSFER": "RECONCILIATION"}
@@ -110,7 +111,8 @@ def build_bootstrap(db) -> Dict:
     } for r in reference.ROUTING]
 
     return {
-        "meta": {"today": today, "runDate": today, "jiraProject": "WIQ"},
+        "meta": {"today": today, "runDate": today, "jiraProject": settings.jira_project_key,
+                 "jiraBaseUrl": (settings.jira_base_url if settings.ticket_sink == "jira" else None)},
         "facilities": reference.FACILITIES,
         "systems": reference.SYSTEMS,
         "sourceTables": ["unified_ledger", "po_table"],

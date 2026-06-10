@@ -5,7 +5,6 @@ fingerprint (custom field if configured, else a label) so re-runs can find it. c
 performs the configured Done transition for auto-close. Failures are logged and swallowed
 so a Jira hiccup never breaks the validation run.
 """
-import json
 import logging
 from typing import Optional
 
@@ -16,9 +15,12 @@ from ..config import settings
 
 log = logging.getLogger("wonder.jira")
 
+# Map our severity model onto Jira's default priority scheme.
+SEVERITY_TO_PRIORITY = {"Urgent": "Highest", "High": "High", "Medium": "Medium", "Low": "Low"}
+
 
 def _adf(text: str) -> dict:
-    """Minimal Atlassian Document Format wrapper (v3 requires ADF for description)."""
+    """Minimal Atlassian Document Format wrapper (v3 requires ADF for plain comments)."""
     return {"type": "doc", "version": 1, "content": [
         {"type": "paragraph", "content": [{"type": "text", "text": text}]}
     ]}
@@ -37,35 +39,79 @@ class JiraTicketSink(TicketSink):
         )
 
     def _summary(self, error) -> str:
-        return "[%s] %s @ %s (%s)" % (error.severity, error.error_type, error.entity_key, error.rule_id)
+        return "%s // %s" % (error.error_type, error.entity_key)
 
-    def _description(self, error) -> str:
-        snap = json.dumps(error.data_snapshot, indent=2)
-        return ("Auto-created by Wonder DQ validator.\n"
-                "Rule: %s  Severity: %s  Run: %s\n"
-                "Routed: %s / %s\nFingerprint: %s\n\nOffending %s row:\n%s"
-                % (error.rule_id, error.severity, error.first_run_date, error.routed_team,
-                   error.routed_assignee, error.fingerprint, error.source_table, snap))
+    def _description_adf(self, error) -> dict:
+        """A clean, human-readable issue body (no raw JSON) for anyone working it in Jira."""
+        snap = error.data_snapshot or {}
+
+        def para(text, label=None):
+            content = []
+            if label is not None:
+                content.append({"type": "text", "text": label, "marks": [{"type": "strong"}]})
+            content.append({"type": "text", "text": text})
+            return {"type": "paragraph", "content": content}
+
+        body = [
+            para("Auto-created by the Wonder Inventory Data-Quality validator."),
+            para("%s · severity %s · run %s" % (error.error_type, error.severity, error.first_run_date)),
+            para("Routed to %s / %s." % (error.routed_team, error.routed_assignee)),
+            {"type": "heading", "attrs": {"level": 4}, "content": [{"type": "text", "text": "What was flagged"}]},
+        ]
+        HIDE = {"tolerance_pct", "uom_match", "ordered_uom", "received_uom", "implausible_quantity"}
+        shown, rows = set(), []
+
+        def add(label, val, *keys):
+            rows.append((label, "NULL" if val is None else str(val)))
+            shown.update(keys)
+
+        if "po" in snap: add("PO", snap["po"], "po")
+        if "consumable_sku" in snap: add("Consumable SKU", snap["consumable_sku"], "consumable_sku")
+        if "item_name" in snap: add("Item", snap["item_name"], "item_name")
+        if "ordered_qty" in snap:
+            add("Ordered", ("%s %s" % (snap["ordered_qty"], snap.get("ordered_uom", ""))).strip(), "ordered_qty")
+        if "received_qty" in snap:
+            add("Received", ("%s %s" % (snap["received_qty"], snap.get("received_uom", ""))).strip(), "received_qty")
+        if "over_by_pct" in snap: add("Over ordered by", "%s%%" % snap["over_by_pct"], "over_by_pct")
+        for k, v in snap.items():  # any remaining fields, generically
+            if k in shown or k in HIDE:
+                continue
+            add(k.replace("_", " ").capitalize(), v)
+        if snap.get("implausible_quantity"):
+            rows.append(("Flag", "Implausible quantity — received is more than 2x ordered"))
+
+        body.append({"type": "bulletList", "content": [
+            {"type": "listItem", "content": [para(v, label + ": ")]} for label, v in rows]})
+        body.append(para("Fingerprint %s" % error.fingerprint))
+        return {"type": "doc", "version": 1, "content": body}
 
     def create(self, error) -> Optional[str]:
-        fields = {
+        base = {
             "project": {"key": settings.jira_project_key},
             "summary": self._summary(error),
-            "description": _adf(self._description(error)),
+            "description": self._description_adf(error),
             "issuetype": {"name": settings.jira_issue_type},
             "labels": ["wonder-dq", "fp-" + error.fingerprint[:16]],
         }
-        if error.routed_team:
-            fields["components"] = [{"name": error.routed_team}]
         if settings.jira_fingerprint_field:
-            fields[settings.jira_fingerprint_field] = error.fingerprint
-        try:
-            r = self.client.post(self.base + "/rest/api/3/issue", json={"fields": fields})
-            r.raise_for_status()
-            return r.json().get("key")
-        except Exception as e:  # pragma: no cover - network
-            log.warning("Jira create failed for %s: %s", error.entity_key, e)
-            return None
+            base[settings.jira_fingerprint_field] = error.fingerprint
+        optional = {"priority": {"name": SEVERITY_TO_PRIORITY.get(error.severity, "Medium")}}
+        if error.routed_team:
+            optional["components"] = [{"name": error.routed_team}]
+        # Try with priority + components; if the project rejects either, fall back (priority first).
+        last = None
+        for drop in ((), ("components",), ("components", "priority")):
+            fields = dict(base, **{k: v for k, v in optional.items() if k not in drop})
+            try:
+                r = self.client.post(self.base + "/rest/api/3/issue", json={"fields": fields})
+                r.raise_for_status()
+                if drop:
+                    log.warning("Jira create for %s dropped fields %s", error.entity_key, drop)
+                return r.json().get("key")
+            except Exception as e:  # pragma: no cover - network
+                last = e
+        log.warning("Jira create failed for %s: %s", error.entity_key, last)
+        return None
 
     def comment(self, error, text: str) -> None:
         if not error.jira_issue_key:

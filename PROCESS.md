@@ -20,6 +20,12 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — JIRA automation live (real Jira Cloud sandbox)
+- Connected the **real Jira Cloud REST adapter** to a sandbox site (`dietrichcoding.atlassian.net`, project **KAN**) via API token in `.env`. Proven end-to-end: **create → route → fingerprint-label → dedup on re-run (0 duplicates) → auto-close via the Done transition.**
+- **Ticket formatting cleaned** (human-readable, not app-only): **priority mapped to severity** (Urgent→Highest / High→High / Medium→Medium / Low→Low), **summary = `error_type // entity_key`**, and a **readable description** (labelled bullet list of the key facts + fingerprint) instead of raw JSON. Create is resilient (drops `priority`/`components` and retries if a team-managed project rejects them).
+- **Console wired to real Jira:** re-seeded the demo to **27 real tickets** (10 over-receipt / 10 UoM-mismatch / 7 implausible), and the in-app "Open in JIRA" links (grid + drawer) deep-link to the real issues (`meta.jiraBaseUrl`). Demo cap = 10/band (tunable); `↻ Run validation` now runs the daily batch against Jira.
+- **For production:** point `JIRA_BASE_URL`/token at the company Jira + a real project, have an admin add an `Urgent` priority (then flip the mapping 1:1), and raise the cap.
+
 ### 2026-06-09 — Live BigQuery connection + first real validation
 - **Connected to production BigQuery** (`wonder-dw-prod-brd.inventory`) read-only via the user's own ADC login (gcloud installed to home dir + standalone Python 3.12, no sudo/admin). Mapped the real schema in [`app/SCHEMA_NOTES.md`](app/SCHEMA_NOTES.md).
 - **Profiled the real data** (capped, single-partition queries): ledger **186.4M rows / 84 GB** (partitioned daily by `datetime_utc`, clustered by `system_of_origin`); PO table **18.8M rows / 5.6 GB** (unpartitioned). Real vocab: systems Pantry/Shiphero/Fishbowl/System; facility_type HDR/DISH/PRODUCTION; PO receipt = `ref_order_type='Purchase Order'`.

@@ -19,6 +19,16 @@
       return res;
     }).catch(function (e) { alert("Action failed: " + e); });
   }
+  // Real Jira deep-link when connected to a live Jira (else a mock notice).
+  function jiraUrl(key) {
+    var b = D.meta && D.meta.jiraBaseUrl;
+    return (b && key && key !== "—") ? b.replace(/\/+$/, "") + "/browse/" + key : null;
+  }
+  function openJira(key) {
+    var u = jiraUrl(key);
+    if (u) window.open(u, "_blank");
+    else alert("Mock: would open " + key + " in JIRA (set TICKET_SINK=jira for live links).");
+  }
   var $ = function (s, r) { return (r || document).querySelector(s); };
   var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
   function el(tag, attrs, kids) {
@@ -204,8 +214,8 @@
           if (e.subAssign) td.appendChild(el("span", { class: "subtag", title: "Sub-assigned to " + e.subAssign.toTeam + " (" + e.subAssign.toPerson + ")" }, ["↳ " + e.subAssign.toTeam]));
         }
         else if (c.key === "jira") {
-          var a = el("a", { class: "jira-link", href: "#", title: "Open " + v + " in JIRA" }, [v]);
-          a.addEventListener("click", function (ev) { ev.stopPropagation(); ev.preventDefault(); alert("Mock: open " + v + " in JIRA (project WIQ)."); });
+          var a = el("a", { class: "jira-link", href: jiraUrl(v) || "#", title: "Open " + v + " in JIRA" }, [v]);
+          a.addEventListener("click", function (ev) { ev.stopPropagation(); ev.preventDefault(); openJira(v); });
           td.appendChild(a);
         }
         else if (c.key === "age") {
@@ -314,7 +324,7 @@
     sub.appendChild(sevPill(e.severity));
     sub.appendChild(statusPill(e.jiraStatus));
     sub.appendChild(el("span", { class: "tag" }, [e.facility + " · " + e.system]));
-    sub.appendChild(el("a", { class: "jira-link", href: "#", html: e.jira }));
+    sub.appendChild(el("a", { class: "jira-link", href: jiraUrl(e.jira) || "#", target: "_blank", html: e.jira }));
     sub.appendChild(el("span", { class: "tip" }, ["Age " + e.age + "d / " + e.slaTarget + "d SLA · " + (e.withinSla ? "within SLA" : "BREACHING")]));
 
     var body = $("#dr-body"); clear(body);
@@ -425,7 +435,7 @@
     body.appendChild(nsec);
 
     // action buttons (rebind to this row) — persisted via the API
-    $("#dr-jira").onclick = function () { alert("Mock: open " + e.jira + " in JIRA."); };
+    $("#dr-jira").onclick = function () { openJira(e.jira); };
     $("#dr-assign").onclick = function () {
       var w = prompt("Assign " + e.id + " to a person (team-leader assignment — updates the JIRA assignee):", e.assignee);
       if (w) apiPost("/exceptions/" + e.pk + "/assign", { assignee: w });
