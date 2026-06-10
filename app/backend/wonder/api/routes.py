@@ -43,7 +43,10 @@ class TransitionBody(BaseModel):
     to: str
 
 
-CLOSED_AT_STATES = ("Resolved", "Closed", "Done", "Auto-Closed")
+# App-facing statuses ↔ Jira statuses. The app keeps its own friendlier wording (Open/Resolved);
+# we translate to the Jira transition name when pushing.
+APP_TO_JIRA = {"Open": "To Do", "In Progress": "In Progress", "In Review": "In Review", "Resolved": "Done"}
+CLOSED_AT_STATES = ("Resolved", "Closed", "Auto-Closed", "Done")
 
 
 @router.get("/health")
@@ -114,18 +117,17 @@ def breakdown(pk: int, db=Depends(get_db)):
 def transition(pk: int, body: TransitionBody, db=Depends(get_db)):
     """Change the ticket's status from the workbench and push the transition to Jira."""
     e = _get_error(db, pk)
-    if e.jira_issue_key and not get_ticket_sink().transition(e, body.to):
-        raise HTTPException(400, "Jira transition to '%s' isn't available from '%s'." % (body.to, e.status))
+    jira_name = APP_TO_JIRA.get(body.to, body.to)
+    synced = get_ticket_sink().transition(e, jira_name) if e.jira_issue_key else True
     prev, at = e.status, _now()
     e.status = body.to
-    if body.to in CLOSED_AT_STATES and not e.resolved_at:
-        e.resolved_at = at
+    e.resolved_at = (e.resolved_at or at) if body.to in CLOSED_AT_STATES else None  # clear on reopen
     db.add(TicketEvent(error_id=e.id, jira_issue_key=e.jira_issue_key, from_status=prev, to_status=body.to,
                        actor="Mike Dietrich", occurred_at=at, note="Status changed in the workbench."))
     db.add(AuditLog(actor="Mike Dietrich", action="transition", entity="error", entity_id=str(e.id),
                     before={"status": prev}, after={"status": body.to}, at=at))
     db.commit()
-    return {"ok": True, "status": e.status}
+    return {"ok": True, "status": e.status, "jiraSynced": synced}
 
 
 @router.post("/exceptions/{pk}/assign")

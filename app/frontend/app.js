@@ -329,7 +329,7 @@
 
     var body = $("#dr-body"); clear(body);
 
-    // Validation rule that fired
+    // Validation rule that fired — built here, appended at the BOTTOM (after Notes).
     var rsec = el("div", { class: "section" }, [el("h3", {}, ["Validation rule that fired"])]);
     var rbox = el("div", { class: "rule-box" }, [
       el("div", { class: "rname" }, [(rule.name || e.errorType) + "  —  " + (rule.type || meta.ruleType || "")]),
@@ -337,7 +337,6 @@
       el("code", { text: rule.expression || "(rule expression unavailable)" })
     ]);
     rsec.appendChild(rbox);
-    body.appendChild(rsec);
 
     // Offending data snapshot — hide backend-only fields; fold UoM into the qty line.
     var snap = e.snapshot;
@@ -434,10 +433,13 @@
     nsec.appendChild(ni);
     body.appendChild(nsec);
 
+    body.appendChild(rsec);  // "Validation rule that fired" goes last (kept for Pavel to see the SQL)
+
     // action buttons (rebind to this row) — persisted via the API
     var statusSel = $("#dr-status");
-    var STATUS_OPTS = ["To Do", "In Progress", "Done"];
-    var opts = [e.jiraStatus].concat(STATUS_OPTS.filter(function (s) { return s !== e.jiraStatus; }));
+    var STATUS_OPTS = ["Open", "In Progress", "In Review", "Resolved"];  // app wording; mapped to Jira on push
+    var opts = STATUS_OPTS.indexOf(e.jiraStatus) > -1 ? STATUS_OPTS
+      : [e.jiraStatus].concat(STATUS_OPTS);
     statusSel.innerHTML = opts.map(function (s) {
       return '<option' + (s === e.jiraStatus ? ' selected' : '') + '>' + s + '</option>';
     }).join("");
