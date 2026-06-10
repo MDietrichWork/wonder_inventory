@@ -14,7 +14,7 @@ A very large number of people across the company will use this in some capacity,
 ### Decisions locked in
 | Area | Decision |
 |---|---|
-| First deliverable | **2–3 clickable HTML prototypes** (distinct UI directions, all 4 core screens) for stakeholders to compare and choose, approved before code |
+| First deliverable | **2–3 clickable HTML prototypes** (distinct UI directions, all 4 core screens) for stakeholders to compare and choose, approved before code. **✅ Approved 2026-06-09: Variant A (dense workbench) base + Variant C dashboard-as-home, condensed, darker-blue — consolidated in `prototypes/approved-console/`** (this is the React styling/UX reference). |
 | Data source | **BigQuery** — synthetic unified ledger + PO tables (read-only), high volume |
 | Cadence | **Daily batch** validating the previous day's complete data |
 | Re-validation | Re-check open issues each run; **auto-close** JIRA ticket if the issue is gone; update (not duplicate) if still present |
@@ -282,7 +282,7 @@ Two docs live in the repo root and are maintained throughout:
 
 ## Roadmap (mockup-first)
 
-**Phase 0 — Mockups (current critical path, NO production code):**
+**Phase 0 — Mockups (✅ direction approved 2026-06-09; consolidated prototype = `prototypes/approved-console/`. NO production code):**
 1. Build **2–3 distinct clickable HTML prototypes** with realistic fake data, each covering all four core screens. Each represents a different UI direction so the stakeholder can review options with others in the organization and pick a winner (or a blend). Likely directions to contrast:
    - **A — Dense workbench / data-grid first:** information-dense tables and filters for power users who triage many exceptions quickly.
    - **B — Guided / card-based triage:** a cleaner, more guided exception-by-exception flow optimized for occasional/non-expert users (minimizes overwhelm).
@@ -297,7 +297,7 @@ Two docs live in the repo root and are maintained throughout:
      README.md                     (how to open each + a one-line summary of each direction)
    ```
 2. Bake the ease-of-use principles into all variants (clear exception triage, no overwhelm).
-3. Socialize the variants with stakeholders (Pavel + group) at the every-other-day touchpoints; iterate until one direction is approved.
+3. Socialize the variants with stakeholders (Pavel + group) at the every-other-day touchpoints; iterate until one direction is approved. **✅ Done — approved direction is Variant A + Variant C dashboard-as-home, consolidated into `prototypes/approved-console/` (the three original variants are retained as reference). Next touchpoint: walk Pavel through the approved console for polish notes.**
 4. Create the initial **`README.md`** and **`PROCESS.md`**; record the prototype work and the "what's next" (stakeholder selection).
 
 > **Standing rule for every phase:** end the phase by updating **`PROCESS.md`** (completed-to-date + what's next) and the **`README.md`** where relevant.
@@ -319,6 +319,11 @@ Two docs live in the repo root and are maintained throughout:
 ---
 
 ## Open items to confirm during build
+- **Sub-assignment / ownership-transfer mechanism** (from the 2026-06-09 walkthrough; shown as a concept in the approved prototype, **not yet finalized — Mike researching**): the **primary owner stays accountable** but can hand work to the root-cause team. Pavel's lean: on hand-off the **SLA clock moves to the secondary holder** and the **original SLA does not reset**; every transition is recorded in an **ownership audit log** (who → whom, when, SLA remaining) to prevent last-minute ping-pong. Decide the exact model and how per-person turnaround is attributed across a hand-off.
+- **In-app assignment → Jira sync:** team leaders assign a ticket to an individual inside the app, which updates the Jira assignee (so staff don't work across two systems).
+- **Facility → manager auto-routing:** e.g. a Field Ops PO over-receipt auto-assigns to that facility's manager — needs a facility→manager mapping (extends the routing/user-group table).
+- **Role-based / hierarchy views:** build the app "big" (all features visible) first, then trim per user group via a backend user-group table (role → which views/teams are visible). Deferred until after the overloaded version is validated.
+- **Dashboard "by inventory movement type" breakout** (added to the approved prototype) — confirm it stays and which movement categories matter most.
 - Exact **BigQuery dataset/table names** for the unified ledger + PO tables, and their partitioning.
 - **Validation-test thresholds** (the `X/Y/Z`, `$X`, `A%–B%` placeholders in the seed catalog) — set with accounting/ops at touchpoints; the rule set continues to grow.
 - **Confirm Hard vs. Soft fail per test** — the framework defines the two types but doesn't tag each test; the catalog's Hard/Soft column is currently inferred.
