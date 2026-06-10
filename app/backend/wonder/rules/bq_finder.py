@@ -45,6 +45,7 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int) -> str:
   SELECT l.ref_order_id AS po, l.consumable_sku, l.datetime_utc,
          l.consumable_quantity_change AS q, l.consumable_uom AS ruom,
          l.facility_name AS facility, l.system_of_origin AS system, l.item_name AS item_name,
+         l.l1_action AS l1_action, l.l2_action AS l2_action,
          SUM(l.consumable_quantity_change) OVER (
            PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv
@@ -57,7 +58,9 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int) -> str:
     return "WITH " + evt + f""",
 received AS (
   SELECT po, consumable_sku, SUM(q) AS received_qty, ANY_VALUE(ruom) AS received_uom,
-         ANY_VALUE(facility) AS facility, ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name
+         ANY_VALUE(facility) AS facility, ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name,
+         -- movement action of the largest receipt = the dominant receiving event (l1 / l2)
+         ANY_VALUE(l1_action HAVING MAX q) AS move_l1, ANY_VALUE(l2_action HAVING MAX q) AS move_l2
   FROM evt GROUP BY po, consumable_sku),
 ordered AS (
   SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty,
@@ -80,6 +83,7 @@ breach AS (
 flagged AS (
   SELECT r.po, r.consumable_sku, r.item_name, o.ordered_qty, r.received_qty,
          o.ordered_uom, r.received_uom, r.facility, r.system, o.supplier, o.status,
+         r.move_l1, r.move_l2,
          SAFE_DIVIDE(r.received_qty, o.ordered_qty) - 1 AS over_frac,
          (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch,
          b.over_breach_date, b.uom_breach_date, b.first_receipt_date, b.last_receipt_date
@@ -114,6 +118,8 @@ def _snap(r, high):
         "over_by_pct": round((r.over_frac or 0.0) * 100, 1), "tolerance_pct": round(high * 100, 1),
         "status": r.status, "supplier": r.supplier,
         "facility": r.facility or "—", "system": r.system or "—",
+        # inventory movement (ledger l1 / l2 of the receiving event) — drives the dashboard breakout
+        "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if getattr(r, "move_l1", None) else None,
         # data-derived timeline: when the error actually began vs. last activity
         "first_receipt": _d(r.first_receipt_date), "last_receipt": _d(r.last_receipt_date),
     }

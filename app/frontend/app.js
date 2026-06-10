@@ -50,14 +50,8 @@
 
   // Inventory movement category for an exception (drives the "by movement type" breakout).
   function movementOf(e) {
-    var t = e.snapshot && e.snapshot.txn_type;
-    if (e.errorType === "TRANSFER_WAREHOUSE_IMBALANCE") return "Transfer";
-    if (e.errorType === "MISSING_LOT_EXPIRATION") return "Expiration";
-    if (t === "PO_RECEIPT" || t === "ADD") return "PO Receipt";
-    if (t === "CONSUME" || t === "PRODUCE_CONSUME") return "Production";
-    if (t === "SHIP") return "Sales / Outbound";
-    if (e.table === "po_table") return "PO Receipt"; // 3-way match / conversion are PO-driven
-    return "Adjustment";
+    // ledger l1/l2 action captured at validation time; PO-table-only errors have none.
+    return (e.snapshot && e.snapshot.movement) || "Non-Movement Errors";
   }
 
   /* ============================ NAVIGATION ============================ */

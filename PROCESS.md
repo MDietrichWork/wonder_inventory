@@ -27,6 +27,11 @@ A living log of the project. **Updated at every step** with what was completed (
 - **Verified** headless against live data: shell + KPIs (37 open / 3% SLA, matches backend), donut + 13 type bars, 37 workbench rows with correct columns, drawer opens — **zero console errors**. Visually faithful to the approved design.
 - **Next:** Turnaround/SLA + Rule & Routing Admin screens; wire drawer **write actions** (status/reassign/hand-off/resolve) to the API; then Entra SSO + RBAC. At deploy, build the React `dist` and have the container serve it (replacing the static vanilla console).
 
+### 2026-06-10 — "Errors by movement type" now driven by ledger l1/l2 action
+- Per the user, the dashboard's movement breakout is keyed on the **ledger `l1_action` / `l2_action`** (the real movement vocabulary: Add/Remove/Move/Adjust/Revise/System/Correction/Cycle Count/…), not an errorType heuristic. Profiled the column (10 distinct values; `Remove` 144M dominant).
+- The over-receipt finder now captures the **receiving action of the largest receipt** (`ANY_VALUE(l1_action HAVING MAX q)` / `l2_action`) into each ledger-sourced error's snapshot as `movement`. PO-table-only errors (PO-09 missing price) have no ledger movement → bucketed as **"Non-Movement Errors"** (user's label). `movementOf()` (React + vanilla) now reads `snapshot.movement || "Non-Movement Errors"`.
+- Current 37 bucket as **Add / PO Receipt 26 · Add / Received 1 · Non-Movement Errors 10** — the breakout enriches as ledger-movement rules (negative on-hand, transfer/move, adjustments) are added. Re-seeded; backend tests green; React QA 35/35.
+
 ### 2026-06-10 — React rebuild brought to full prototype parity
 - After review feedback (the first React drawer was a read-only stub — missing Notes, colored timeline dots, and the status/reassign/hand-off action flow), did a **full feature audit** of the vanilla prototype and closed every gap.
 - **Bug fixed:** the drawer never opened in the browser — it used `.drawer.open`, but the approved CSS reveals it via `.drawer.show` (it rendered off-screen). Caught because the original headless check only asserted DOM presence, not on-screen visibility.

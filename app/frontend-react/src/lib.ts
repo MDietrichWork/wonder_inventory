@@ -9,16 +9,10 @@ export function countBy<T>(rows: T[], key: ((r: T) => string) | keyof T): Record
   return m;
 }
 
-// Inventory movement category for an exception (drives the "by movement type" breakout).
+// Inventory movement category for an exception — the ledger l1/l2 action captured at validation
+// time. PO-table-only errors (e.g. missing price) have no ledger movement → "Non-Movement Errors".
 export function movementOf(e: Exception): string {
-  const t = e.snapshot && e.snapshot.txn_type;
-  if (e.errorType === "TRANSFER_WAREHOUSE_IMBALANCE") return "Transfer";
-  if (e.errorType === "MISSING_LOT_EXPIRATION") return "Expiration";
-  if (t === "PO_RECEIPT" || t === "ADD") return "PO Receipt";
-  if (t === "CONSUME" || t === "PRODUCE_CONSUME") return "Production";
-  if (t === "SHIP") return "Sales / Outbound";
-  if (e.table === "po_table") return "PO Receipt";
-  return "Adjustment";
+  return (e.snapshot && e.snapshot.movement) || "Non-Movement Errors";
 }
 
 export const statusClass = (s: string) => "st-" + s.replace(/[^A-Za-z]/g, "");
