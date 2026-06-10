@@ -371,27 +371,25 @@
     // Ownership & assignment (incl. sub-assignment concept — under review)
     var route = D.routing.filter(function (r) { return r.errorType === e.errorType; })[0] || {};
     var osec = el("div", { class: "section" }, [el("h3", {}, ["Ownership & assignment"])]);
+    var handed = !!(e.currentHolder && e.currentHolder !== e.primaryOwner);
     var okv = el("div", { class: "kv" }, [
       el("div", { class: "k" }, ["routed_team"]), el("div", { class: "v" }, [e.team]),
-      el("div", { class: "k" }, ["primary_owner"]), el("div", { class: "v" }, [e.assignee]),
+      el("div", { class: "k" }, ["primary_owner"]), el("div", { class: "v" }, [e.primaryOwner + "  (accountable)"]),
+      el("div", { class: "k" }, ["currently_with"]), el("div", { class: "v" }, [e.currentHolder + " · held " + e.heldDays + "d (since " + e.heldSince + ")"]),
       el("div", { class: "k" }, ["jira_project"]), el("div", { class: "v" }, [route.project || "WIQ"]),
-      el("div", { class: "k" }, ["component"]), el("div", { class: "v" }, [route.component || "—"]),
       el("div", { class: "k" }, ["recurrence_30d"]), el("div", { class: "v" }, ["×" + e.recurrence])
     ]);
     osec.appendChild(okv);
-    if (e.subAssign) {
+    if (handed && e.subAssign) {
       var sa = e.subAssign;
-      var box = el("div", { class: "subassign-box" }, [
-        el("div", { class: "sa-head" }, ["↳ Sub-assigned to ", el("b", {}, [sa.toTeam + " · " + sa.toPerson])]),
-        el("div", { class: "tip" }, ["Handed off " + sa.at.replace("T", " ").replace("Z", " UTC") + " by " + sa.byPerson + " — primary owner (" + e.assignee + ") stays accountable."]),
-        el("div", { class: "sa-sla" }, ["SLA continues — not reset · ~" + sa.slaRemainingDays + " day(s) of the original SLA remained at hand-off"]),
-        el("div", { class: "tip" }, [sa.note])
-      ]);
-      osec.appendChild(box);
+      osec.appendChild(el("div", { class: "subassign-box" }, [
+        el("div", { class: "sa-head" }, ["↳ Handed off to ", el("b", {}, [sa.toPerson + (sa.toTeam ? " · " + sa.toTeam : "")])]),
+        el("div", { class: "tip" }, ["By " + e.primaryOwner + " on " + (sa.at || "").replace("T", " ").replace("Z", " UTC") + " — " + e.primaryOwner + " stays primary owner (accountable)."]),
+        el("div", { class: "sa-sla" }, ["SLA does not reset · current holder " + e.currentHolder + " has had it " + e.heldDays + " day(s)"])
+      ]));
     } else {
-      osec.appendChild(el("div", { class: "tip", style: "margin-top:8px" }, ["No sub-assignment — handled by the primary owner. Use “Sub-assign to team” to route the root cause elsewhere while staying accountable."]));
+      osec.appendChild(el("div", { class: "tip", style: "margin-top:8px" }, ["Held by the primary owner. Use “Hand off…” to give the work to someone else while staying accountable (SLA doesn’t reset)."]));
     }
-    osec.appendChild(el("div", { class: "concept-note" }, ["Concept under review: when work is sub-assigned, the original SLA does not restart and the clock moves to whoever currently holds it; every hand-off is recorded in the timeline below for a fair audit trail."]));
     body.appendChild(osec);
 
     // JIRA timeline (includes ownership transitions)
@@ -399,7 +397,7 @@
     var ul = el("ul", { class: "timeline" });
     e.timeline.forEach(function (t) {
       var auto = /auto/i.test(t.status) || t.by === "batch-validator";
-      var handoff = /sub-assigned/i.test(t.status);
+      var handoff = /sub-assigned|handed off/i.test(t.status);
       var li = el("li", { class: auto ? "auto" : (handoff ? "handoff" : "") }, [
         el("span", { class: "tdot" }),
         el("div", { class: "tstatus" }, [t.status]),
@@ -448,14 +446,14 @@
     };
     $("#dr-jira").onclick = function () { openJira(e.jira); };
     $("#dr-assign").onclick = function () {
-      var w = prompt("Assign " + e.id + " to a person (team-leader assignment — updates the JIRA assignee):", e.assignee);
+      var w = prompt("Reassign the PRIMARY OWNER of " + e.id + " (accountability moves to this person, updates the Jira assignee):", e.primaryOwner);
       if (w) apiPost("/exceptions/" + e.pk + "/assign", { assignee: w });
     };
     $("#dr-subassign").onclick = function () {
-      var t = prompt("Sub-assign " + e.id + " to which team? (you stay the primary owner; SLA does not reset)", e.subAssign ? e.subAssign.toTeam : "Procurement");
-      if (!t) return;
-      var p = prompt("Sub-assign to which person on " + t + "?", e.subAssign ? e.subAssign.toPerson : "");
-      apiPost("/exceptions/" + e.pk + "/subassign", { team: t, person: p || null });
+      var p = prompt("Hand off " + e.id + " to which person? (they do the work; " + e.primaryOwner + " stays accountable, SLA doesn’t reset)", e.subAssign ? e.subAssign.toPerson : "");
+      if (!p) return;
+      var t = prompt("Their team (optional):", e.subAssign ? e.subAssign.toTeam : "");
+      apiPost("/exceptions/" + e.pk + "/subassign", { person: p, team: t || null });
     };
     $("#dr-note").onclick = function () { inp.focus(); };
 

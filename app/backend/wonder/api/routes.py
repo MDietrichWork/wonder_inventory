@@ -35,8 +35,8 @@ class AssignBody(BaseModel):
 
 
 class SubAssignBody(BaseModel):
-    team: str
-    person: Optional[str] = None
+    person: str                 # the new current holder (who does the actual work)
+    team: Optional[str] = None  # optional team context
 
 
 class TransitionBody(BaseModel):
@@ -147,20 +147,28 @@ def assign(pk: int, body: AssignBody, db=Depends(get_db)):
 
 @router.post("/exceptions/{pk}/subassign")
 def subassign(pk: int, body: SubAssignBody, db=Depends(get_db)):
+    """Hand the work to another person. The primary owner (routed_assignee) stays accountable
+    and the SLA does NOT reset; the current holder + hand-off time are recorded, and Jira's
+    assignee becomes the holder."""
     e = _get_error(db, pk)
-    person = body.person or (body.team + " lead")
-    at = _now()
-    e.sub_team, e.sub_assignee, e.sub_assigned_at = body.team, person, at
+    person, team, at = body.person, body.team, _now()
+    primary = e.routed_assignee
+    e.sub_team, e.sub_assignee, e.sub_assigned_at = team, person, at
+    label = "Handed off → %s%s" % (person, (" (%s)" % team if team else ""))
     db.add(TicketEvent(error_id=e.id, jira_issue_key=e.jira_issue_key, from_status=e.status,
-                       to_status="Sub-assigned → %s (%s)" % (body.team, person), actor=e.routed_assignee,
-                       occurred_at=at, note="Root cause routed to %s. SLA does not reset." % body.team))
-    db.add(AuditLog(actor=e.routed_assignee, action="sub_assign", entity="error", entity_id=str(e.id),
-                    before=None, after={"team": body.team, "person": person}, at=at))
+                       to_status=label, actor=primary, occurred_at=at,
+                       note="%s handed the work to %s; %s remains primary owner (accountable). SLA does not reset."
+                       % (primary, person, primary)))
+    db.add(AuditLog(actor=primary, action="handoff", entity="error", entity_id=str(e.id),
+                    before={"holder": primary}, after={"holder": person, "team": team}, at=at))
+    synced = False
     if e.jira_issue_key:
-        get_ticket_sink().comment(e, "Sub-assigned to %s (%s). Primary owner stays %s; SLA does not reset."
-                                  % (body.team, person, e.routed_assignee))
+        sink = get_ticket_sink()
+        synced = sink.set_assignee(e, person)   # current holder becomes the Jira assignee
+        sink.comment(e, "Handed off from %s to %s. %s remains primary owner (accountable); SLA unchanged."
+                     % (primary, person, primary))
     db.commit()
-    return {"ok": True, "subTeam": e.sub_team, "subAssignee": e.sub_assignee}
+    return {"ok": True, "primaryOwner": primary, "currentHolder": person, "jiraAssigneeSynced": synced}
 
 
 @router.post("/exceptions/{pk}/resolve")

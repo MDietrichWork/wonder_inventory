@@ -33,7 +33,7 @@ def _timeline(events: List[TicketEvent]) -> List[Dict]:
     for e in sorted(events, key=lambda x: x.occurred_at):
         # keep creation, status changes, sub-assignments, auto-close — drop pure recurrence pings
         is_change = e.from_status is None or e.from_status != e.to_status
-        is_handoff = "sub-assigned" in (e.to_status or "").lower()
+        is_handoff = "handed off" in (e.to_status or "").lower() or "sub-assigned" in (e.to_status or "").lower()
         if is_change or is_handoff:
             out.append({"status": e.to_status, "at": e.occurred_at, "by": e.actor})
     return out
@@ -59,6 +59,10 @@ def _exception(e: Error, today: str) -> Dict:
         "entityKey": e.entity_key,
         "team": e.routed_team,
         "assignee": e.routed_assignee,
+        "primaryOwner": e.routed_assignee,                       # accountable, never changes on hand-off
+        "currentHolder": e.sub_assignee or e.routed_assignee,    # who's actively working it now
+        "heldSince": (e.sub_assigned_at[:10] if e.sub_assigned_at else e.first_run_date),
+        "heldDays": _days(e.sub_assigned_at[:10] if e.sub_assigned_at else e.first_run_date, today),
         "jira": e.jira_issue_key or "—",
         "jiraStatus": e.status,
         "created": e.first_run_date,
