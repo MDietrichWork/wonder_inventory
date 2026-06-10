@@ -27,6 +27,12 @@ A living log of the project. **Updated at every step** with what was completed (
 - **Verified** headless against live data: shell + KPIs (37 open / 3% SLA, matches backend), donut + 13 type bars, 37 workbench rows with correct columns, drawer opens — **zero console errors**. Visually faithful to the approved design.
 - **Next:** Turnaround/SLA + Rule & Routing Admin screens; wire drawer **write actions** (status/reassign/hand-off/resolve) to the API; then Entra SSO + RBAC. At deploy, build the React `dist` and have the container serve it (replacing the static vanilla console).
 
+### 2026-06-10 — React rebuild brought to full prototype parity
+- After review feedback (the first React drawer was a read-only stub — missing Notes, colored timeline dots, and the status/reassign/hand-off action flow), did a **full feature audit** of the vanilla prototype and closed every gap.
+- **Bug fixed:** the drawer never opened in the browser — it used `.drawer.open`, but the approved CSS reveals it via `.drawer.show` (it rendered off-screen). Caught because the original headless check only asserted DOM presence, not on-screen visibility.
+- **Ported to parity:** drawer (full ownership w/ hand-off box, colored JIRA/ownership timeline `.tdot`, Notes + input, full over-receipt breakdown table w/ UoM/duplicate warnings, and the wired action footer — status `<select>`→transition, Open-in-JIRA, Reassign owner, Hand off…, Add note); Workbench row selection + bulk bar (reassign/comment/resolve/clear); **Turnaround/SLA** screen (aging buckets, by-team/owner/holder, overdue); **Rule & Routing Admin** (rules + enable toggles, rule editor, routing map, SLA targets); keyboard shortcuts (1–4, /, Esc); refresh-after-mutation.
+- **QA:** a **34-point headless feature test** (`/tmp/qa_react.py`) now checks actual on-screen visibility + every screen/control — all green, zero console errors; `tsc --noEmit` clean. Notes stay local-mock (matching the prototype); real Jira-comment wiring is a small backend add if wanted.
+
 ### 2026-06-10 — Phase 1 start: production foundation (Docker · CI · Postgres parity)
 - Began hardening for deployment **without changing the local code-edit loop** (the user keeps editing validations in code, not a UI — [[wonder-rules-in-code-not-ui]]). All three pieces need no cloud creds and are CI-provable.
 - **Containerized:** `app/Dockerfile` (single image = FastAPI API + static console, build context `./app`) + `.dockerignore`. CMD runs `alembic upgrade head` then uvicorn; honors Cloud Run's `$PORT`.

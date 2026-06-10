@@ -4,7 +4,9 @@ import { getBootstrap, apiPost } from "./api";
 import { metrics } from "./lib";
 import { Dashboard } from "./Dashboard";
 import { Workbench } from "./Workbench";
-import { Drawer } from "./Drawer";
+import { Drawer, type Note } from "./Drawer";
+import { Sla } from "./Sla";
+import { Admin } from "./Admin";
 
 type View = "dashboard" | "workbench" | "sla" | "admin";
 
@@ -13,43 +15,58 @@ export function App() {
   const [err, setErr] = useState<string | null>(null);
   const [view, setView] = useState<View>("dashboard");
   const [drill, setDrill] = useState<Drill>(null);
-  const [open, setOpen] = useState<Exception | null>(null);
+  const [openPk, setOpenPk] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [notes, setNotes] = useState<Record<number, Note[]>>({});
 
-  const load = useCallback(() => {
-    getBootstrap().then(setData).catch((e) => setErr(String(e)));
+  const load = useCallback(async () => {
+    try { setData(await getBootstrap()); } catch (e) { setErr(String(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
 
-  const drillTo = (label: string, test: (e: Exception) => boolean) => {
-    setDrill({ label, test });
-    setView("workbench");
-  };
+  const drillTo = (label: string, test: (e: Exception) => boolean) => { setDrill({ label, test }); setView("workbench"); };
+  const ownerQueue = (name: string) => drillTo("Primary owner: " + name, (e) => e.primaryOwner === name);
+  const openExc = (pk: number) => { setView("workbench"); setOpenPk(pk); };
 
   const runAction = async (label: string, path: string) => {
     setBusy(label);
-    try { await apiPost(path); load(); } finally { setBusy(null); }
+    try { await apiPost(path); await load(); } finally { setBusy(null); }
   };
+
+  // keyboard: 1-4 switch views, / focus search, Esc close drawer
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement;
+      if (t && t.matches && t.matches("input,select,textarea")) { if (e.key === "Escape") (t as HTMLInputElement).blur(); return; }
+      if (e.key === "Escape") { setOpenPk(null); return; }
+      if (e.key === "/") { e.preventDefault(); setView("workbench"); setTimeout(() => document.querySelector<HTMLInputElement>(".toolbar input[type=search]")?.focus(), 0); return; }
+      const idx = ["1", "2", "3", "4"].indexOf(e.key);
+      if (idx > -1) setView((["dashboard", "workbench", "sla", "admin"] as View[])[idx]);
+    };
+    document.addEventListener("keydown", h);
+    return () => document.removeEventListener("keydown", h);
+  }, []);
 
   if (err) return <div style={{ padding: 24, color: "#f88" }}>Failed to load: {err}<br />Is the backend running on :8000?</div>;
   if (!data) return <div style={{ padding: 24, color: "#9aa" }}>Loading console…</div>;
 
   const m = metrics(data.exceptions, data.meta.runDate);
+  const openException = openPk != null ? data.exceptions.find((e) => e.pk === openPk) || null : null;
+  const addNote = (pk: number, text: string) =>
+    setNotes((p) => ({ ...p, [pk]: [...(p[pk] || []), { by: "Mike Dietrich", at: data.meta.today, text }] }));
 
   return (
     <div className="app">
       <div className="brand">
         <div className="logo">W</div>
-        <div>
-          <div className="name">Wonder DQ Console</div>
-          <div className="sub">Inventory Data-Quality</div>
-        </div>
+        <div><div className="name">Wonder DQ Console</div><div className="sub">Inventory Data-Quality</div></div>
       </div>
 
       <header className="topbar">
-        <span className="run-pill"><span className="dot" /> Validation run <b>{data.meta.runDate}</b></span>
+        <span className="run-pill"><span className="dot" /> Validation run <b>{data.meta.runDate}</b> · processed <b>{data.meta.today}</b></span>
         <span className="run-pill">JIRA project <b>{data.meta.jiraProject}</b></span>
         <span className="spacer" />
+        <span className="tip">Press <span className="kbd">1</span>–<span className="kbd">4</span> · <span className="kbd">/</span> search · <span className="kbd">Esc</span> close</span>
         <button className="btn sm" disabled={!!busy} onClick={() => runAction("run", "/run")}>{busy === "run" ? "Running…" : "↻ Run validation"}</button>
         <button className="btn sm" disabled={!!busy} onClick={() => runAction("sync", "/sync")}>{busy === "sync" ? "Syncing…" : "⟲ Sync from Jira"}</button>
         <span className="user"><span className="avatar">MD</span> Mike Dietrich · Accounting</span>
@@ -73,29 +90,17 @@ export function App() {
 
       <main className="main">
         {view === "dashboard" && <Dashboard data={data} drillTo={drillTo as any} />}
-        {view === "workbench" && <Workbench data={data} drill={drill} clearDrill={() => setDrill(null)} onOpen={setOpen} />}
-        {view === "sla" && <Stub title="Ticket Turnaround / SLA" />}
-        {view === "admin" && <Stub title="Rule & Routing Admin" />}
+        {view === "workbench" && <Workbench data={data} drill={drill} clearDrill={() => setDrill(null)} onOpen={(e) => setOpenPk(e.pk)} refresh={load} />}
+        {view === "sla" && <Sla data={data} drillTo={drillTo} ownerQueue={ownerQueue} openExc={openExc} />}
+        {view === "admin" && <Admin data={data} />}
       </main>
 
-      {open && <Drawer data={data} exc={open} onClose={() => setOpen(null)} />}
+      {openException && <Drawer data={data} exc={openException} onClose={() => setOpenPk(null)} refresh={load} notes={notes[openException.pk] || []} addNote={addNote} />}
       <div className="proto-banner">PROTOTYPE · <b>React console</b> · live API + validation engine</div>
     </div>
   );
 }
 
 function NavItem({ active, onClick, icon, label, badge }: { active: boolean; onClick: () => void; icon: string; label: string; badge?: number }) {
-  return (
-    <button className={"nav-item" + (active ? " active" : "")} onClick={onClick}>
-      <span className="nico">{icon}</span> {label}{badge != null && <span className="badge">{badge}</span>}
-    </button>
-  );
-}
-
-function Stub({ title }: { title: string }) {
-  return (
-    <section className="view active">
-      <div className="page-head"><h1>{title}</h1><p>This screen ports next — the Dashboard and Workbench are live first since that's the rule-iteration surface.</p></div>
-    </section>
-  );
+  return <button className={"nav-item" + (active ? " active" : "")} onClick={onClick}><span className="nico">{icon}</span> {label}{badge != null && <span className="badge">{badge}</span>}</button>;
 }

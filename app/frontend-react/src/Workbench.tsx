@@ -1,6 +1,7 @@
 import { useState, useMemo } from "react";
 import type { Bootstrap, Drill, Exception } from "./types";
 import { SEVRANK, statusClass } from "./lib";
+import { apiPost } from "./api";
 
 const COLS: { key: keyof Exception | "currentHolder"; label: string; cls?: string; num?: boolean }[] = [
   { key: "id", label: "Error ID", cls: "mono" },
@@ -25,13 +26,14 @@ export const statusPill = (s: string) => <span className={"status " + statusClas
 const uniq = (exc: Exception[], key: keyof Exception) =>
   Array.from(new Set(exc.map((e) => e[key]).filter(Boolean) as string[])).sort();
 
-export function Workbench({ data, drill, clearDrill, onOpen }: {
-  data: Bootstrap; drill: Drill; clearDrill: () => void; onOpen: (e: Exception) => void;
+export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
+  data: Bootstrap; drill: Drill; clearDrill: () => void; onOpen: (e: Exception) => void; refresh: () => Promise<void>;
 }) {
   const exc = data.exceptions;
   const [f, setF] = useState({ q: "", facility: "", system: "", errortype: "", severity: "", status: "", team: "", owner: "" });
   const [sortKey, setSortKey] = useState<string>("severity");
   const [sortDir, setSortDir] = useState(1);
+  const [sel, setSel] = useState<Set<number>>(new Set());
 
   const set = (k: string, v: string) => setF((p) => ({ ...p, [k]: v }));
   const clearFilters = () => { setF({ q: "", facility: "", system: "", errortype: "", severity: "", status: "", team: "", owner: "" }); clearDrill(); };
@@ -64,12 +66,26 @@ export function Workbench({ data, drill, clearDrill, onOpen }: {
   }, [exc, drill, f, sortKey, sortDir]);
 
   const sort = (k: string) => { if (sortKey === k) setSortDir((d) => -d); else { setSortKey(k); setSortDir(1); } };
+  const toggle = (pk: number) => setSel((p) => { const n = new Set(p); n.has(pk) ? n.delete(pk) : n.add(pk); return n; });
+  const allChecked = rows.length > 0 && rows.every((r) => sel.has(r.pk));
+  const toggleAll = () => setSel(allChecked ? new Set() : new Set(rows.map((r) => r.pk)));
+  const selected = exc.filter((e) => sel.has(e.pk));
+
+  const bulkReassign = async () => {
+    if (!selected.length) return;
+    const who = prompt(`Reassign ${selected.length} exception(s) to (assignee name):`, "Sarah Chen");
+    if (!who) return;
+    await Promise.all(selected.map((e) => apiPost(`/exceptions/${e.pk}/assign`, { assignee: who })));
+    setSel(new Set()); await refresh();
+  };
+  const bulkComment = () => { if (!selected.length) return; const c = prompt(`Add a comment to ${selected.length} ticket(s):`, "Investigating batch root cause."); if (c) alert(`Mock: comment posted to ${selected.length} JIRA ticket(s).`); };
+  const bulkResolve = async () => { if (!selected.length) return; await Promise.all(selected.map((e) => apiPost(`/exceptions/${e.pk}/resolve`))); setSel(new Set()); await refresh(); };
 
   return (
     <section className="view active">
       <div className="page-head">
         <h1>Exception Workbench</h1>
-        <p>Triage flagged validation errors from the latest runs. Filter, sort, and click any row for the full snapshot, rule, ownership, and JIRA timeline.</p>
+        <p>Triage flagged validation errors from the latest runs. Filter, sort, multi-select for bulk actions, and click any row for the full snapshot, rule, ownership, and JIRA timeline.</p>
       </div>
 
       <div className="toolbar">
@@ -95,9 +111,21 @@ export function Workbench({ data, drill, clearDrill, onOpen }: {
         </div>
       )}
 
+      {sel.size > 0 && (
+        <div className="bulkbar" style={{ display: "flex" }}>
+          <span className="count">{sel.size} selected</span>
+          <button className="btn sm" onClick={bulkReassign}>Reassign…</button>
+          <button className="btn sm" onClick={bulkComment}>Bulk comment…</button>
+          <button className="btn sm" onClick={bulkResolve}>Mark resolved</button>
+          <span className="spacer" />
+          <button className="btn ghost sm" onClick={() => setSel(new Set())}>Clear selection</button>
+        </div>
+      )}
+
       <div className="grid-wrap">
         <table className="grid">
           <thead><tr>
+            <th className="nosort checkcol"><input type="checkbox" aria-label="Select all" checked={allChecked} onChange={toggleAll} /></th>
             {COLS.map((c) => (
               <th key={c.key as string} className={c.num ? "num" : ""} onClick={() => sort(c.key as string)}>
                 {c.label}{sortKey === c.key && <span className="arr">{sortDir > 0 ? "▲" : "▼"}</span>}
@@ -108,7 +136,10 @@ export function Workbench({ data, drill, clearDrill, onOpen }: {
             {rows.map((e) => {
               const handed = e.currentHolder && e.currentHolder !== e.primaryOwner;
               return (
-                <tr key={e.pk} className="row" tabIndex={0} onClick={() => onOpen(e)}>
+                <tr key={e.pk} className={"row" + (sel.has(e.pk) ? " selected" : "")} tabIndex={0} onClick={() => onOpen(e)}>
+                  <td className="checkcol" onClick={(ev) => ev.stopPropagation()}>
+                    <input type="checkbox" aria-label={"Select " + e.id} checked={sel.has(e.pk)} onChange={() => toggle(e.pk)} />
+                  </td>
                   {COLS.map((c) => {
                     if (c.key === "severity") return <td key="severity">{sevPill(e.severity)}</td>;
                     if (c.key === "jiraStatus") return <td key="jiraStatus">{statusPill(e.jiraStatus)}</td>;

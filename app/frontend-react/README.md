@@ -20,13 +20,22 @@ cd ../frontend-react
 Vite proxies `/api` → `http://127.0.0.1:8000`, so the React console runs against **live BigQuery +
 Jira** data with hot-reload — edit a component or a validation rule (backend) and see it immediately.
 
-## Status (incremental rebuild)
-- **Done:** app shell (brand, topbar with live Run/Sync, sidebar nav), **Reporting Dashboard**
-  (KPIs, trend, system donut, by-type/facility/movement/severity bars, recurring leaderboard),
-  **Exception Workbench** (filters, sort, drill-from-dashboard, search), and a **read-only detail
-  drawer** (snapshot, ownership, timeline, the rule that fired, live over-receipt breakdown).
-- **Next:** port Turnaround/SLA + Rule & Routing Admin screens; wire the drawer **write actions**
-  (status change, reassign, hand-off, resolve) to the API; then Entra SSO + role-based views.
+## Status — full parity with the approved prototype
+All four screens + the drawer are ported and verified headlessly (34-point feature QA, zero console errors):
+- **Reporting Dashboard** — KPIs, trend, system donut, by-type/facility/movement/severity bars,
+  recurring leaderboard, all with dashboard→workbench drill-down.
+- **Exception Workbench** — search + 8 filters, sortable 14-col grid, drill chip, row selection +
+  **bulk bar** (reassign / comment / mark-resolved / clear).
+- **Detail drawer** — snapshot, live over-receipt breakdown table (+ UoM/duplicate warnings),
+  ownership & hand-off, colored JIRA/ownership **timeline**, **Notes**, and the action footer
+  (**status select**, Open-in-JIRA, **Reassign owner**, **Hand off…**, Add note) wired to the API.
+- **Turnaround / SLA** — aging buckets, by-team, by-owner (click → accountability queue), by-holder
+  (held-time), overdue table.
+- **Rule & Routing Admin** — rules table + enable toggles, rule editor, routing map, SLA targets.
+- **Keyboard:** `1`–`4` switch screens, `/` focus search, `Esc` close drawer.
+
+Notes are local-mock (matching the prototype); wiring them to real Jira comments is a small backend add.
+- **Next:** Entra SSO + role-based views; then at deploy, build `dist` and have the container serve it.
 
 ## Layout
 - `src/types.ts` — the `/api/bootstrap` contract types
