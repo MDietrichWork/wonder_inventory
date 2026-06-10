@@ -367,6 +367,7 @@
       if (k === "ordered_qty" && snap.ordered_uom) val = fmtNum(val) + " " + snap.ordered_uom;
       else if (k === "received_qty" && snap.received_uom) val = fmtNum(val) + " " + snap.received_uom;
       else if (k === "over_by_pct" && val != null) val = fmtNum(val) + "%";
+      else if (k === "supplier_price") val = (val == null ? null : "$" + Number(val).toFixed(2));
       var neg = (typeof val === "number" && val < 0) || val === null;
       kv.appendChild(el("div", { class: "k" }, [k]));
       kv.appendChild(el("div", { class: "v" + (neg ? " neg" : "") }, [val === null ? "NULL" : String(val)]));
