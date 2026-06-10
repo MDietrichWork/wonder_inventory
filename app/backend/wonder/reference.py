@@ -16,6 +16,26 @@ FACILITIES = [
 
 SYSTEMS = ["Pantry", "Ship Hero", "Fishbowl"]
 
+# The ledger (`system_of_origin`) and the PO table (`po_source_system`) spell the same systems
+# differently (e.g. "Shiphero" vs "ShipHero", "Ship Hero"). Canonicalize on read so a system isn't
+# split across donut slices / filter options. Unknown systems pass through trimmed.
+_SYSTEM_CANON = {
+    "shiphero": "ShipHero",
+    "fishbowl": "Fishbowl",
+    "pantry": "Pantry",
+    "extensiv": "Extensiv",
+    "extensiv(manual)": "Extensiv (Manual)",
+    "ordergrid-external": "OrderGrid - External",
+    "eddon": "Ed Don",
+    "system": "System",
+}
+
+
+def canon_system(s):
+    if not s:
+        return s
+    return _SYSTEM_CANON.get("".join(s.split()).lower(), s.strip())
+
 TEAMS = {
     "SC Product (IMS)": ["Pavel Romanov", "Sarah Chen", "Marcus Webb"],
     "Field Ops": ["Diego Alvarez", "Priya Nair"],

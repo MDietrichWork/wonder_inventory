@@ -55,7 +55,7 @@ def _exception(e: Error, today: str) -> Dict:
         "severity": e.severity,
         "table": e.source_table,
         "facility": snap.get("facility", "—"),
-        "system": snap.get("system", "—"),
+        "system": reference.canon_system(snap.get("system")) or "—",
         "entityKey": e.entity_key,
         "team": e.routed_team,
         "assignee": e.routed_assignee,
