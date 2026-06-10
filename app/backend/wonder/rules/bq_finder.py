@@ -171,3 +171,42 @@ def breakdown(ds, po: str, consumable_sku: str, system: str = None):
     return [{"source": r.source, "qty": r.qty, "uom": r.uom, "order_type": r.order_type, "l1_action": r.l1_action,
              "l2_action": r.l2_action, "status": r.status, "facility": r.facility,
              "ts": str(r.ts) if r.ts else None} for r in rows]
+
+
+def recheck(ds, pairs):
+    """Current received-vs-ordered + UoM for a set of (po, consumable_sku) OPEN tickets, so the
+    job can auto-close the ones that no longer fail. Returns {(po, sku): {recv, ruom, ord, ouom}}.
+    Receipts summed over the lookback window (recent fixes show up; very old POs may read as
+    'no recent receipts' and are left open rather than risk a false close)."""
+    if not pairs:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, potbl = settings.bq_ledger_table, settings.bq_po_table
+    keys = ["%s~~%s" % (p, s) for (p, s) in pairs if p is not None and s is not None]
+    if not keys:
+        return {}
+    sql = f"""
+    WITH received AS (
+      SELECT ref_order_id AS po, consumable_sku AS sku, SUM(consumable_quantity_change) AS recv,
+             ANY_VALUE(consumable_uom) AS ruom
+      FROM `{proj}.{dset}.{led}`
+      WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL
+        AND CONCAT(ref_order_id, '~~', consumable_sku) IN UNNEST(@keys)
+        AND datetime_utc >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {BACKFILL_LOOKBACK_DAYS} DAY)
+      GROUP BY po, sku),
+    ordered AS (
+      SELECT po, consumable_sku AS sku, SUM(consumable_sku_qty) AS ord, ANY_VALUE(consumable_uom) AS ouom
+      FROM `{proj}.{dset}.{potbl}`
+      WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL
+        AND CONCAT(po, '~~', consumable_sku) IN UNNEST(@keys)
+      GROUP BY po, sku)
+    SELECT po, sku, r.recv AS recv, r.ruom AS ruom, o.ord AS ord, o.ouom AS ouom
+    FROM received r FULL OUTER JOIN ordered o USING (po, sku)
+    """
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
+    out = {}
+    for row in ds.client.query(sql, job_config=cfg).result():
+        out[(row.po, row.sku)] = {"recv": row.recv, "ruom": row.ruom, "ord": row.ord, "ouom": row.ouom}
+    return out
