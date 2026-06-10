@@ -67,6 +67,8 @@ ERROR_TYPES = [
      "owner": "Procurement", "desc": "Purchase PO line has a $0.00 or NULL vendor (supplier) price — the receipt can't be costed into the GL until a price is set."},
     {"type": "PO_MISSING_NUMBER", "rule": "PO number present (master table)", "ruleType": "NOT_NULL",
      "owner": "SC Product (IMS)", "desc": "A row in the PO master table has a NULL/blank PO number — a broken master record with nothing to receive against. Safety-net rule: currently finds 0 on live data, kept to catch upstream degradation."},
+    {"type": "PO_SKU_NOT_ON_PO", "rule": "Received SKU listed on the PO", "ruleType": "REFERENTIAL",
+     "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but that SKU isn't on the PO's lines — a 3-way-match break: wrong item received, an undocumented substitution, or a PO line never set up. (Framework catalog PO-02.)"},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -123,6 +125,22 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
      "expression": "running_on_hand >= 0", "enabled": True},
+    {"id": "PO-14", "name": "Received SKU listed on the PO", "primitive": "REFERENTIAL", "error_type": "PO_SKU_NOT_ON_PO",
+     "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
+     "params": {},  # BigQuery 3-way-match join; runs via the SQL finder, skipped by the fixtures engine
+     "expression": (
+        "-- 3-way match (catalog PO-02): a consumable_sku received against an existing PO\n"
+        "-- (ledger.ref_order_id = PO.po, order_type='Purchase') that is NOT on the PO's lines.\n"
+        "WITH led AS (\n"
+        "  SELECT DISTINCT ref_order_id AS po, consumable_sku\n"
+        "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL),\n"
+        "po_keys AS (SELECT DISTINCT po, consumable_sku FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase'),\n"
+        "po_exists AS (SELECT DISTINCT po FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase')\n"
+        "SELECT l.po, l.consumable_sku FROM led l JOIN po_exists pe USING (po)\n"
+        "LEFT JOIN po_keys pk ON l.po=pk.po AND l.consumable_sku=pk.consumable_sku\n"
+        "WHERE pk.po IS NULL  -- PO exists, but this received SKU isn't on it"
+     ), "enabled": True},
     {"id": "PO-13", "name": "PO number present (master table)", "primitive": "NOT_NULL", "error_type": "PO_MISSING_NUMBER",
      "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {"column": "po", "where": {"order_type": ["Purchase"]}},
@@ -162,6 +180,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "Vendor Pricing"},
     {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
      "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
+    {"error_type": "PO_SKU_NOT_ON_PO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
+     "jira_project": "WIQ", "jira_component": "3-Way Match"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team

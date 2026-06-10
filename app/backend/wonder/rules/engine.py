@@ -66,7 +66,9 @@ def _not_null(rule, ds, run_date) -> List[Finding]:
 
 
 def _referential(rule, ds, run_date) -> List[Finding]:
-    col = L[rule.params["column"]]
+    col = L.get(rule.params.get("column"))
+    if col is None:
+        return []  # BigQuery-only rule (column not in the logical ledger map) — skip in fixtures
     ref_col = P.get(rule.params["ref_column"], rule.params["ref_column"])
     refset = {r.get(ref_col) for r in ds.fetch_table(rule.params["ref_table"])}
     where = rule.params.get("where", {})

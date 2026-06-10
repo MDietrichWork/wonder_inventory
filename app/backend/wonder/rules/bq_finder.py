@@ -288,7 +288,84 @@ def recheck_null_po(ds, ids):
     return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
 
 
-_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po}
+def _build_sku_not_on_po_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """PO-14 (catalog PO-02): a consumable_sku received against an existing PO that isn't on the
+    PO's lines. Ledger-sourced, so it carries the receiving l1/l2 movement."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH led AS (
+  SELECT ref_order_id AS po, consumable_sku,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system,
+         ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS ruom,
+         SUM(consumable_quantity_change) AS received_qty,
+         DATE(MIN(datetime_utc)) AS first_receipt_date, DATE(MAX(datetime_utc)) AS last_receipt_date,
+         ANY_VALUE(l1_action HAVING MAX consumable_quantity_change) AS move_l1,
+         ANY_VALUE(l2_action HAVING MAX consumable_quantity_change) AS move_l2
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL {date_filter}
+  GROUP BY po, consumable_sku),
+po_keys AS (SELECT DISTINCT po, consumable_sku FROM `{proj}.{dset}.{po}`
+            WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL),
+po_exists AS (SELECT po, ANY_VALUE(supplier_name) AS supplier FROM `{proj}.{dset}.{po}`
+              WHERE order_type = 'Purchase' GROUP BY po),
+flagged AS (
+  SELECT l.*, pe.supplier
+  FROM led l JOIN po_exists pe USING (po)
+  LEFT JOIN po_keys pk ON l.po = pk.po AND l.consumable_sku = pk.consumable_sku
+  WHERE pk.po IS NULL),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY last_receipt_date DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_receipt_date DESC"""
+
+
+def _sku_not_on_po(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_SKU_NOT_ON_PO (High, SC Product (IMS)) — received SKU not on the matching PO."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_sku_not_on_po_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        ek = f"{r.po}:{r.consumable_sku}"
+        snap = {
+            "po": r.po, "consumable_sku": r.consumable_sku, "item_name": r.item_name,
+            "supplier_name": r.supplier, "on_po": False,
+            "received_qty": r.received_qty, "received_uom": r.ruom,
+            "facility": r.facility or "—", "system": r.system or "—",
+            "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if r.move_l1 else None,
+            "first_receipt": _d(r.first_receipt_date), "last_receipt": _d(r.last_receipt_date),
+            "breached_at": _d(r.first_receipt_date),  # first received against the PO without being on it
+        }
+        findings.append(Finding("PO-14", "PO_SKU_NOT_ON_PO", "High", src, ek, snap))
+    return findings, total
+
+
+def recheck_sku_on_po(ds, pairs):
+    """Which (po, consumable_sku) tickets are NOW on the PO — those can be auto-closed."""
+    if not pairs:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    keys = ["%s~~%s" % (p, s) for (p, s) in pairs if p is not None and s is not None]
+    if not keys:
+        return set()
+    sql = f"""SELECT DISTINCT CONCAT(po, '~~', consumable_sku) AS key
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Purchase' AND CONCAT(po, '~~', consumable_sku) IN UNNEST(@keys)"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
+    return {r.key for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po, "PO-14": _sku_not_on_po}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:
