@@ -20,6 +20,13 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — Phase 5 start: React rebuild of the console (runs locally, live data)
+- Began the production UI rebuild as a **Vite + React + TypeScript** app at `app/frontend-react/`, so the user can run it locally with hot-reload while making visual changes / testing new rules. **Reuses the approved `styles.css` verbatim** (identical look) and hits the **same** FastAPI API; the vanilla console under `app/frontend` is left untouched.
+- Installed **Node 24 LTS standalone** (`~/.local/bin/node`, no admin — brew is permission-broken). `npm run dev` serves :5173 and **proxies `/api` → :8000**, so it runs against live BigQuery + Jira.
+- **Ported this iteration:** app shell (brand, topbar with live **Run validation** / **Sync from Jira**, sidebar nav with open-count badge), **Reporting Dashboard** (KPIs, SVG trend, system donut, by-type/facility/movement/severity bars, recurring leaderboard — all with dashboard→workbench drill-down), **Exception Workbench** (search + 8 filters incl. Primary owner, sortable 14-col grid, drill chip), and a **read-only detail drawer** (snapshot with `$0.00`/`NULL` price formatting + began/detected/last-receipt line, ownership, timeline, the rule that fired, live over-receipt breakdown).
+- **Verified** headless against live data: shell + KPIs (37 open / 3% SLA, matches backend), donut + 13 type bars, 37 workbench rows with correct columns, drawer opens — **zero console errors**. Visually faithful to the approved design.
+- **Next:** Turnaround/SLA + Rule & Routing Admin screens; wire drawer **write actions** (status/reassign/hand-off/resolve) to the API; then Entra SSO + RBAC. At deploy, build the React `dist` and have the container serve it (replacing the static vanilla console).
+
 ### 2026-06-10 — Phase 1 start: production foundation (Docker · CI · Postgres parity)
 - Began hardening for deployment **without changing the local code-edit loop** (the user keeps editing validations in code, not a UI — [[wonder-rules-in-code-not-ui]]). All three pieces need no cloud creds and are CI-provable.
 - **Containerized:** `app/Dockerfile` (single image = FastAPI API + static console, build context `./app`) + `.dockerignore`. CMD runs `alembic upgrade head` then uvicorn; honors Cloud Run's `$PORT`.
