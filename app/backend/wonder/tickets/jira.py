@@ -12,6 +12,7 @@ import httpx
 
 from .base import TicketSink
 from ..config import settings
+from .. import reference
 
 log = logging.getLogger("wonder.jira")
 
@@ -37,6 +38,22 @@ class JiraTicketSink(TicketSink):
             headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=20.0,
         )
+        self._acct_cache = {}  # email -> accountId
+
+    def _resolve_account(self, email):
+        if not email:
+            return None
+        if email not in self._acct_cache:
+            acct = None
+            try:
+                r = self.client.get(self.base + "/rest/api/3/user/search", params={"query": email})
+                r.raise_for_status()
+                users = r.json()
+                acct = users[0]["accountId"] if users else None
+            except Exception as e:  # pragma: no cover - network
+                log.warning("Jira user lookup failed for %s: %s", email, e)
+            self._acct_cache[email] = acct
+        return self._acct_cache[email]
 
     def _summary(self, error) -> str:
         return "%s // %s" % (error.error_type, error.entity_key)
@@ -86,21 +103,30 @@ class JiraTicketSink(TicketSink):
         return {"type": "doc", "version": 1, "content": body}
 
     def create(self, error) -> Optional[str]:
+        team = reference.JIRA_TEAM_MAP.get(error.routed_team)
+        labels = ["wonder-dq", "fp-" + error.fingerprint[:16]]
+        if team:
+            labels.append(team["group"])   # team label so Jira can be filtered by owner team
         base = {
             "project": {"key": settings.jira_project_key},
             "summary": self._summary(error),
             "description": self._description_adf(error),
             "issuetype": {"name": settings.jira_issue_type},
-            "labels": ["wonder-dq", "fp-" + error.fingerprint[:16]],
+            "labels": labels,
         }
         if settings.jira_fingerprint_field:
             base[settings.jira_fingerprint_field] = error.fingerprint
+
         optional = {"priority": {"name": SEVERITY_TO_PRIORITY.get(error.severity, "Medium")}}
-        if error.routed_team:
-            optional["components"] = [{"name": error.routed_team}]
-        # Try with priority + components; if the project rejects either, fall back (priority first).
+        # Assignee: mapped user for the team, else the default (JIRA_EMAIL) account.
+        assignee_email = (team or {}).get("assignee_email") or settings.jira_email
+        acct = self._resolve_account(assignee_email)
+        if acct:
+            optional["assignee"] = {"accountId": acct}
+
+        # Try full; if the project rejects assignee/priority, fall back (keep priority longest).
         last = None
-        for drop in ((), ("components",), ("components", "priority")):
+        for drop in ((), ("assignee",), ("assignee", "priority")):
             fields = dict(base, **{k: v for k, v in optional.items() if k not in drop})
             try:
                 r = self.client.post(self.base + "/rest/api/3/issue", json={"fields": fields})
@@ -113,6 +139,21 @@ class JiraTicketSink(TicketSink):
         log.warning("Jira create failed for %s: %s", error.entity_key, last)
         return None
 
+    def set_assignee(self, error, query: str) -> bool:
+        if not error.jira_issue_key or not query:
+            return False
+        acct = self._resolve_account(query)
+        if not acct:
+            log.warning("Jira assignee '%s' not found for %s", query, error.jira_issue_key)
+            return False
+        try:
+            self.client.put(self.base + "/rest/api/3/issue/%s/assignee" % error.jira_issue_key,
+                            json={"accountId": acct}).raise_for_status()
+            return True
+        except Exception as e:  # pragma: no cover - network
+            log.warning("Jira set-assignee failed for %s: %s", error.jira_issue_key, e)
+            return False
+
     def comment(self, error, text: str) -> None:
         if not error.jira_issue_key:
             return
@@ -122,18 +163,28 @@ class JiraTicketSink(TicketSink):
         except Exception as e:  # pragma: no cover
             log.warning("Jira comment failed for %s: %s", error.jira_issue_key, e)
 
+    def transition(self, error, status_name: str) -> bool:
+        """Transition the issue to the named status (transition name, case-insensitive)."""
+        if not error.jira_issue_key or not status_name:
+            return False
+        try:
+            tr = self.client.get(self.base + "/rest/api/3/issue/%s/transitions" % error.jira_issue_key)
+            tr.raise_for_status()
+            avail = tr.json().get("transitions", [])
+            tid = next((t["id"] for t in avail if t["name"].lower() == status_name.lower()), None)
+            if tid is None:
+                log.warning("Jira: no transition '%s' for %s (have %s)", status_name,
+                            error.jira_issue_key, [t["name"] for t in avail])
+                return False
+            self.client.post(self.base + "/rest/api/3/issue/%s/transitions" % error.jira_issue_key,
+                             json={"transition": {"id": tid}}).raise_for_status()
+            return True
+        except Exception as e:  # pragma: no cover - network
+            log.warning("Jira transition failed for %s: %s", error.jira_issue_key, e)
+            return False
+
     def close(self, error, text: str) -> None:
         if not error.jira_issue_key:
             return
-        try:
-            self.comment(error, text)
-            tr = self.client.get(self.base + "/rest/api/3/issue/%s/transitions" % error.jira_issue_key)
-            tr.raise_for_status()
-            target = settings.jira_done_transition.lower()
-            tid = next((t["id"] for t in tr.json().get("transitions", [])
-                        if t["name"].lower() == target), None)
-            if tid:
-                self.client.post(self.base + "/rest/api/3/issue/%s/transitions" % error.jira_issue_key,
-                                 json={"transition": {"id": tid}}).raise_for_status()
-        except Exception as e:  # pragma: no cover
-            log.warning("Jira close failed for %s: %s", error.jira_issue_key, e)
+        self.comment(error, text)
+        self.transition(error, settings.jira_done_transition)

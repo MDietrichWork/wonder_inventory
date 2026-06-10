@@ -10,7 +10,8 @@ from ..models import Error, TicketEvent, ValidationRun
 from .. import reference
 from ..config import settings
 
-OPEN_STATES = ("Open", "In Progress", "In Review")
+# A ticket is closed once it reaches one of these (covers app + Jira status names).
+CLOSED_STATES = ("Resolved", "Closed", "Auto-Closed", "Done")
 PRIMITIVE_DISPLAY = {"OVER_RECEIPT": "RANGE", "RECON_TRANSFER": "RECONCILIATION"}
 
 
@@ -41,7 +42,7 @@ def _timeline(events: List[TicketEvent]) -> List[Dict]:
 def _exception(e: Error, today: str) -> Dict:
     snap = e.data_snapshot or {}
     resolved_date = e.resolved_at[:10] if e.resolved_at else None
-    is_open = e.status in OPEN_STATES
+    is_open = e.status not in CLOSED_STATES
     sla = reference.SLA_TARGETS.get(e.severity, 3)
     age = _days(e.first_run_date, today)
     turnaround = _days(e.first_run_date, resolved_date) if resolved_date else None

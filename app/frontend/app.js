@@ -97,7 +97,7 @@
   fillSelect($("#f-system"), exVals("system"), "All systems");
   fillSelect($("#f-errortype"), D.errorTypes.map(function (t) { return t.type; }), "All error types");
   fillSelect($("#f-severity"), ["Urgent", "High", "Medium", "Low"], "All severities");
-  fillSelect($("#f-status"), ["Open", "In Progress", "In Review", "Resolved", "Closed", "Auto-Closed"], "All statuses");
+  fillSelect($("#f-status"), exVals("jiraStatus"), "All statuses");
   fillSelect($("#f-team"), Object.keys(D.teams), "All teams");
 
   /* ============================ WORKBENCH GRID ============================ */
@@ -435,6 +435,15 @@
     body.appendChild(nsec);
 
     // action buttons (rebind to this row) — persisted via the API
+    var statusSel = $("#dr-status");
+    var STATUS_OPTS = ["To Do", "In Progress", "Done"];
+    var opts = [e.jiraStatus].concat(STATUS_OPTS.filter(function (s) { return s !== e.jiraStatus; }));
+    statusSel.innerHTML = opts.map(function (s) {
+      return '<option' + (s === e.jiraStatus ? ' selected' : '') + '>' + s + '</option>';
+    }).join("");
+    statusSel.onchange = function () {
+      if (statusSel.value !== e.jiraStatus) apiPost("/exceptions/" + e.pk + "/transition", { to: statusSel.value });
+    };
     $("#dr-jira").onclick = function () { openJira(e.jira); };
     $("#dr-assign").onclick = function () {
       var w = prompt("Assign " + e.id + " to a person (team-leader assignment — updates the JIRA assignee):", e.assignee);

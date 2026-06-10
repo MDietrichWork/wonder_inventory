@@ -39,6 +39,13 @@ class SubAssignBody(BaseModel):
     person: Optional[str] = None
 
 
+class TransitionBody(BaseModel):
+    to: str
+
+
+CLOSED_AT_STATES = ("Resolved", "Closed", "Done", "Auto-Closed")
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -103,6 +110,24 @@ def breakdown(pk: int, db=Depends(get_db)):
     return result
 
 
+@router.post("/exceptions/{pk}/transition")
+def transition(pk: int, body: TransitionBody, db=Depends(get_db)):
+    """Change the ticket's status from the workbench and push the transition to Jira."""
+    e = _get_error(db, pk)
+    if e.jira_issue_key and not get_ticket_sink().transition(e, body.to):
+        raise HTTPException(400, "Jira transition to '%s' isn't available from '%s'." % (body.to, e.status))
+    prev, at = e.status, _now()
+    e.status = body.to
+    if body.to in CLOSED_AT_STATES and not e.resolved_at:
+        e.resolved_at = at
+    db.add(TicketEvent(error_id=e.id, jira_issue_key=e.jira_issue_key, from_status=prev, to_status=body.to,
+                       actor="Mike Dietrich", occurred_at=at, note="Status changed in the workbench."))
+    db.add(AuditLog(actor="Mike Dietrich", action="transition", entity="error", entity_id=str(e.id),
+                    before={"status": prev}, after={"status": body.to}, at=at))
+    db.commit()
+    return {"ok": True, "status": e.status}
+
+
 @router.post("/exceptions/{pk}/assign")
 def assign(pk: int, body: AssignBody, db=Depends(get_db)):
     e = _get_error(db, pk)
@@ -113,8 +138,9 @@ def assign(pk: int, body: AssignBody, db=Depends(get_db)):
                        note="Assigned to %s (would update the JIRA assignee)." % body.assignee))
     db.add(AuditLog(actor="Mike Dietrich", action="assign", entity="error", entity_id=str(e.id),
                     before={"assignee": before}, after={"assignee": body.assignee}, at=_now()))
+    synced = get_ticket_sink().set_assignee(e, body.assignee) if e.jira_issue_key else False
     db.commit()
-    return {"ok": True, "assignee": e.routed_assignee}
+    return {"ok": True, "assignee": e.routed_assignee, "jiraSynced": synced}
 
 
 @router.post("/exceptions/{pk}/subassign")
@@ -128,6 +154,9 @@ def subassign(pk: int, body: SubAssignBody, db=Depends(get_db)):
                        occurred_at=at, note="Root cause routed to %s. SLA does not reset." % body.team))
     db.add(AuditLog(actor=e.routed_assignee, action="sub_assign", entity="error", entity_id=str(e.id),
                     before=None, after={"team": body.team, "person": person}, at=at))
+    if e.jira_issue_key:
+        get_ticket_sink().comment(e, "Sub-assigned to %s (%s). Primary owner stays %s; SLA does not reset."
+                                  % (body.team, person, e.routed_assignee))
     db.commit()
     return {"ok": True, "subTeam": e.sub_team, "subAssignee": e.sub_assignee}
 
@@ -142,5 +171,7 @@ def resolve(pk: int, db=Depends(get_db)):
                        note="Marked resolved in the workbench."))
     db.add(AuditLog(actor="Mike Dietrich", action="resolve", entity="error", entity_id=str(e.id),
                     before={"status": "Open"}, after={"status": "Resolved"}, at=at))
+    if e.jira_issue_key:
+        get_ticket_sink().close(e, "Marked resolved in the workbench by Mike Dietrich.")
     db.commit()
     return {"ok": True, "status": e.status}

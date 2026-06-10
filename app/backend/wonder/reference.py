@@ -117,3 +117,15 @@ ROUTING = [
     {"error_type": "NEGATIVE_ON_HAND", "team": "SC Product (IMS)", "assignee": "Pavel Romanov",
      "jira_project": "WIQ", "jira_component": "On-Hand Recon"},
 ]
+
+# Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team
+# label) + a default assignee email. assignee_email=None falls back to the JIRA_EMAIL account
+# (handy in a single-user sandbox). The `group` value is also applied as a team label on each
+# ticket so Jira can be filtered by team.
+JIRA_TEAM_MAP = {
+    "Field Ops": {"group": "dq-field-ops", "assignee_email": None},
+    "SC Product (IMS)": {"group": "dq-sc-product-ims", "assignee_email": None},
+    "Procurement": {"group": "dq-procurement", "assignee_email": None},
+    "Accounting (Cost Accountant)": {"group": "dq-accounting", "assignee_email": None},
+    "HDR Field Ops": {"group": "dq-hdr-field-ops", "assignee_email": None},
+}

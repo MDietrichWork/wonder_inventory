@@ -16,3 +16,6 @@ class MemoryTicketSink(TicketSink):
 
     def close(self, error, text: str) -> None:
         pass
+
+    def transition(self, error, status_name: str) -> bool:
+        return True  # no external system; the app DB is the source of truth

@@ -14,3 +14,11 @@ class TicketSink:
     def close(self, error, text: str) -> None:
         """Transition the ticket to a resolved/closed state (used for auto-close)."""
         pass
+
+    def set_assignee(self, error, query: str) -> bool:
+        """Set the ticket assignee (resolve query=email/name). Returns True if applied."""
+        return False
+
+    def transition(self, error, status_name: str) -> bool:
+        """Move the ticket to the named status/transition. Returns True if applied."""
+        return False
