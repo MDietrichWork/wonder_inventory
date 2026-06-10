@@ -4,8 +4,6 @@ import { fmtNum } from "./lib";
 import { getBreakdown, jiraUrl, apiPost } from "./api";
 import { sevPill, statusPill } from "./Workbench";
 
-export type Note = { by: string; at: string; text: string };
-
 const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt"]);
 const STATUS_OPTS = ["Open", "In Progress", "In Review", "Resolved"];
 
@@ -19,9 +17,10 @@ function snapValue(k: string, val: any, snap: Record<string, any>): { text: stri
   return { text: out === null ? "NULL" : String(out), neg };
 }
 
-export function Drawer({ data, exc, onClose, refresh, notes, addNote }: {
-  data: Bootstrap; exc: Exception; onClose: () => void; refresh: () => Promise<void>; notes: Note[]; addNote: (pk: number, text: string) => void;
+export function Drawer({ data, exc, onClose, refresh }: {
+  data: Bootstrap; exc: Exception; onClose: () => void; refresh: () => Promise<void>;
 }) {
+  const notes = exc.notes || [];
   const rule = data.rules.find((r) => r.id === exc.rule);
   const meta = data.errorTypes.find((t) => t.type === exc.errorType);
   const route = data.routing.find((r) => r.errorType === exc.errorType);
@@ -52,7 +51,7 @@ export function Drawer({ data, exc, onClose, refresh, notes, addNote }: {
     const t = prompt("Their team (optional):", exc.subAssign?.toTeam || "");
     act("/subassign", { person: p, team: t || null });
   };
-  const submitNote = () => { if (!noteText.trim()) return; addNote(exc.pk, noteText.trim()); setNoteText(""); };
+  const submitNote = async () => { if (!noteText.trim()) return; await act("/comment", { text: noteText.trim() }); setNoteText(""); };
 
   const statusOpts = STATUS_OPTS.includes(exc.jiraStatus) ? STATUS_OPTS : [exc.jiraStatus, ...STATUS_OPTS];
 
@@ -143,7 +142,7 @@ export function Drawer({ data, exc, onClose, refresh, notes, addNote }: {
               ))}
             </ul>
             <div className="note-input">
-              <input type="text" placeholder="Add a note…" value={noteText}
+              <input type="text" placeholder="Add a note (posts a comment to Jira)…" value={noteText}
                 onChange={(e) => setNoteText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitNote()} />
               <button className="btn sm primary" onClick={submitNote}>Add</button>
             </div>

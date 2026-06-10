@@ -44,6 +44,10 @@ class TransitionBody(BaseModel):
     to: str
 
 
+class CommentBody(BaseModel):
+    text: str
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -171,6 +175,30 @@ def subassign(pk: int, body: SubAssignBody, db=Depends(get_db)):
                      % (primary, person, primary))
     db.commit()
     return {"ok": True, "primaryOwner": primary, "currentHolder": person, "jiraAssigneeSynced": synced}
+
+
+@router.post("/exceptions/{pk}/comment")
+def comment(pk: int, body: CommentBody, db=Depends(get_db)):
+    """Add a note from the console — posts a comment to the Jira issue and records it on the
+    ticket timeline (kind 'Comment') so it persists and shows back in the app."""
+    e = _get_error(db, pk)
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "Empty comment")
+    at = _now()
+    db.add(TicketEvent(error_id=e.id, jira_issue_key=e.jira_issue_key, from_status="Comment",
+                       to_status="Comment", actor="Mike Dietrich", occurred_at=at, note=text))
+    db.add(AuditLog(actor="Mike Dietrich", action="comment", entity="error", entity_id=str(e.id),
+                    before=None, after={"comment": text}, at=at))
+    synced = False
+    if e.jira_issue_key:
+        try:
+            get_ticket_sink().comment(e, "Mike Dietrich (DQ console): " + text)
+            synced = True
+        except Exception:  # pragma: no cover - network
+            synced = False
+    db.commit()
+    return {"ok": True, "synced": synced}
 
 
 @router.post("/exceptions/{pk}/resolve")

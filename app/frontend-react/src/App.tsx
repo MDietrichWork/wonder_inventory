@@ -4,7 +4,7 @@ import { getBootstrap, apiPost } from "./api";
 import { metrics } from "./lib";
 import { Dashboard } from "./Dashboard";
 import { Workbench } from "./Workbench";
-import { Drawer, type Note } from "./Drawer";
+import { Drawer } from "./Drawer";
 import { Sla } from "./Sla";
 import { Admin } from "./Admin";
 
@@ -17,7 +17,6 @@ export function App() {
   const [drill, setDrill] = useState<Drill>(null);
   const [openPk, setOpenPk] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [notes, setNotes] = useState<Record<number, Note[]>>({});
 
   const load = useCallback(async () => {
     try { setData(await getBootstrap()); } catch (e) { setErr(String(e)); }
@@ -52,8 +51,6 @@ export function App() {
 
   const m = metrics(data.exceptions, data.meta.runDate);
   const openException = openPk != null ? data.exceptions.find((e) => e.pk === openPk) || null : null;
-  const addNote = (pk: number, text: string) =>
-    setNotes((p) => ({ ...p, [pk]: [...(p[pk] || []), { by: "Mike Dietrich", at: data.meta.today, text }] }));
 
   return (
     <div className="app">
@@ -95,7 +92,7 @@ export function App() {
         {view === "admin" && <Admin data={data} />}
       </main>
 
-      {openException && <Drawer data={data} exc={openException} onClose={() => setOpenPk(null)} refresh={load} notes={notes[openException.pk] || []} addNote={addNote} />}
+      {openException && <Drawer data={data} exc={openException} onClose={() => setOpenPk(null)} refresh={load} />}
       <div className="proto-banner">PROTOTYPE · <b>React console</b> · live API + validation engine</div>
     </div>
   );

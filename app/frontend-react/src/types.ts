@@ -25,6 +25,7 @@ export interface Exception {
   snapshot: Record<string, any>;
   rule: string;
   timeline: { status: string; at: string; by: string }[];
+  notes: { by: string; at: string; text: string }[];
   age: number;
   turnaround: number | null;
   slaTarget: number;
