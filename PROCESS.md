@@ -20,6 +20,12 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-10 — Data-derived SLA anchor (breach date, not batch-detection date)
+- **Age / SLA now start when the error actually began in the data, not when the nightly batch caught it.** The over-receipt finder gained an `evt` CTE with a running cumulative received-qty per (po, sku) and a `breach` CTE that pinpoints the **first receipt at which cumulative received crossed the ordered threshold** = the breach date. UoM-mismatch anchors to the **first receipt in the conflicting unit**. `validate.py` stores that as the Error's age anchor (`first_run_date`), while `detected_at` keeps the real detection timestamp.
+- **Why breach date, not last-receipt** (decided with the user): last-receipt resets the clock on every new delivery, hiding chronic problems; breach date = true inception, so the **oldest unfixed breaches surface first** and you can drill by severity × age. Last-receipt is kept as a separate *staleness* signal.
+- The drawer now shows the full timeline — **"began {breach} · detected {run} · last receipt {last}"** — and the dashboard's "New today" switched to *detected*-today (so it still means newly-flagged).
+- **Effect on the live demo:** ages now spread **1–14 days** across the backfill (was a flat 0d), the aging buckets, held-time, and the overdue list all populate realistically (25 of 27 breaching — the aged backlog the backfill is meant to expose). Re-seeded against live BigQuery + a clean Jira project; lifecycle tests green (3 passed).
+
 ### 2026-06-10 — Accountability queue + SLA-by-holder views
 - **Accountability queue (primary owner).** New **Primary owner** filter on the Exception Workbench shows everything a person is accountable for — *including tickets they've handed off*. The SLA "By owner" table is now keyed on the primary owner (accountable, never moves on hand-off), gained a **Handed off** column, and each name is **clickable → opens that owner's full accountability queue** in the workbench.
 - **SLA-by-holder (held-time).** New **"By holder"** table on the Turnaround/SLA screen, keyed on whoever *currently holds* each open ticket: Holding · Handed-to-them · Breaching · Avg held · Total held-days. Held-time is attributed to the current holder while the SLA clock still belongs to the primary owner and does not reset. Clicking a holder drills the workbench to the tickets they're holding. Verified: Tom Becker (a non-owner who received a hand-off) correctly appears as a holder with his handed-off count.

@@ -65,7 +65,9 @@ def _exception(e: Error, today: str) -> Dict:
         "heldDays": _days(e.sub_assigned_at[:10] if e.sub_assigned_at else e.first_run_date, today),
         "jira": e.jira_issue_key or "—",
         "jiraStatus": e.status,
-        "created": e.first_run_date,
+        "created": e.first_run_date,                              # = breach date (when the error began)
+        "detectedOn": (e.detected_at or e.first_run_date)[:10],   # when the batch caught it
+        "lastReceipt": snap.get("last_receipt"),                  # staleness: most recent receipt activity
         "resolved": resolved_date,
         "recurrence": e.recurrence,
         "snapshot": snap,

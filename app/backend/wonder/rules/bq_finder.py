@@ -32,34 +32,33 @@ BACKFILL_LOOKBACK_DAYS = 14   # initial run: history to sweep for the existing b
 def _build_sql(backfill: bool, lookback: int, high: float, cap: int) -> str:
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
-    if backfill:
-        received = f"""received AS (
-  SELECT ref_order_id AS po, consumable_sku, SUM(consumable_quantity_change) AS received_qty,
-         ANY_VALUE(consumable_uom) AS received_uom,
-         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system, ANY_VALUE(item_name) AS item_name
-  FROM `{proj}.{dset}.{led}`
-  WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL
-    AND DATE(datetime_utc) <= @run_date
-    AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)
-  GROUP BY po, consumable_sku)"""
-        head = "WITH " + received
-    else:
-        touched = f"""touched AS (
-  SELECT DISTINCT ref_order_id AS po, consumable_sku FROM `{proj}.{dset}.{led}`
-  WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL AND DATE(datetime_utc) = @run_date)"""
-        received = f"""received AS (
-  SELECT l.ref_order_id AS po, l.consumable_sku, SUM(l.consumable_quantity_change) AS received_qty,
-         ANY_VALUE(l.consumable_uom) AS received_uom,
-         ANY_VALUE(l.facility_name) AS facility, ANY_VALUE(l.system_of_origin) AS system, ANY_VALUE(l.item_name) AS item_name
-  FROM `{proj}.{dset}.{led}` l
-  JOIN touched t ON l.ref_order_id = t.po AND l.consumable_sku = t.consumable_sku
-  WHERE l.ref_order_type = 'Purchase Order' AND DATE(l.datetime_utc) <= @run_date
-    AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)
-  GROUP BY po, consumable_sku)"""
-        head = "WITH " + touched + ",\n" + received
+    # Per-receipt event stream (the same rows the daily/backfill modes already scan) carrying a
+    # running cumulative received qty per (po, sku) — so we can pinpoint the BREACH date: the
+    # receipt at which cumulative received first crossed the ordered threshold = when the error
+    # truly began. (daily restricts to POs touched on the run-date; backfill sweeps the window.)
+    join = (f"""
+  JOIN (SELECT DISTINCT ref_order_id AS po, consumable_sku FROM `{proj}.{dset}.{led}`
+        WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL
+          AND DATE(datetime_utc) = @run_date) t
+    ON l.ref_order_id = t.po AND l.consumable_sku = t.consumable_sku""" if not backfill else "")
+    evt = f"""evt AS (
+  SELECT l.ref_order_id AS po, l.consumable_sku, l.datetime_utc,
+         l.consumable_quantity_change AS q, l.consumable_uom AS ruom,
+         l.facility_name AS facility, l.system_of_origin AS system, l.item_name AS item_name,
+         SUM(l.consumable_quantity_change) OVER (
+           PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv
+  FROM `{proj}.{dset}.{led}` l{join}
+  WHERE l.ref_order_type = 'Purchase Order' AND l.consumable_sku IS NOT NULL
+    AND DATE(l.datetime_utc) <= @run_date
+    AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY))"""
     # Rank within each band (genuine over_frac<=1 vs implausible >1) so the cap keeps BOTH
     # populations represented instead of the most-extreme corrupt rows crowding out genuine ones.
-    return head + f""",
+    return "WITH " + evt + f""",
+received AS (
+  SELECT po, consumable_sku, SUM(q) AS received_qty, ANY_VALUE(ruom) AS received_uom,
+         ANY_VALUE(facility) AS facility, ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name
+  FROM evt GROUP BY po, consumable_sku),
 ordered AS (
   SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty,
          ANY_VALUE(consumable_uom) AS ordered_uom,
@@ -67,12 +66,25 @@ ordered AS (
   FROM `{proj}.{dset}.{po}`
   WHERE consumable_sku IS NOT NULL AND order_type = 'Purchase'   -- PO-side: purchases only (for now)
   GROUP BY po, consumable_sku),
+breach AS (
+  SELECT e.po, e.consumable_sku,
+         -- first receipt where cumulative crossed the over-receipt threshold
+         DATE(MIN(IF(e.running_recv > o.ordered_qty * (1 + {high}), e.datetime_utc, NULL))) AS over_breach_date,
+         -- first receipt that introduced a unit different from the order's
+         DATE(MIN(IF(o.ordered_uom IS NOT NULL AND e.ruom IS NOT NULL AND e.ruom != o.ordered_uom,
+                     e.datetime_utc, NULL))) AS uom_breach_date,
+         DATE(MIN(e.datetime_utc)) AS first_receipt_date,
+         DATE(MAX(e.datetime_utc)) AS last_receipt_date
+  FROM evt e JOIN ordered o USING (po, consumable_sku)
+  GROUP BY po, consumable_sku),
 flagged AS (
   SELECT r.po, r.consumable_sku, r.item_name, o.ordered_qty, r.received_qty,
          o.ordered_uom, r.received_uom, r.facility, r.system, o.supplier, o.status,
          SAFE_DIVIDE(r.received_qty, o.ordered_qty) - 1 AS over_frac,
-         (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch
+         (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch,
+         b.over_breach_date, b.uom_breach_date, b.first_receipt_date, b.last_receipt_date
   FROM received r JOIN ordered o USING (po, consumable_sku)
+                  JOIN breach b USING (po, consumable_sku)
   WHERE o.ordered_qty > 0 AND (
         (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom)
         OR r.received_qty > o.ordered_qty * (1 + {high})
@@ -89,6 +101,10 @@ SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap}
 ORDER BY over_frac DESC"""
 
 
+def _d(v):
+    return str(v) if v else None
+
+
 def _snap(r, high):
     return {
         "po": r.po, "consumable_sku": r.consumable_sku, "item_name": r.item_name,
@@ -98,6 +114,8 @@ def _snap(r, high):
         "over_by_pct": round((r.over_frac or 0.0) * 100, 1), "tolerance_pct": round(high * 100, 1),
         "status": r.status, "supplier": r.supplier,
         "facility": r.facility or "—", "system": r.system or "—",
+        # data-derived timeline: when the error actually began vs. last activity
+        "first_receipt": _d(r.first_receipt_date), "last_receipt": _d(r.last_receipt_date),
     }
 
 
@@ -117,13 +135,18 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
         ek = f"{r.po}:{r.consumable_sku}"
+        s = _snap(r, high)
         if r.uom_mismatch:  # ordered/received in different UoM → over-receipt % is not comparable
-            findings.append(Finding("PO-03", "PO_UOM_MISMATCH", "High", src, ek, _snap(r, high)))
+            # the error began at the first receipt in the conflicting unit
+            s["breached_at"] = _d(r.uom_breach_date) or s["first_receipt"] or s["last_receipt"]
+            findings.append(Finding("PO-03", "PO_UOM_MISMATCH", "High", src, ek, s))
         elif (r.over_frac or 0.0) > 1:  # received > 2x ordered
-            s = _snap(r, high); s["implausible_quantity"] = True
+            s["implausible_quantity"] = True
+            s["breached_at"] = _d(r.over_breach_date) or s["last_receipt"]
             findings.append(Finding("PO-03", "PO_IMPLAUSIBLE_QTY", "Urgent", src, ek, s))
         else:
-            findings.append(Finding("PO-03", "PO_OVER_RECEIPT", "High", src, ek, _snap(r, high)))
+            s["breached_at"] = _d(r.over_breach_date) or s["last_receipt"]
+            findings.append(Finding("PO-03", "PO_OVER_RECEIPT", "High", src, ek, s))
     return findings, total
 
 

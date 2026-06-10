@@ -338,6 +338,11 @@
     sub.appendChild(el("span", { class: "tag" }, [e.facility + " · " + e.system]));
     sub.appendChild(el("a", { class: "jira-link", href: jiraUrl(e.jira) || "#", target: "_blank", html: e.jira }));
     sub.appendChild(el("span", { class: "tip" }, ["Age " + e.age + "d / " + e.slaTarget + "d SLA · " + (e.withinSla ? "within SLA" : "BREACHING")]));
+    var since = [];
+    if (e.created) since.push("began " + e.created);
+    if (e.detectedOn && e.detectedOn !== e.created) since.push("detected " + e.detectedOn);
+    if (e.lastReceipt) since.push("last receipt " + e.lastReceipt);
+    if (since.length) sub.appendChild(el("span", { class: "tip" }, [since.join(" · ")]));
 
     var body = $("#dr-body"); clear(body);
 
@@ -352,7 +357,8 @@
 
     // Offending data snapshot — hide backend-only fields; fold UoM into the qty line.
     var snap = e.snapshot;
-    var SNAP_HIDE = { tolerance_pct: 1, uom_match: 1, status: 1, ordered_uom: 1, received_uom: 1 };
+    var SNAP_HIDE = { tolerance_pct: 1, uom_match: 1, status: 1, ordered_uom: 1, received_uom: 1,
+      breached_at: 1, first_receipt: 1, last_receipt: 1 };  // surfaced in the header timeline line instead
     var dsec = el("div", { class: "section" }, [el("h3", {}, ["Offending " + e.table + " snapshot"])]);
     var kv = el("div", { class: "kv" });
     Object.keys(snap).forEach(function (k) {
@@ -534,7 +540,7 @@
 
   function metrics() {
     var open = openExc();
-    var newToday = EXC.filter(function (e) { return e.created === D.meta.runDate; });
+    var newToday = EXC.filter(function (e) { return (e.detectedOn || e.created) === D.meta.runDate; });
     var autoClosedToday = EXC.filter(function (e) { return e.autoClosed && e.resolved === D.meta.runDate; });
     var resolvedAll = EXC.filter(function (e) { return e.turnaround != null; });
     var avgTat = resolvedAll.length ? (resolvedAll.reduce(function (s, e) { return s + e.turnaround; }, 0) / resolvedAll.length) : 0;
