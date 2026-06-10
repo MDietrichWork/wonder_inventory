@@ -65,6 +65,8 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "Cumulative on-hand quantity went negative for an item / location."},
     {"type": "PO_MISSING_PRICE", "rule": "Vendor SKU price present", "ruleType": "NOT_NULL",
      "owner": "Procurement", "desc": "Purchase PO line has a $0.00 or NULL vendor (supplier) price — the receipt can't be costed into the GL until a price is set."},
+    {"type": "PO_MISSING_NUMBER", "rule": "PO number present (master table)", "ruleType": "NOT_NULL",
+     "owner": "SC Product (IMS)", "desc": "A row in the PO master table has a NULL/blank PO number — a broken master record with nothing to receive against. Safety-net rule: currently finds 0 on live data, kept to catch upstream degradation."},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -121,6 +123,15 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
      "expression": "running_on_hand >= 0", "enabled": True},
+    {"id": "PO-13", "name": "PO number present (master table)", "primitive": "NOT_NULL", "error_type": "PO_MISSING_NUMBER",
+     "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
+     "params": {"column": "po", "where": {"order_type": ["Purchase"]}},
+     "expression": (
+        "-- Master PO table integrity: a Purchase row with no PO number (safety-net; 0 on current data).\n"
+        "SELECT _id, supplier_name, supplier_sku, consumable_sku, po_date_utc\n"
+        "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
+        "WHERE order_type = 'Purchase' AND (po IS NULL OR TRIM(po) = '')"
+     ), "enabled": True},
     {"id": "PO-09", "name": "Vendor SKU price present", "primitive": "NOT_NULL", "error_type": "PO_MISSING_PRICE",
      "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "Procurement",
      "params": {"column": "supplier_price", "where": {"order_type": ["Purchase"]}},
@@ -149,6 +160,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "On-Hand Recon"},
     {"error_type": "PO_MISSING_PRICE", "team": "Procurement", "assignee": "Tom Becker",
      "jira_project": "WIQ", "jira_component": "Vendor Pricing"},
+    {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
+     "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team

@@ -107,11 +107,12 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
     else:
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
-        from ..rules.bq_finder import recheck, recheck_price
+        from ..rules.bq_finder import recheck, recheck_price, recheck_null_po
         high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
         price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
+        nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
 
         # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
@@ -141,6 +142,16 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if not cur["missing"]:  # a vendor price has been set
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: vendor price now populated — auto-closed." % run_date)
+                autoclosed += 1
+
+        # missing PO number (master table): close once a PO number is set
+        nids = list({(e.data_snapshot or {}).get("po_id") for e in nullpo_errs if (e.data_snapshot or {}).get("po_id")})
+        ncurrent = recheck_null_po(ds, nids) if nids else {}
+        for e in nullpo_errs:
+            cur = ncurrent.get(str((e.data_snapshot or {}).get("po_id")))
+            if cur and not cur["missing"]:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: PO number now populated — auto-closed." % run_date)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

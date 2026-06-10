@@ -233,7 +233,62 @@ def recheck_price(ds, pairs):
     return out
 
 
-_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price}
+def _build_null_po_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """PO-13: a Purchase row in the master PO table with a NULL/blank PO number. Safety-net —
+    finds 0 on current data; wired so it tickets + auto-closes if upstream ever degrades."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    date_filter = ("AND DATE(po_date_utc) = @run_date" if not backfill else
+                   f"AND (po_date_utc IS NULL OR (DATE(po_date_utc) <= @run_date "
+                   f"AND po_date_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)))")
+    return f"""WITH flagged AS (
+  SELECT CAST(_id AS STRING) AS id, ANY_VALUE(supplier_name) AS supplier_name,
+         ANY_VALUE(supplier_sku) AS supplier_sku, ANY_VALUE(consumable_sku) AS consumable_sku,
+         MIN(po_date_utc) AS po_date_utc
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND (po IS NULL OR TRIM(po) = '') {date_filter}
+  GROUP BY id),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY po_date_utc DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap}"""
+
+
+def _null_po(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_MISSING_NUMBER (Urgent, SC Product (IMS)) — PO master row with no PO number."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_null_po_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "po_id": r.id, "po": None, "supplier_name": r.supplier_name, "supplier_sku": r.supplier_sku,
+            "consumable_sku": r.consumable_sku,
+            "po_date_utc": str(r.po_date_utc) if r.po_date_utc else None,
+            "breached_at": (r.po_date_utc.date().isoformat() if r.po_date_utc else run_date),
+        }
+        findings.append(Finding("PO-13", "PO_MISSING_NUMBER", "Urgent", src, r.id, snap))
+    return findings, total
+
+
+def recheck_null_po(ds, ids):
+    """Whether each open PO-13 ticket's PO row still has a null/blank po — close once populated."""
+    if not ids:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    sql = f"""SELECT CAST(_id AS STRING) AS id, MAX(IF(po IS NULL OR TRIM(po) = '', 1, 0)) AS still_null
+    FROM `{proj}.{dset}.{po}` WHERE CAST(_id AS STRING) IN UNNEST(@ids) GROUP BY id"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", [str(i) for i in ids])])
+    return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:
