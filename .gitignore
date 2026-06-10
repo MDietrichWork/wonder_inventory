@@ -44,6 +44,14 @@ docs/framework.xlsx
 docs/validation-tests.csv
 docs/validation-tests.md
 
+# Terraform — state holds secrets; tfvars holds config. Keep the .example only.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+*.auto.tfvars
+.terraform.lock.hcl
+
 # Local tooling artifacts
 /tmp/
 *.log

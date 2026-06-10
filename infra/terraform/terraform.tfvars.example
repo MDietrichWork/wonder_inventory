@@ -1,0 +1,25 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+# Secrets (db_password, jira_api_token) are best passed via env, NOT this file:
+#   export TF_VAR_db_password=...      export TF_VAR_jira_api_token=...
+
+project_id = "wonder-dq-sandbox"           # SANDBOX — retarget to Wonder's project at go-live
+region     = "us-central1"
+
+# Built from app/Dockerfile and pushed to the Artifact Registry repo (see `artifact_registry_repo` output):
+image = "us-central1-docker.pkg.dev/wonder-dq-sandbox/wonder-dq/app:latest"
+
+allow_unauthenticated = true              # sandbox demo only; false + SSO/IAP in prod
+
+# BigQuery source (read-only)
+bq_project      = "wonder-dw-prod-brd"
+bq_dataset      = "inventory"
+bq_ledger_table = "consolidated_inventory_ledger"
+bq_po_table     = "int_ledger_purchase_orders"
+
+# Jira (sandbox values today; company Jira at go-live)
+jira_base_url    = "https://dietrichcoding.atlassian.net"
+jira_email       = "you@example.com"
+jira_project_key = "WIQ"
+
+# db_password    -> set via TF_VAR_db_password
+# jira_api_token -> set via TF_VAR_jira_api_token
