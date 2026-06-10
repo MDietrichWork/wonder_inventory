@@ -106,12 +106,12 @@
     { key: "runDate", label: "Run Date", cls: "mono" },
     { key: "errorType", label: "Error Type" },
     { key: "severity", label: "Severity" },
-    { key: "table", label: "Source Table", cls: "mono" },
     { key: "facility", label: "Facility", cls: "mono" },
     { key: "system", label: "System" },
     { key: "entityKey", label: "Entity Key", cls: "mono" },
     { key: "team", label: "Routed Team" },
-    { key: "assignee", label: "Assignee" },
+    { key: "primaryOwner", label: "Primary Owner" },
+    { key: "currentHolder", label: "Assignee", title: "Current holder when handed off — blank means the primary owner still has it." },
     { key: "jira", label: "JIRA Key", cls: "mono" },
     { key: "jiraStatus", label: "JIRA Status" },
     { key: "age", label: "Age (d)", cls: "num", num: true },
@@ -146,7 +146,7 @@
       if (f.status && e.jiraStatus !== f.status) return false;
       if (f.team && e.team !== f.team) return false;
       if (f.q) {
-        var hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + e.assignee + " " + e.facility).toLowerCase();
+        var hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
         if (hay.indexOf(f.q) === -1) return false;
       }
       return true;
@@ -209,9 +209,11 @@
         var v = e[c.key];
         if (c.key === "severity") td.appendChild(sevPill(v));
         else if (c.key === "jiraStatus") td.appendChild(statusPill(v));
-        else if (c.key === "assignee") {
-          td.textContent = v;
-          if (e.subAssign) td.appendChild(el("span", { class: "subtag", title: "Sub-assigned to " + e.subAssign.toTeam + " (" + e.subAssign.toPerson + ")" }, ["↳ " + e.subAssign.toTeam]));
+        else if (c.key === "currentHolder") {
+          // Only show an assignee once it's been handed off; blank means the primary owner still holds it.
+          var handed = e.currentHolder && e.currentHolder !== e.primaryOwner;
+          td.textContent = handed ? e.currentHolder : "";
+          if (handed) td.appendChild(el("span", { class: "subtag", title: "Held " + e.heldDays + "d" }, ["↳ held " + e.heldDays + "d"]));
         }
         else if (c.key === "jira") {
           var a = el("a", { class: "jira-link", href: jiraUrl(v) || "#", title: "Open " + v + " in JIRA" }, [v]);
