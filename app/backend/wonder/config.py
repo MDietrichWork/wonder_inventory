@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     autoclose_consecutive_runs: int = 1  # close after issue absent for N runs
 
     # --- Over-receipt thresholds (catalog PO-03 / PO-04) ---
-    over_receipt_high_pct: float = 0.05    # received exceeds ordered by >5%  -> High
-    over_receipt_urgent_pct: float = 0.10  # received exceeds ordered by >10% -> Urgent
+    over_receipt_high_pct: float = 0.05    # flag + High floor: received exceeds ordered by >5%
+    over_receipt_urgent_pct: float = 0.50  # over-receipt severity split: 5-50% over -> High, >50% -> Urgent
 
     # --- BigQuery (only used when data_source=bigquery) ---
     gcp_project: Optional[str] = None

@@ -29,7 +29,7 @@ BACKFILL_LOOKBACK_DAYS = 14   # initial run: history to sweep for the existing b
 #   backfill — flag ALL over-received POs across history (the one-time initial catch-up)
 
 
-def _build_sql(backfill: bool, lookback: int, high: float, cap: int) -> str:
+def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: float = 0.50) -> str:
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
     # Per-receipt event stream (the same rows the daily/backfill modes already scan) carrying a
@@ -97,7 +97,10 @@ flagged AS (
 ranked AS (
   SELECT *, COUNT(*) OVER() AS total_matches,
          ROW_NUMBER() OVER (
-           PARTITION BY (CASE WHEN uom_mismatch THEN 'uom' WHEN over_frac > 1 THEN 'impl' ELSE 'gen' END)
+           PARTITION BY (CASE WHEN uom_mismatch THEN 'uom'
+                              WHEN over_frac > 1 THEN 'impl'                 -- >2x: implausible / data corruption
+                              WHEN over_frac > {urgent} THEN 'gen_urgent'    -- >50%: severe overage (Urgent)
+                              ELSE 'gen_high' END)                          -- 5-50%: genuine overage (High)
            ORDER BY over_frac DESC) AS rn
   FROM flagged
 )
@@ -129,10 +132,11 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     """PO_OVER_RECEIPT (genuine ≤2× → High, Field Ops) and PO_IMPLAUSIBLE_QTY (>2× → Urgent, SC Product)."""
     bq = ds._bq
     high = settings.over_receipt_high_pct
+    urgent = settings.over_receipt_urgent_pct
     src = settings.bq_ledger_table
     lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
     cap = BACKFILL_CAP if backfill else RESULT_CAP
-    sql = _build_sql(backfill, lookback, high, cap)
+    sql = _build_sql(backfill, lookback, high, cap, urgent)
     cfg = bq.QueryJobConfig(
         maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
         query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)],
@@ -152,7 +156,9 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
             findings.append(Finding("PO-03", "PO_IMPLAUSIBLE_QTY", "Urgent", src, ek, s))
         else:
             s["breached_at"] = _d(r.over_breach_date) or s["last_receipt"]
-            findings.append(Finding("PO-03", "PO_OVER_RECEIPT", "High", src, ek, s))
+            # severity by magnitude: 5-50% over -> High, >50% over -> Urgent
+            sev = "Urgent" if (r.over_frac or 0.0) > urgent else "High"
+            findings.append(Finding("PO-03", "PO_OVER_RECEIPT", sev, src, ek, s))
     return findings, total
 
 

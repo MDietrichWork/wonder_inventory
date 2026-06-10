@@ -43,13 +43,13 @@ def test_over_receipt_severity_bands():
     po = [{"po_number": "PO-1", "sku": "S1", "ordered_qty": 100},
           {"po_number": "PO-2", "sku": "S2", "ordered_qty": 100}]
     ledger = [
-        {"txn_type": "PO_RECEIPT", "po_number": "PO-1", "sku": "S1", "qty": 112, "facility": "F1", "system_of_origin": "Sys"},  # 12% -> Urgent
-        {"txn_type": "PO_RECEIPT", "po_number": "PO-2", "sku": "S2", "qty": 106, "facility": "F1", "system_of_origin": "Sys"},  # 6%  -> High
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-1", "sku": "S1", "qty": 160, "facility": "F1", "system_of_origin": "Sys"},  # 60% over -> Urgent (>50%)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-2", "sku": "S2", "qty": 106, "facility": "F1", "system_of_origin": "Sys"},  # 6%  over -> High (5-50%)
     ]
     r = _rule("PO-03", "OVER_RECEIPT", "PO_OVER_RECEIPT", {})
     sev = {f.entity_key: f.severity for f in run_rules([r], _Stub(ledger, po), "2026-06-09")}
-    assert sev["PO-1:S1"] == "Urgent"
-    assert sev["PO-2:S2"] == "High"
+    assert sev["PO-1:S1"] == "Urgent"   # >50% over
+    assert sev["PO-2:S2"] == "High"     # 5-50% over
 
 
 def test_lifecycle_autoclose_and_idempotent():

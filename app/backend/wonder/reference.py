@@ -54,7 +54,7 @@ ERROR_TYPES = [
     {"type": "PO_RECORD_MISSING", "rule": "PO exists in PO table", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Ledger PO reference has no matching row in the PO table."},
     {"type": "PO_OVER_RECEIPT", "rule": "Receipt within ordered qty", "ruleType": "RANGE",
-     "owner": "Field Ops", "desc": "Received quantity exceeds the quantity ordered on the PO (up to 2x) — a genuine receiving overage."},
+     "owner": "Field Ops", "desc": "Received quantity exceeds the quantity ordered on the PO — a genuine receiving overage. Severity by magnitude: 5–50% over → High, >50% over → Urgent. (Beyond 2× is split out as PO_IMPLAUSIBLE_QTY — likely data corruption.)"},
     {"type": "PO_IMPLAUSIBLE_QTY", "rule": "Received qty is physically plausible", "ruleType": "RANGE",
      "owner": "SC Product (IMS)", "desc": "Received quantity is more than 2x ordered (often vastly so) — an upstream data-corruption / unit defect, not a real overage."},
     {"type": "PO_UOM_MISMATCH", "rule": "PO/ledger consumable UoM match", "ruleType": "RECONCILIATION",
