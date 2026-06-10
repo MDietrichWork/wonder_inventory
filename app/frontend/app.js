@@ -352,7 +352,7 @@
     // Offending data snapshot — hide backend-only fields; fold UoM into the qty line.
     var snap = e.snapshot;
     var SNAP_HIDE = { tolerance_pct: 1, uom_match: 1, status: 1, ordered_uom: 1, received_uom: 1,
-      breached_at: 1, first_receipt: 1, last_receipt: 1 };  // surfaced in the header timeline line instead
+      breached_at: 1, first_receipt: 1, last_receipt: 1, consumable_uom: 1 };  // surfaced in the header timeline line / merged into qty
     var dsec = el("div", { class: "section" }, [el("h3", {}, ["Offending " + e.table + " snapshot"])]);
     var kv = el("div", { class: "kv" });
     Object.keys(snap).forEach(function (k) {
@@ -360,8 +360,11 @@
       var val = snap[k];
       if (k === "ordered_qty" && snap.ordered_uom) val = fmtNum(val) + " " + snap.ordered_uom;
       else if (k === "received_qty" && snap.received_uom) val = fmtNum(val) + " " + snap.received_uom;
+      else if (k === "waste_qty") val = fmtNum(val) + (snap.consumable_uom ? " " + snap.consumable_uom : "");
       else if (k === "over_by_pct" && val != null) val = fmtNum(val) + "%";
       else if (k === "supplier_price") val = (val == null ? null : "$" + Number(val).toFixed(2));
+      else if (k === "unit_cost") val = (val == null ? null : "$" + Number(val).toFixed(4));
+      else if (k === "est_value") val = (val == null ? null : "$" + Number(val).toLocaleString("en-US", { maximumFractionDigits: 2 }));
       var neg = (typeof val === "number" && val < 0) || val === null;
       kv.appendChild(el("div", { class: "k" }, [k]));
       kv.appendChild(el("div", { class: "v" + (neg ? " neg" : "") }, [val === null ? "NULL" : String(val)]));

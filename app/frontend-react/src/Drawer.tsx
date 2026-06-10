@@ -4,15 +4,18 @@ import { fmtNum } from "./lib";
 import { getBreakdown, jiraUrl, apiPost } from "./api";
 import { sevPill, statusPill } from "./Workbench";
 
-const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt"]);
+const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt", "consumable_uom"]);
 const STATUS_OPTS = ["Open", "In Progress", "In Review", "Resolved"];
 
 function snapValue(k: string, val: any, snap: Record<string, any>): { text: string; neg: boolean } {
   let out: any = val;
   if (k === "ordered_qty" && snap.ordered_uom) out = fmtNum(val) + " " + snap.ordered_uom;
   else if (k === "received_qty" && snap.received_uom) out = fmtNum(val) + " " + snap.received_uom;
+  else if (k === "waste_qty") out = fmtNum(val) + (snap.consumable_uom ? " " + snap.consumable_uom : "");
   else if (k === "over_by_pct" && val != null) out = fmtNum(val) + "%";
   else if (k === "supplier_price") out = val == null ? null : "$" + Number(val).toFixed(2);
+  else if (k === "unit_cost") out = val == null ? null : "$" + Number(val).toFixed(4);
+  else if (k === "est_value") out = val == null ? null : "$" + Number(val).toLocaleString("en-US", { maximumFractionDigits: 2 });
   const neg = (typeof out === "number" && out < 0) || out === null;
   return { text: out === null ? "NULL" : String(out), neg };
 }

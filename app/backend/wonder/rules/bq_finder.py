@@ -466,6 +466,7 @@ def _build_implausible_adjustment_sql(backfill: bool, lookback: int, cap: int, c
 adj AS (
   SELECT consumable_sku, facility_name, DATE(datetime_utc) AS day,
          ANY_VALUE(item_name) AS item_name, ANY_VALUE(system_of_origin) AS system,
+         ANY_VALUE(consumable_uom) AS consumable_uom,
          SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
          ANY_VALUE(l2_action HAVING MIN consumable_quantity_change) AS reason  -- reason of the biggest single removal
   FROM `{proj}.{dset}.{led}`
@@ -497,7 +498,7 @@ def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding]
         snap = {
             "facility": r.facility_name or "—", "consumable_sku": r.consumable_sku, "item_name": r.item_name,
             "system": r.system or "—", "adjustment_date": day, "reason": r.reason,
-            "waste_qty": r.waste_qty, "implausible_ceiling": ceiling,
+            "waste_qty": r.waste_qty, "consumable_uom": r.consumable_uom, "implausible_ceiling": ceiling,
             "unit_cost": (round(r.unit_cost, 4) if r.unit_cost is not None else None),
             "est_value": (round(r.est_value, 2) if r.est_value is not None else None),
             "movement": "Adjust / %s" % r.reason if r.reason else "Adjust",
