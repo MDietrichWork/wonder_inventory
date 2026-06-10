@@ -45,7 +45,7 @@ export function Drawer({ data, exc, onClose }: { data: Bootstrap; exc: Exception
   return (
     <>
       <div className="drawer-scrim show" onClick={onClose} />
-      <aside className="drawer open" role="dialog" aria-label="Exception detail">
+      <aside className="drawer show" role="dialog" aria-label="Exception detail">
         <div className="drawer-head">
           <div>
             <div className="drawer-title">{exc.id} · {exc.errorType}</div>
