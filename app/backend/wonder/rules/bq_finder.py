@@ -480,7 +480,7 @@ SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY waste_qty DESC"""
 
 
 def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """ADJ_IMPLAUSIBLE_QTY (High, SC Product (IMS)) — a single (sku,location,day) waste qty over the ceiling."""
+    """WASTE_IMPLAUSIBLE_QTY (High, SC Product (IMS)) — a single (sku,location,day) waste qty over the ceiling."""
     bq = ds._bq
     src = settings.bq_ledger_table
     ceiling = settings.adjust_implausible_qty
@@ -503,7 +503,7 @@ def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding]
             "movement": "Adjust / %s" % r.reason if r.reason else "Adjust",
             "breached_at": day,
         }
-        findings.append(Finding("ADJ-IMPL", "ADJ_IMPLAUSIBLE_QTY", "High", src, ek, snap))
+        findings.append(Finding("WASTE-IMPL", "WASTE_IMPLAUSIBLE_QTY", "High", src, ek, snap))
     return findings, total
 
 
@@ -545,7 +545,7 @@ adj AS (
   FROM `{proj}.{dset}.{led}`
   WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) AND DATE(datetime_utc) = @run_date
   GROUP BY facility_name, day, consumable_sku
-  HAVING qty > 0 AND qty <= {ceiling}),   -- exclude the implausible rows (handled by ADJ-IMPL)
+  HAVING qty > 0 AND qty <= {ceiling}),   -- exclude the implausible rows (handled by WASTE-IMPL)
 costed AS (
   SELECT facility_name, day, SUM(adj.qty * cost.unit_cost) AS dollars, COUNT(*) AS skus
   FROM adj JOIN cost USING (consumable_sku) GROUP BY facility_name, day)
@@ -558,7 +558,7 @@ FROM costed WHERE dollars > {threshold} ORDER BY dollars DESC"""
 
 
 _FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
-            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing, "ADJ-IMPL": _implausible_adjustment}
+            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing, "WASTE-IMPL": _implausible_adjustment}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:

@@ -116,7 +116,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
-        adj_errs = [e for e in open_errs if e.error_type == "ADJ_IMPLAUSIBLE_QTY"]
+        adj_errs = [e for e in open_errs if e.error_type == "WASTE_IMPLAUSIBLE_QTY"]
 
         # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))

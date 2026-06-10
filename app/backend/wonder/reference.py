@@ -71,7 +71,7 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but that SKU isn't on the PO's lines — a 3-way-match break: wrong item received, an undocumented substitution, or a PO line never set up. (Framework catalog PO-02.)"},
     {"type": "TRANSFER_ORDER_MISSING", "rule": "Picked Transfer Order exists", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
-    {"type": "ADJ_IMPLAUSIBLE_QTY", "rule": "Adjustment quantity is plausible", "ruleType": "RANGE",
+    {"type": "WASTE_IMPLAUSIBLE_QTY", "rule": "Adjustment quantity is plausible", "ruleType": "RANGE",
      "owner": "SC Product (IMS)", "desc": "A single item's waste adjustment at one location in a day exceeds 100,000 units — a physically implausible quantity (e.g. the SKU number leaking into the qty field). Almost certainly bad data, not real waste; pulled out of the waste metric and flagged for review."},
 ]
 
@@ -129,7 +129,7 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
      "expression": "running_on_hand >= 0", "enabled": True},
-    {"id": "ADJ-IMPL", "name": "Adjustment quantity is plausible", "primitive": "RANGE", "error_type": "ADJ_IMPLAUSIBLE_QTY",
+    {"id": "WASTE-IMPL", "name": "Adjustment quantity is plausible", "primitive": "RANGE", "error_type": "WASTE_IMPLAUSIBLE_QTY",
      "target_table": "consolidated_inventory_ledger", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {"column": "adjustment_qty", "op": ">", "value": 100000},  # BigQuery aggregate; skipped by the fixtures engine
      "expression": (
@@ -215,7 +215,7 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "3-Way Match"},
     {"error_type": "TRANSFER_ORDER_MISSING", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_project": "WIQ", "jira_component": "Transfer Orders"},
-    {"error_type": "ADJ_IMPLAUSIBLE_QTY", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
+    {"error_type": "WASTE_IMPLAUSIBLE_QTY", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_project": "WIQ", "jira_component": "Adjustment Integrity"},
 ]
 
