@@ -332,6 +332,8 @@ Two docs live in the repo root and are maintained throughout:
 - Which **ledger fields** drive data-derived routing vs. what comes from the mapping table.
 - Entra **app registration** + group → role mapping.
 - The precise condition for **auto-close** (issue no longer reproduces in N consecutive runs vs. immediately).
+- **Backfill depth (X):** how far back the one-time initial backfill sweeps. Drives both the size of the catch-up and — because age is anchored to the data breach date — the **exact age** we can compute (the prototype clamps to a 2-week window; go-live needs full per-PO receipt history so the breach date is the real first crossing, not the window edge). Decide X with the team + how to bound BigQuery cost (per-PO history pull / materialized cumulative vs. a blanket window widen).
+- **Daily reconciliation window:** should the daily batch re-check just the **previous day's** partition, or a small **trailing window** (last N days) to catch **late-posted receipts** that land after a PO's day already ran? Also sets how far back the daily cumulative must sum to get a touched PO's true running total.
 
 ---
 
