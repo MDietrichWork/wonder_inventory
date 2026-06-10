@@ -105,14 +105,19 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                 _auto_close(db, e, as_of, sink, "Issue no longer reproduces on run %s — auto-closed." % run_date)
                 autoclosed += 1
     else:
-        # BigQuery (scoped rule): re-check each open ticket's specific entity against current data
+        # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
-        from ..rules.bq_finder import recheck
+        from ..rules.bq_finder import recheck, recheck_price
         high = settings.over_receipt_high_pct
+        OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
+        over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
+        price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
+
+        # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
-                      for e in open_errs if (e.data_snapshot or {}).get("po")})
+                      for e in over_errs if (e.data_snapshot or {}).get("po")})
         current = recheck(ds, pairs) if pairs else {}
-        for e in open_errs:
+        for e in over_errs:
             snap = e.data_snapshot or {}
             cur = current.get((snap.get("po"), snap.get("consumable_sku")))
             if not cur or cur.get("recv") is None or not cur.get("ord"):
@@ -122,6 +127,20 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if over <= high and not uom_mismatch:  # received now within tolerance AND UoMs agree
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: received now within tolerance / UoM reconciled — auto-closed." % run_date)
+                autoclosed += 1
+
+        # missing-price: close once a vendor price has been set
+        ppairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("supplier_sku"))
+                       for e in price_errs if (e.data_snapshot or {}).get("po")})
+        pcurrent = recheck_price(ds, ppairs) if ppairs else {}
+        for e in price_errs:
+            snap = e.data_snapshot or {}
+            cur = pcurrent.get((snap.get("po"), snap.get("supplier_sku")))
+            if not cur:
+                continue  # PO line not found — can't confirm; leave open
+            if not cur["missing"]:  # a vendor price has been set
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: vendor price now populated — auto-closed." % run_date)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

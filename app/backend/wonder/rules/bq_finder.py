@@ -150,7 +150,82 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     return findings, total
 
 
-_FINDERS = {"PO-03": _over_receipt}
+def _build_price_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """PO-09: Purchase PO lines with no usable vendor price. Single-table, cheap. Daily flags
+    lines created on the run-date; backfill sweeps the lookback window. Age anchors to po_date_utc
+    (the error has existed since the PO was created without a price)."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    date_filter = ("AND DATE(po_date_utc) = @run_date" if not backfill else
+                   f"AND DATE(po_date_utc) <= @run_date "
+                   f"AND po_date_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH flagged AS (
+  SELECT po, supplier_sku,
+         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(supplier_sku_name) AS supplier_sku_name,
+         ANY_VALUE(supplier_name) AS supplier_name, ANY_VALUE(status) AS status,
+         ANY_VALUE(consumable_sku_qty) AS ordered_qty, ANY_VALUE(consumable_uom) AS ordered_uom,
+         MIN(supplier_price) AS supplier_price, DATE(MIN(po_date_utc)) AS po_date
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)
+        AND supplier_sku IS NOT NULL {date_filter}
+  GROUP BY po, supplier_sku),
+ranked AS (
+  SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY po_date DESC) AS rn
+  FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY po_date DESC"""
+
+
+def _missing_price(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_MISSING_PRICE (Urgent, Procurement) — order_type='Purchase' AND supplier_price IS NULL OR 0."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_price_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(
+        maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+        query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)],
+    )
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        ek = f"{r.po}:{r.supplier_sku}"
+        snap = {
+            "po": r.po, "supplier_sku": r.supplier_sku, "supplier_sku_name": r.supplier_sku_name,
+            "consumable_sku": r.consumable_sku, "supplier_name": r.supplier_name, "status": r.status,
+            "ordered_qty": r.ordered_qty, "ordered_uom": r.ordered_uom,
+            "supplier_price": r.supplier_price,   # NULL or 0 — the offending value
+            "breached_at": _d(r.po_date),
+        }
+        findings.append(Finding("PO-09", "PO_MISSING_PRICE", "Urgent", src, ek, snap))
+    return findings, total
+
+
+def recheck_price(ds, pairs):
+    """Current vendor price for a set of (po, supplier_sku) OPEN PO-09 tickets, so the job can
+    auto-close the ones that now have a price. Returns {(po, supplier_sku): {"missing": bool}}."""
+    if not pairs:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    keys = ["%s~~%s" % (p, s) for (p, s) in pairs if p is not None and s is not None]
+    if not keys:
+        return {}
+    sql = f"""
+    SELECT po, supplier_sku AS sku, MIN(supplier_price) AS price
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Purchase' AND CONCAT(po, '~~', supplier_sku) IN UNNEST(@keys)
+    GROUP BY po, sku"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
+    out = {}
+    for row in ds.client.query(sql, job_config=cfg).result():
+        out[(row.po, row.sku)] = {"missing": (row.price is None or row.price == 0)}
+    return out
+
+
+_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:

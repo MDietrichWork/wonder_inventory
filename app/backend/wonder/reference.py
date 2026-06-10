@@ -43,6 +43,8 @@ ERROR_TYPES = [
      "owner": "Field Ops", "desc": "Shipped vs received quantity mismatch leaves aged stock in the Transfer Warehouse."},
     {"type": "NEGATIVE_ON_HAND", "rule": "On-hand >= 0", "ruleType": "RANGE",
      "owner": "SC Product (IMS)", "desc": "Cumulative on-hand quantity went negative for an item / location."},
+    {"type": "PO_MISSING_PRICE", "rule": "Vendor SKU price present", "ruleType": "NOT_NULL",
+     "owner": "Procurement", "desc": "Purchase PO line has a $0.00 or NULL vendor (supplier) price — the receipt can't be costed into the GL until a price is set."},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -99,6 +101,15 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
      "expression": "running_on_hand >= 0", "enabled": True},
+    {"id": "PO-09", "name": "Vendor SKU price present", "primitive": "NOT_NULL", "error_type": "PO_MISSING_PRICE",
+     "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "Procurement",
+     "params": {"column": "supplier_price", "where": {"order_type": ["Purchase"]}},
+     "expression": (
+        "-- Purchase PO lines with no usable vendor (supplier) price — receipts can't be costed.\n"
+        "SELECT po, supplier_sku, consumable_sku, supplier_name, status, supplier_price, po_date_utc\n"
+        "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
+        "WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)"
+     ), "enabled": True},
 ]
 
 ROUTING = [
@@ -116,6 +127,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "Transfers"},
     {"error_type": "NEGATIVE_ON_HAND", "team": "SC Product (IMS)", "assignee": "Pavel Romanov",
      "jira_project": "WIQ", "jira_component": "On-Hand Recon"},
+    {"error_type": "PO_MISSING_PRICE", "team": "Procurement", "assignee": "Tom Becker",
+     "jira_project": "WIQ", "jira_component": "Vendor Pricing"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team
