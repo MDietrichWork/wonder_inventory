@@ -569,8 +569,7 @@
     kpis.forEach(function (t) {
       var tile = el("div", { class: "kpi" + (t.drill ? " clickable" : "") }, [
         el("div", { class: "label" }, [t.label]),
-        el("div", { class: "value" }, [String(t.val)]),
-        el("div", { class: "kpi-sub" }, [t.chip])
+        el("div", { class: "value" }, [String(t.val)])
       ]);
       if (t.drill) tile.addEventListener("click", function () { drillTo(t.drill[0], t.drill[1]); });
       k.appendChild(tile);
