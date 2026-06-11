@@ -70,15 +70,17 @@ over_receipt_route = field_ops_facility_route
 
 
 # Daily waste $ per facility per day -> exception (WASTE_DAILY_FACILITY), by facility_type bucket,
-# with two severity bands. PLACEHOLDER $ values — to be tuned from day-over-day observation once the
-# standard-cost valuation is corrected. IKC selling units (HDR) are small; CK/DISH/PRODUCTION large.
+# with two severity bands (High / Urgent). Tuned 2026-06-11 to the observed net-waste $ distribution
+# at the REAL ERP standard cost (14-day): High ≈ p90, Urgent ≈ p99/extreme per type, so only outlier
+# days flag, not routine ones. Revisit as more days accrue / volume scales (Pavel may add effectivity
+# dates later). HDR = small selling units; DISH = distribution; CK/PRODUCTION = kitchens.
 WASTE_DAILY_THRESHOLDS = {
-    "HDR":        {"high": 5_000,  "urgent": 15_000},
-    "CK":         {"high": 50_000, "urgent": 100_000},
-    "DISH":       {"high": 50_000, "urgent": 100_000},
-    "PRODUCTION": {"high": 50_000, "urgent": 100_000},
+    "HDR":        {"high": 1_000,  "urgent": 3_000},    # p90 $398 / p99 $950 / max $5.4k
+    "DISH":       {"high": 40_000, "urgent": 65_000},   # p50 $15.8k / max $67.8k
+    "CK":         {"high": 15_000, "urgent": 30_000},   # mirrors PRODUCTION (no CK-tagged days observed)
+    "PRODUCTION": {"high": 15_000, "urgent": 30_000},   # p50 $4.2k / p90 $25.9k
 }
-_DEFAULT_WASTE_THRESHOLD = {"high": 25_000, "urgent": 75_000}
+_DEFAULT_WASTE_THRESHOLD = {"high": 10_000, "urgent": 25_000}
 
 
 def waste_daily_threshold(facility_type):
