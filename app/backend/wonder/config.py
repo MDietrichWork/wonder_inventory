@@ -29,9 +29,9 @@ class Settings(BaseSettings):
     over_receipt_high_pct: float = 0.30    # flag + High floor: received exceeds ordered by >30%
     over_receipt_urgent_pct: float = 1.00  # over-receipt severity split: 30-99% over -> High, >=100% -> Urgent
 
-    # --- Adjustment / waste thresholds ---
-    adjust_implausible_qty: int = 100000      # single (sku,location,day) waste qty above this -> Implausible Adjustment Quantity (Jira, High)
-    daily_waste_threshold_usd: float = 10000  # location daily waste $ above this -> dashboard waste card (excludes implausible rows)
+    # --- Waste thresholds ---
+    # Daily facility waste $ thresholds are per-facility-type and live in
+    # reference.WASTE_DAILY_THRESHOLDS (banded High/Urgent), not here.
 
     # --- BigQuery (only used when data_source=bigquery) ---
     gcp_project: Optional[str] = None
