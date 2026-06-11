@@ -448,18 +448,25 @@ NON_WASTE_ADJUST_L2 = ("Move From", "Move To", "Update Received Order", "Shelf L
 
 
 def _cost_cte() -> str:
-    """SQL CTE `cost` = per-consumable-sku unit cost. Same UoM -> supplier_price; else convert the
-    supplier-unit price down to a consumable-unit price via the order qty ratio."""
-    proj, dset = settings.gcp_project, settings.bq_dataset
-    po = settings.bq_po_table
+    """SQL CTE `cost` = latest-activated ERP (Dynamics) standard cost per ITEMID (= consumable_sku)
+    at the 'control' inventory site. unit_cost = PRICE/PRICEUNIT; cost_uom = UNITID. One row per
+    ITEMID. Provided by Pavel (see SCHEMA_NOTES.md); cross-project to settings.erp_project."""
+    ep, ed = settings.erp_project, settings.erp_dataset
     return f"""cost AS (
-  SELECT consumable_sku, AVG(CASE
-           WHEN supplier_uom = consumable_uom THEN supplier_price
-           WHEN consumable_sku_qty > 0 THEN supplier_price * SAFE_DIVIDE(supplier_sku_qty, consumable_sku_qty)
-         END) AS unit_cost
-  FROM `{proj}.{dset}.{po}`
-  WHERE order_type = 'Purchase' AND supplier_price > 0 AND consumable_sku IS NOT NULL
-  GROUP BY consumable_sku)"""
+  SELECT ITEMID, AVG(UnitPrice) AS unit_cost, ANY_VALUE(UNITID) AS cost_uom FROM (
+    SELECT p.ITEMID, SAFE_DIVIDE(p.PRICE, p.PRICEUNIT) AS UnitPrice, p.UNITID
+    FROM `{ep}.{ed}.inventitempriceftistaging` AS p
+    INNER JOIN (
+      SELECT MAX(price.ActivationDate) AS ActivationDate, MAX(price.CREATEDTIME) AS CREATEDTIME,
+             price.ITEMID, price.INVENTDIMID, price.DATAAREAID
+      FROM `{ep}.{ed}.inventitempriceftistaging` AS price
+      INNER JOIN `{ep}.{ed}.inventdimftistaging` AS dim
+        ON dim.INVENTDIMID = price.INVENTDIMID AND LOWER(dim.INVENTDIMDATAAREAID) = LOWER(price.DATAAREAID)
+        AND LOWER(dim.INVENTSITEID) = 'control'
+      GROUP BY price.ITEMID, price.DATAAREAID, price.INVENTDIMID
+    ) m ON m.ITEMID = p.ITEMID AND m.ActivationDate = p.ActivationDate AND m.CREATEDTIME = p.CREATEDTIME
+       AND LOWER(m.INVENTDIMID) = LOWER(p.INVENTDIMID) AND LOWER(m.DATAAREAID) = LOWER(p.DATAAREAID))
+  GROUP BY ITEMID)"""
 
 
 def _daily_waste_rows(ds, run_date, backfill=False):
@@ -479,19 +486,24 @@ def _daily_waste_rows(ds, run_date, backfill=False):
     sql = f"""WITH {_cost_cte()},
 adj AS (   -- signed net per (facility, sku, day): losses (-) net against Found / recoveries (+)
   SELECT facility_name, facility_type, DATE(datetime_utc) AS day, consumable_sku,
+         ANY_VALUE(consumable_uom) AS consumable_uom,
          SUM(consumable_quantity_change) AS net_change
   FROM `{proj}.{dset}.{led}`
   WHERE l1_action = 'Adjust' AND l2_action NOT IN ({excl}) {date_filter}
   GROUP BY facility_name, facility_type, day, consumable_sku),
-costed AS (   -- net lost value per sku (positive = net loss, negative = net recovery)
-  SELECT a.facility_name, a.facility_type, a.day, a.consumable_sku,
-         -a.net_change * c.unit_cost AS dollars
-  FROM adj a JOIN cost c USING (consumable_sku))
+costed AS (   -- net lost value per sku (positive = net loss); only valued when cost UoM matches
+  SELECT a.facility_name, a.facility_type, a.day, a.consumable_sku, a.net_change,
+         -a.net_change * c.unit_cost AS dollars,
+         (c.unit_cost IS NOT NULL AND LOWER(c.cost_uom) = LOWER(a.consumable_uom)) AS uom_ok
+  FROM adj a LEFT JOIN cost c ON CAST(a.consumable_sku AS STRING) = c.ITEMID)
 SELECT facility_name, facility_type, CAST(day AS STRING) AS day,
-       ROUND(SUM(dollars), 0) AS dollars,
-       COUNTIF(dollars > 0) AS skus,   -- count of net-loss SKUs
-       ARRAY_AGG(STRUCT(consumable_sku AS sku, ROUND(dollars, 0) AS d)
-                 ORDER BY dollars DESC LIMIT 5) AS top
+       ROUND(SUM(IF(uom_ok, dollars, 0)), 0) AS dollars,          -- only UoM-matched items valued
+       COUNTIF(uom_ok AND dollars > 0) AS skus,                   -- # net-loss SKUs valued
+       COUNTIF(NOT uom_ok AND net_change < 0) AS uom_mismatch_skus,  -- net-loss items we couldn't value
+       ARRAY_AGG(IF(uom_ok AND dollars > 0, STRUCT(consumable_sku AS sku, ROUND(dollars, 0) AS d), NULL)
+                 IGNORE NULLS ORDER BY IF(uom_ok, dollars, 0) DESC LIMIT 5) AS top,
+       ARRAY_AGG(IF(NOT uom_ok AND net_change < 0, consumable_sku, NULL)
+                 IGNORE NULLS LIMIT 8) AS mismatch_skus
 FROM costed GROUP BY facility_name, facility_type, day
 HAVING dollars > 0 ORDER BY dollars DESC"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
@@ -542,6 +554,14 @@ def _daily_waste_facility(ds, run_date, backfill=False) -> Tuple[List[Finding], 
             "top_contributors": _top_contributors(r.top),
             "breached_at": r.day,
         }
+        # UoM mismatch callout: net-loss SKUs whose ERP cost UoM != ledger consumable_uom — NOT
+        # valued in the $ above (would be wrong), surfaced so the team can reconcile the conversion.
+        if r.uom_mismatch_skus:
+            snap["uom_mismatch_count"] = r.uom_mismatch_skus
+            shown = list(r.mismatch_skus or [])
+            snap["uom_mismatch_note"] = ("%d net-loss SKU(s) not valued — ERP cost UoM ≠ waste UoM (reconcile): %s%s"
+                                         % (r.uom_mismatch_skus, ", ".join(shown),
+                                            " …" if r.uom_mismatch_skus > len(shown) else ""))
         findings.append(Finding("WASTE-DAILY", "WASTE_DAILY_FACILITY", sev, src, ek, snap))
     return findings, total
 

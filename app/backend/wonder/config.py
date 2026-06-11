@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     bq_ledger_table: Optional[str] = None   # e.g. "unified_inventory_ledger"
     bq_po_table: Optional[str] = None        # e.g. "purchase_order_table"
     google_application_credentials: Optional[str] = None  # path to read-only SA key
+    # ERP standard-cost source (Dynamics), cross-project; ITEMID = consumable_sku. See SCHEMA_NOTES.md.
+    erp_project: str = "wonder-raw-prod"
+    erp_dataset: str = "erp_prod_batch"
 
     # --- Jira Cloud (only used when ticket_sink=jira) ---
     jira_base_url: Optional[str] = None      # https://your-org.atlassian.net
