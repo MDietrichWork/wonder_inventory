@@ -39,9 +39,29 @@ def canon_system(s):
 TEAMS = {
     "SC Product (IMS)": ["Pavel Romanov", "Sarah Chen", "Marcus Webb"],
     "Field Ops": ["Diego Alvarez", "Priya Nair"],
+    "Field Ops — IKC": ["Diego Alvarez"],        # selling units (facility_type HDR)
+    "Field Ops — ProdCo": ["Priya Nair"],         # Central Kitchen + Distribution (facility_type CK/DISH/PRODUCTION)
     "Procurement": ["Tom Becker", "Lena Ortiz"],
     "Accounting (Cost Accountant)": ["Mike Dietrich"],
 }
+
+# Over-receipt routing is facility-type-aware (Pavel): the selling IKC units (facility_type 'HDR')
+# go to Field Ops — IKC; Central Kitchen / Distribution / Production go to Field Ops — ProdCo.
+# Anything unrecognized falls through to ProdCo. facility_type is read from the finding snapshot.
+FACILITY_TYPE_TEAM = {
+    "HDR": "Field Ops — IKC",
+    "CK": "Field Ops — ProdCo",
+    "DISH": "Field Ops — ProdCo",
+    "PRODUCTION": "Field Ops — ProdCo",
+}
+_DEFAULT_OVER_RECEIPT_TEAM = "Field Ops — ProdCo"
+
+
+def over_receipt_route(facility_type):
+    """(team, assignee) for a PO_OVER_RECEIPT finding, chosen by facility_type bucket."""
+    team = FACILITY_TYPE_TEAM.get((facility_type or "").strip().upper(), _DEFAULT_OVER_RECEIPT_TEAM)
+    assignee = (TEAMS.get(team) or ["Unassigned"])[0]
+    return team, assignee
 
 MOVEMENT_TYPES = ["PO Receipt", "Transfer", "Production", "Sales / Outbound", "Expiration", "Adjustment"]
 
@@ -54,9 +74,9 @@ ERROR_TYPES = [
     {"type": "PO_RECORD_MISSING", "rule": "PO exists in PO table", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Ledger PO reference has no matching row in the PO table."},
     {"type": "PO_OVER_RECEIPT", "rule": "Receipt within ordered qty", "ruleType": "RANGE",
-     "owner": "Field Ops", "desc": "Received quantity exceeds the quantity ordered on the PO — a genuine receiving overage. Severity by magnitude: 5–50% over → High, >50% over → Urgent. (Beyond 2× is split out as PO_IMPLAUSIBLE_QTY — likely data corruption.)"},
+     "owner": "Field Ops", "desc": "Received quantity exceeds the quantity ordered on the PO. Severity by magnitude: 30–99% over → High (a supply-chain signal — possible unsolicited / over-shipment), ≥100% over (received ≥2× ordered) → Urgent (a likely receiving error — double-receive / fat-finger). Routed by facility type: HDR (selling units) → Field Ops — IKC; CK / DISH / Production → Field Ops — ProdCo."},
     {"type": "PO_IMPLAUSIBLE_QTY", "rule": "Received qty is physically plausible", "ruleType": "RANGE",
-     "owner": "SC Product (IMS)", "desc": "Received quantity is more than 2x ordered (often vastly so) — an upstream data-corruption / unit defect, not a real overage."},
+     "owner": "SC Product (IMS)", "desc": "DEPRECATED — folded into PO_OVER_RECEIPT (≥100% over → Urgent) as of the facility-routing change. Kept so historical tickets still render; no longer emitted."},
     {"type": "PO_UOM_MISMATCH", "rule": "PO/ledger consumable UoM match", "ruleType": "RECONCILIATION",
      "owner": "Procurement", "desc": "Consumable UoM on the PO differs from the ledger receipt — ordered vs received aren't comparable until the UoM/conversion is reconciled (excluded from the over-receipt % rule)."},
     {"type": "TRANSFER_WAREHOUSE_IMBALANCE", "rule": "Transfer Warehouse balances", "ruleType": "RECONCILIATION",
@@ -225,6 +245,8 @@ ROUTING = [
 # ticket so Jira can be filtered by team.
 JIRA_TEAM_MAP = {
     "Field Ops": {"group": "dq-field-ops", "assignee_email": None},
+    "Field Ops — IKC": {"group": "dq-field-ops-ikc", "assignee_email": None},
+    "Field Ops — ProdCo": {"group": "dq-field-ops-prodco", "assignee_email": None},
     "SC Product (IMS)": {"group": "dq-sc-product-ims", "assignee_email": None},
     "Procurement": {"group": "dq-procurement", "assignee_email": None},
     "Accounting (Cost Accountant)": {"group": "dq-accounting", "assignee_email": None},

@@ -24,8 +24,10 @@ class Settings(BaseSettings):
     autoclose_consecutive_runs: int = 1  # close after issue absent for N runs
 
     # --- Over-receipt thresholds (catalog PO-03 / PO-04) ---
-    over_receipt_high_pct: float = 0.05    # flag + High floor: received exceeds ordered by >5%
-    over_receipt_urgent_pct: float = 0.50  # over-receipt severity split: 5-50% over -> High, >50% -> Urgent
+    # Per Pavel: 30-99% over is a supply-chain signal (High), >=100% over (received >=2x ordered)
+    # is a likely receiving error (Urgent). The >2x "implausible" tier folds into the Urgent band.
+    over_receipt_high_pct: float = 0.30    # flag + High floor: received exceeds ordered by >30%
+    over_receipt_urgent_pct: float = 1.00  # over-receipt severity split: 30-99% over -> High, >=100% -> Urgent
 
     # --- Adjustment / waste thresholds ---
     adjust_implausible_qty: int = 100000      # single (sku,location,day) waste qty above this -> Implausible Adjustment Quantity (Jira, High)

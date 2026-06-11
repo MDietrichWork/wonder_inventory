@@ -41,15 +41,30 @@ def test_not_null_flags_missing_po():
 
 def test_over_receipt_severity_bands():
     po = [{"po_number": "PO-1", "sku": "S1", "ordered_qty": 100},
-          {"po_number": "PO-2", "sku": "S2", "ordered_qty": 100}]
+          {"po_number": "PO-2", "sku": "S2", "ordered_qty": 100},
+          {"po_number": "PO-3", "sku": "S3", "ordered_qty": 100},
+          {"po_number": "PO-4", "sku": "S4", "ordered_qty": 100}]
     ledger = [
-        {"txn_type": "PO_RECEIPT", "po_number": "PO-1", "sku": "S1", "qty": 160, "facility": "F1", "system_of_origin": "Sys"},  # 60% over -> Urgent (>50%)
-        {"txn_type": "PO_RECEIPT", "po_number": "PO-2", "sku": "S2", "qty": 106, "facility": "F1", "system_of_origin": "Sys"},  # 6%  over -> High (5-50%)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-1", "sku": "S1", "qty": 260, "facility": "F1", "system_of_origin": "Sys"},  # 160% over -> Urgent (>=100%)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-2", "sku": "S2", "qty": 160, "facility": "F1", "system_of_origin": "Sys"},  # 60%  over -> High (30-99%)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-3", "sku": "S3", "qty": 200, "facility": "F1", "system_of_origin": "Sys"},  # 100% over exactly -> Urgent (boundary)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-4", "sku": "S4", "qty": 120, "facility": "F1", "system_of_origin": "Sys"},  # 20%  over -> below 30% floor, not flagged
     ]
     r = _rule("PO-03", "OVER_RECEIPT", "PO_OVER_RECEIPT", {})
     sev = {f.entity_key: f.severity for f in run_rules([r], _Stub(ledger, po), "2026-06-09")}
-    assert sev["PO-1:S1"] == "Urgent"   # >50% over
-    assert sev["PO-2:S2"] == "High"     # 5-50% over
+    assert sev["PO-1:S1"] == "Urgent"      # >=100% over
+    assert sev["PO-2:S2"] == "High"        # 30-99% over
+    assert sev["PO-3:S3"] == "Urgent"      # exactly 100% over (boundary -> Urgent)
+    assert "PO-4:S4" not in sev            # 20% over is below the 30% floor
+
+
+def test_over_receipt_facility_routing():
+    from wonder import reference
+    assert reference.over_receipt_route("HDR") == ("Field Ops — IKC", "Diego Alvarez")
+    assert reference.over_receipt_route("CK")[0] == "Field Ops — ProdCo"
+    assert reference.over_receipt_route("DISH")[0] == "Field Ops — ProdCo"
+    assert reference.over_receipt_route("PRODUCTION")[0] == "Field Ops — ProdCo"
+    assert reference.over_receipt_route(None)[0] == "Field Ops — ProdCo"   # unknown -> ProdCo
 
 
 def test_lifecycle_autoclose_and_idempotent():

@@ -129,7 +129,7 @@ def _over_receipt(rule, ds, run_date) -> List[Finding]:
             continue  # missing PO is a referential concern
         over = (recv - ord_qty) / ord_qty
         if over > high:
-            sev = "Urgent" if over > urgent else "High"
+            sev = "Urgent" if over >= urgent else "High"  # 30-99% -> High, >=100% -> Urgent
             fac, sysn = where.get((po, sku), (None, None))
             out.append(Finding(rule.id, rule.error_type, sev, rule.target_table, _ent(po, sku), {
                 "po_number": po, "sku": sku, "facility": fac, "system": sysn,

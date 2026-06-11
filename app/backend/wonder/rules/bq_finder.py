@@ -44,7 +44,8 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: flo
     evt = f"""evt AS (
   SELECT l.ref_order_id AS po, l.consumable_sku, l.datetime_utc,
          l.consumable_quantity_change AS q, l.consumable_uom AS ruom,
-         l.facility_name AS facility, l.system_of_origin AS system, l.item_name AS item_name,
+         l.facility_name AS facility, l.facility_type AS facility_type,
+         l.system_of_origin AS system, l.item_name AS item_name,
          l.l1_action AS l1_action, l.l2_action AS l2_action,
          SUM(l.consumable_quantity_change) OVER (
            PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
@@ -58,7 +59,8 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: flo
     return "WITH " + evt + f""",
 received AS (
   SELECT po, consumable_sku, SUM(q) AS received_qty, ANY_VALUE(ruom) AS received_uom,
-         ANY_VALUE(facility) AS facility, ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(facility) AS facility, ANY_VALUE(facility_type) AS facility_type,
+         ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name,
          -- movement action of the largest receipt = the dominant receiving event (l1 / l2)
          ANY_VALUE(l1_action HAVING MAX q) AS move_l1, ANY_VALUE(l2_action HAVING MAX q) AS move_l2
   FROM evt GROUP BY po, consumable_sku),
@@ -82,7 +84,7 @@ breach AS (
   GROUP BY po, consumable_sku),
 flagged AS (
   SELECT r.po, r.consumable_sku, r.item_name, o.ordered_qty, r.received_qty,
-         o.ordered_uom, r.received_uom, r.facility, r.system, o.supplier, o.status,
+         o.ordered_uom, r.received_uom, r.facility, r.facility_type, r.system, o.supplier, o.status,
          r.move_l1, r.move_l2,
          SAFE_DIVIDE(r.received_qty, o.ordered_qty) - 1 AS over_frac,
          (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch,
@@ -94,13 +96,14 @@ flagged AS (
         OR r.received_qty > o.ordered_qty * (1 + {high})
   )
 ),
+-- Rank within each band (High 30-99% vs Urgent >=100%) so the per-band cap keeps BOTH
+-- populations represented instead of the most-extreme rows crowding out the mid-band ones.
 ranked AS (
   SELECT *, COUNT(*) OVER() AS total_matches,
          ROW_NUMBER() OVER (
            PARTITION BY (CASE WHEN uom_mismatch THEN 'uom'
-                              WHEN over_frac > 1 THEN 'impl'                 -- >2x: implausible / data corruption
-                              WHEN over_frac > {urgent} THEN 'gen_urgent'    -- >50%: severe overage (Urgent)
-                              ELSE 'gen_high' END)                          -- 5-50%: genuine overage (High)
+                              WHEN over_frac >= {urgent} THEN 'over_urgent'  -- >=100% over (>=2x ordered): likely error (Urgent)
+                              ELSE 'over_high' END)                         -- 30-99% over: supply-chain signal (High)
            ORDER BY over_frac DESC) AS rn
   FROM flagged
 )
@@ -120,7 +123,7 @@ def _snap(r, high):
         "uom_match": (r.ordered_uom == r.received_uom),
         "over_by_pct": round((r.over_frac or 0.0) * 100, 1), "tolerance_pct": round(high * 100, 1),
         "status": r.status, "supplier": r.supplier,
-        "facility": r.facility or "—", "system": r.system or "—",
+        "facility": r.facility or "—", "facility_type": r.facility_type, "system": r.system or "—",
         # inventory movement (ledger l1 / l2 of the receiving event) — drives the dashboard breakout
         "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if getattr(r, "move_l1", None) else None,
         # data-derived timeline: when the error actually began vs. last activity
@@ -129,7 +132,9 @@ def _snap(r, high):
 
 
 def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """PO_OVER_RECEIPT (genuine ≤2× → High, Field Ops) and PO_IMPLAUSIBLE_QTY (>2× → Urgent, SC Product)."""
+    """PO_OVER_RECEIPT — 30-99% over → High, >=100% over (>=2× ordered) → Urgent. Routed by
+    facility_type at assignment time (HDR → Field Ops/IKC, CK/DISH/PRODUCTION → Field Ops/ProdCo).
+    UoM mismatches split off as PO_UOM_MISMATCH (not comparable as an overage %)."""
     bq = ds._bq
     high = settings.over_receipt_high_pct
     urgent = settings.over_receipt_urgent_pct
@@ -150,14 +155,13 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
             # the error began at the first receipt in the conflicting unit
             s["breached_at"] = _d(r.uom_breach_date) or s["first_receipt"] or s["last_receipt"]
             findings.append(Finding("PO-03", "PO_UOM_MISMATCH", "High", src, ek, s))
-        elif (r.over_frac or 0.0) > 1:  # received > 2x ordered
-            s["implausible_quantity"] = True
-            s["breached_at"] = _d(r.over_breach_date) or s["last_receipt"]
-            findings.append(Finding("PO-03", "PO_IMPLAUSIBLE_QTY", "Urgent", src, ek, s))
         else:
+            over = r.over_frac or 0.0
             s["breached_at"] = _d(r.over_breach_date) or s["last_receipt"]
-            # severity by magnitude: 5-50% over -> High, >50% over -> Urgent
-            sev = "Urgent" if (r.over_frac or 0.0) > urgent else "High"
+            # severity by magnitude: 30-99% over -> High, >=100% over (>=2x ordered) -> Urgent
+            sev = "Urgent" if over >= urgent else "High"
+            if over >= 1:  # received >=2x ordered — surface a note in the ticket body
+                s["implausible_quantity"] = True
             findings.append(Finding("PO-03", "PO_OVER_RECEIPT", sev, src, ek, s))
     return findings, total
 

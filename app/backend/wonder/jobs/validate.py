@@ -11,6 +11,7 @@ from ..models import ValidationRun, Rule, RoutingMap, Error, TicketEvent, AuditL
 from ..rules import run_rules
 from ..schema_map import LEDGER_TABLE, PO_TABLE
 from ..config import settings
+from .. import reference
 
 OPEN_STATES = ("Open", "In Progress", "In Review")
 CLOSED_STATES = ("Resolved", "Closed", "Auto-Closed")
@@ -73,14 +74,20 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             continue
 
         route = routing.get(f.error_type)
+        routed_team = route.team if route else "Unassigned"
+        routed_assignee = route.assignee if route else "Unassigned"
+        # Over-receipt routes by facility type (HDR -> Field Ops/IKC, CK·DISH·PRODUCTION ->
+        # Field Ops/ProdCo) rather than the flat error_type map.
+        if f.error_type == "PO_OVER_RECEIPT":
+            routed_team, routed_assignee = reference.over_receipt_route((f.snapshot or {}).get("facility_type"))
         # SLA/age anchor = when the error actually began in the data (breach date), not when the
         # batch happened to detect it. detected_at keeps the real detection timestamp.
         anchor = (f.snapshot or {}).get("breached_at") or run_date
         err = Error(
             fingerprint=fp, rule_id=f.rule_id, error_type=f.error_type, source_table=f.source_table,
             entity_key=f.entity_key, data_snapshot=f.snapshot, severity=f.severity,
-            routed_team=route.team if route else "Unassigned",
-            routed_assignee=route.assignee if route else "Unassigned",
+            routed_team=routed_team,
+            routed_assignee=routed_assignee,
             status="Open", detected_at=as_of, first_run_date=anchor, last_seen_run=run_date,
             recurrence=1,
         )
