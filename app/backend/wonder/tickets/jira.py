@@ -16,8 +16,9 @@ from .. import reference
 
 log = logging.getLogger("wonder.jira")
 
-# Map our severity model onto Jira's default priority scheme.
-SEVERITY_TO_PRIORITY = {"Urgent": "Highest", "High": "High", "Medium": "Medium", "Low": "Low"}
+# Map our severity model onto Jira's priority scheme. Jira now has a 1:1 set
+# (Urgent / High / Medium / Low), so the mapping is identity.
+SEVERITY_TO_PRIORITY = {"Urgent": "Urgent", "High": "High", "Medium": "Medium", "Low": "Low"}
 
 
 def _adf(text: str) -> dict:
