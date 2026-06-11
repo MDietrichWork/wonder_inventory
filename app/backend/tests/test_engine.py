@@ -65,6 +65,16 @@ def test_over_receipt_facility_routing():
     assert reference.over_receipt_route("DISH")[0] == "Field Ops — ProdCo"
     assert reference.over_receipt_route("PRODUCTION")[0] == "Field Ops — ProdCo"
     assert reference.over_receipt_route(None)[0] == "Field Ops — ProdCo"   # unknown -> ProdCo
+    assert reference.field_ops_facility_route is reference.over_receipt_route  # shared helper
+
+
+def test_waste_daily_threshold_by_facility_type():
+    from wonder import reference
+    hdr = reference.waste_daily_threshold("HDR")           # selling units: small
+    ck = reference.waste_daily_threshold("CK")             # central kitchen: large
+    assert hdr["high"] < ck["high"] and hdr["urgent"] < ck["urgent"]
+    assert reference.waste_daily_threshold("dish")["high"] == reference.waste_daily_threshold("DISH")["high"]  # case-insensitive
+    assert reference.waste_daily_threshold("nope") == reference.waste_daily_threshold(None)   # unknown -> default
 
 
 def test_lifecycle_autoclose_and_idempotent():

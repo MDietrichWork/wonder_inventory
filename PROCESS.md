@@ -20,6 +20,14 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-11 — Over-receipt re-tier + facility routing; waste refactor; cleanups
+- **Jira priority fix:** Jira's scheme was renamed to Urgent/High/Medium/Low (no "Highest"), so the old `Urgent→Highest` map was rejected and tickets silently fell back to Medium. Mapped identity; app Urgents now post as Jira **Urgent** (backfilled the existing tickets).
+- **Over-receipt re-tiered (per Pavel):** flag floor **5%→30%**; **30–99% over → High** (supply-chain signal), **≥100% over (received ≥2× ordered) → Urgent** (likely receiving error). The old >2× `PO_IMPLAUSIBLE_QTY` tier **folds into** the Urgent band (kept in the catalog as deprecated for historical tickets, no longer emitted).
+- **Facility-type routing:** profiled the ledger's `facility_type` → **HDR** (131 selling units), **DISH** (7), **CK** (1), **PRODUCTION** (2). `PO_OVER_RECEIPT` and the new daily-waste exception now route by bucket: **HDR → Field Ops — IKC**; **CK/DISH/PRODUCTION (and unknown) → Field Ops — ProdCo** (two new teams + Jira group labels `dq-field-ops-ikc` / `-prodco`).
+- **Waste refactor:** (1) **net basis** — `WASTE_IMPLAUSIBLE_QTY` and the daily-waste metric now net same-day corrections of the same action (grouped by sku/facility/day/`l2_action`) instead of summing removals; (2) new **`WASTE_DAILY_FACILITY` exception** — a facility's net daily waste $ over its **facility-type threshold** (placeholder $ pending the standard-cost fix), banded **High/Urgent**, drawer lists top contributing SKUs (sorted; no over-engineering per Pavel); (3) dashboard `waste_by_location` switched to net + per-type thresholds.
+- **Cleanups:** disabled **XFER-01** (Pavel: transfer orders out of scope). **Deferred the `LOWER()` case pass** — profiled the join keys (26,851/26,922 exact, **0** case-only matches), so it's a no-op-with-cost today; revisit right after Johnny's UoM standardization, which is the likely source of case drift.
+- Reseeded live (BigQuery + Jira): 67 exceptions across 6 rule types; tests 5/5.
+
 ### 2026-06-10 — Phase 5 start: React rebuild of the console (runs locally, live data)
 - Began the production UI rebuild as a **Vite + React + TypeScript** app at `app/frontend-react/`, so the user can run it locally with hot-reload while making visual changes / testing new rules. **Reuses the approved `styles.css` verbatim** (identical look) and hits the **same** FastAPI API; the vanilla console under `app/frontend` is left untouched.
 - Installed **Node 24 LTS standalone** (`~/.local/bin/node`, no admin — brew is permission-broken). `npm run dev` serves :5173 and **proxies `/api` → :8000**, so it runs against live BigQuery + Jira.

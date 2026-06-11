@@ -76,10 +76,10 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         route = routing.get(f.error_type)
         routed_team = route.team if route else "Unassigned"
         routed_assignee = route.assignee if route else "Unassigned"
-        # Over-receipt routes by facility type (HDR -> Field Ops/IKC, CK·DISH·PRODUCTION ->
-        # Field Ops/ProdCo) rather than the flat error_type map.
-        if f.error_type == "PO_OVER_RECEIPT":
-            routed_team, routed_assignee = reference.over_receipt_route((f.snapshot or {}).get("facility_type"))
+        # Over-receipt and daily-facility-waste route by facility type (HDR -> Field Ops/IKC,
+        # CK·DISH·PRODUCTION -> Field Ops/ProdCo) rather than the flat error_type map.
+        if f.error_type in ("PO_OVER_RECEIPT", "WASTE_DAILY_FACILITY"):
+            routed_team, routed_assignee = reference.field_ops_facility_route((f.snapshot or {}).get("facility_type"))
         # SLA/age anchor = when the error actually began in the data (breach date), not when the
         # batch happened to detect it. detected_at keeps the real detection timestamp.
         anchor = (f.snapshot or {}).get("breached_at") or run_date
@@ -115,7 +115,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
         from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_sku_on_po,
-                                        recheck_to_exists, recheck_implausible_adjustment)
+                                        recheck_to_exists, recheck_implausible_adjustment,
+                                        recheck_daily_waste_facility)
         high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
@@ -124,6 +125,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
         adj_errs = [e for e in open_errs if e.error_type == "WASTE_IMPLAUSIBLE_QTY"]
+        dwf_errs = [e for e in open_errs if e.error_type == "WASTE_DAILY_FACILITY"]
 
         # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
@@ -185,18 +187,35 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                             "Re-check on run %s: transfer order now exists — auto-closed." % run_date)
                 autoclosed += 1
 
-        # implausible adjustment qty: close once the (sku,location,day) waste is back under the ceiling
+        # implausible adjustment qty: close once the (sku,location,day,action) NET waste is back under the ceiling
         ceiling = settings.adjust_implausible_qty
         akeys = list({((e.data_snapshot or {}).get("facility"), (e.data_snapshot or {}).get("consumable_sku"),
-                       (e.data_snapshot or {}).get("adjustment_date")) for e in adj_errs if (e.data_snapshot or {}).get("facility")})
+                       (e.data_snapshot or {}).get("adjustment_date"), (e.data_snapshot or {}).get("reason"))
+                      for e in adj_errs if (e.data_snapshot or {}).get("facility")})
         acur = recheck_implausible_adjustment(ds, akeys) if akeys else {}
         for e in adj_errs:
             snap = e.data_snapshot or {}
-            k = "%s~~%s~~%s" % (snap.get("facility"), snap.get("consumable_sku"), snap.get("adjustment_date"))
+            k = "%s~~%s~~%s~~%s" % (snap.get("facility"), snap.get("consumable_sku"),
+                                    snap.get("adjustment_date"), snap.get("reason"))
             qty = acur.get(k)
             if qty is None or qty <= ceiling:  # corrected (or no longer present) — back to plausible
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: adjustment quantity now plausible (<= %s) — auto-closed." % (run_date, ceiling))
+                autoclosed += 1
+
+        # daily facility waste: close once the facility-day NET waste $ is back under its High threshold
+        dkeys = list({((e.data_snapshot or {}).get("facility"), (e.data_snapshot or {}).get("day"))
+                      for e in dwf_errs if (e.data_snapshot or {}).get("facility")})
+        dcur = recheck_daily_waste_facility(ds, dkeys) if dkeys else {}
+        for e in dwf_errs:
+            snap = e.data_snapshot or {}
+            cur = dcur.get("%s~~%s" % (snap.get("facility"), snap.get("day")))
+            if cur is None:
+                continue  # couldn't recompute — leave open rather than false-close
+            threshold = reference.waste_daily_threshold(snap.get("facility_type"))["high"]
+            if cur["dollars"] <= threshold:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: daily facility waste back under threshold — auto-closed." % run_date)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

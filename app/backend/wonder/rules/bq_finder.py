@@ -12,6 +12,7 @@ from typing import List, Tuple
 
 from .engine import Finding
 from ..config import settings
+from .. import reference
 
 MAX_GB = 60               # backfill scans more history; daily stays tiny
 RESULT_CAP = 500          # per-band ticket cap for a daily run (touched-set is normally far smaller)
@@ -468,14 +469,15 @@ def _build_implausible_adjustment_sql(backfill: bool, lookback: int, cap: int, c
                    f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
     return f"""WITH {_cost_cte()},
 adj AS (
-  SELECT consumable_sku, facility_name, DATE(datetime_utc) AS day,
+  -- NET removed per (sku, facility, day, action): same-day corrections of the SAME action offset,
+  -- so a +50/-50 pair nets to 0 and isn't flagged (per Pavel). Implausible = net still over ceiling.
+  SELECT consumable_sku, facility_name, facility_type, DATE(datetime_utc) AS day, l2_action AS reason,
          ANY_VALUE(item_name) AS item_name, ANY_VALUE(system_of_origin) AS system,
          ANY_VALUE(consumable_uom) AS consumable_uom,
-         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
-         ANY_VALUE(l2_action HAVING MIN consumable_quantity_change) AS reason  -- reason of the biggest single removal
+         -SUM(consumable_quantity_change) AS waste_qty
   FROM `{proj}.{dset}.{led}`
   WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) {date_filter}
-  GROUP BY consumable_sku, facility_name, day
+  GROUP BY consumable_sku, facility_name, facility_type, day, l2_action
   HAVING waste_qty > {ceiling}),
 flagged AS (
   SELECT a.*, c.unit_cost, a.waste_qty * c.unit_cost AS est_value
@@ -498,9 +500,10 @@ def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding]
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
         day = str(r.day)
-        ek = f"{r.facility_name}:{r.consumable_sku}:{day}"
+        ek = f"{r.facility_name}:{r.consumable_sku}:{day}:{r.reason}"
         snap = {
-            "facility": r.facility_name or "—", "consumable_sku": r.consumable_sku, "item_name": r.item_name,
+            "facility": r.facility_name or "—", "facility_type": r.facility_type,
+            "consumable_sku": r.consumable_sku, "item_name": r.item_name,
             "system": r.system or "—", "adjustment_date": day, "reason": r.reason,
             "waste_qty": r.waste_qty, "consumable_uom": r.consumable_uom, "implausible_ceiling": ceiling,
             "unit_cost": (round(r.unit_cost, 4) if r.unit_cost is not None else None),
@@ -513,57 +516,131 @@ def _implausible_adjustment(ds, run_date, backfill=False) -> Tuple[List[Finding]
 
 
 def recheck_implausible_adjustment(ds, keys):
-    """For each open (facility~~sku~~day) ticket, the current waste qty — close once it's back under the ceiling."""
+    """For each open (facility~~sku~~day~~action) ticket, the current NET waste qty — close once
+    it's back under the ceiling."""
     if not keys:
         return {}
     bq = ds._bq
     proj, dset = settings.gcp_project, settings.bq_dataset
     led = settings.bq_ledger_table
     waste_in = ", ".join("'%s'" % w for w in WASTE_L2)
-    kk = ["%s~~%s~~%s" % k for k in keys if all(x is not None for x in k)]
+    kk = ["%s~~%s~~%s~~%s" % k for k in keys if all(x is not None for x in k)]
     if not kk:
         return {}
-    sql = f"""SELECT CONCAT(facility_name, '~~', consumable_sku, '~~', CAST(DATE(datetime_utc) AS STRING)) AS key,
-       SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS qty
+    keyexpr = ("CONCAT(facility_name, '~~', consumable_sku, '~~', "
+               "CAST(DATE(datetime_utc) AS STRING), '~~', l2_action)")
+    sql = f"""SELECT {keyexpr} AS key, -SUM(consumable_quantity_change) AS qty
     FROM `{proj}.{dset}.{led}`
     WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in})
-      AND CONCAT(facility_name, '~~', consumable_sku, '~~', CAST(DATE(datetime_utc) AS STRING)) IN UNNEST(@keys)
+      AND {keyexpr} IN UNNEST(@keys)
     GROUP BY key"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("keys", "STRING", kk)])
     return {r.key: r.qty for r in ds.client.query(sql, job_config=cfg).result()}
 
 
-def waste_by_location(ds, run_date):
-    """Dashboard metric (NOT a ticket): daily waste $ per location for run_date, valued at the
-    derived consumable-unit cost, EXCLUDING implausible (>ceiling) per-sku rows. Returns the
-    locations whose waste exceeds the $ threshold, biggest first."""
+def _daily_waste_rows(ds, run_date, backfill=False):
+    """Per (facility, facility_type, day) NET waste $ for the run_date (or backfill window),
+    valued at the derived consumable-unit cost, EXCLUDING the implausible (>ceiling) per-sku rows
+    (those are WASTE_IMPLAUSIBLE_QTY). Net so same-day corrections offset. Each row carries the
+    top contributing SKUs (sorted, for the drawer). Shared by the dashboard metric + the exception."""
     bq = ds._bq
     proj, dset = settings.gcp_project, settings.bq_dataset
     led = settings.bq_ledger_table
     waste_in = ", ".join("'%s'" % w for w in WASTE_L2)
-    ceiling, threshold = settings.adjust_implausible_qty, settings.daily_waste_threshold_usd
+    ceiling = settings.adjust_implausible_qty
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
     sql = f"""WITH {_cost_cte()},
 adj AS (
-  SELECT facility_name, DATE(datetime_utc) AS day, consumable_sku,
-         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS qty
+  SELECT facility_name, facility_type, DATE(datetime_utc) AS day, consumable_sku,
+         -SUM(consumable_quantity_change) AS qty
   FROM `{proj}.{dset}.{led}`
-  WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) AND DATE(datetime_utc) = @run_date
-  GROUP BY facility_name, day, consumable_sku
-  HAVING qty > 0 AND qty <= {ceiling}),   -- exclude the implausible rows (handled by WASTE-IMPL)
+  WHERE l1_action = 'Adjust' AND l2_action IN ({waste_in}) {date_filter}
+  GROUP BY facility_name, facility_type, day, consumable_sku
+  HAVING qty > 0 AND qty <= {ceiling}),   -- exclude implausible per-sku rows (handled by WASTE-IMPL)
 costed AS (
-  SELECT facility_name, day, SUM(adj.qty * cost.unit_cost) AS dollars, COUNT(*) AS skus
-  FROM adj JOIN cost USING (consumable_sku) GROUP BY facility_name, day)
-SELECT facility_name, CAST(day AS STRING) AS day, ROUND(dollars, 0) AS dollars, skus
-FROM costed WHERE dollars > {threshold} ORDER BY dollars DESC"""
+  SELECT a.facility_name, a.facility_type, a.day, a.consumable_sku, a.qty * c.unit_cost AS dollars
+  FROM adj a JOIN cost c USING (consumable_sku))
+SELECT facility_name, facility_type, CAST(day AS STRING) AS day,
+       ROUND(SUM(dollars), 0) AS dollars, COUNT(*) AS skus,
+       ARRAY_AGG(STRUCT(consumable_sku AS sku, ROUND(dollars, 0) AS d)
+                 ORDER BY dollars DESC LIMIT 5) AS top
+FROM costed GROUP BY facility_name, facility_type, day
+HAVING dollars > 0 ORDER BY dollars DESC"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
-    return [{"facility": r.facility_name or "—", "day": r.day, "dollars": r.dollars, "skus": r.skus}
-            for r in ds.client.query(sql, job_config=cfg).result()]
+    return list(ds.client.query(sql, job_config=cfg).result())
+
+
+def _top_contributors(top):
+    """ARRAY<STRUCT<sku, d>> -> a readable, single-line string for the drawer/ticket."""
+    return "; ".join("%s ($%s)" % (t["sku"], "{:,.0f}".format(t["d"] or 0)) for t in (top or []))
+
+
+def waste_by_location(ds, run_date):
+    """Dashboard metric (NOT a ticket): facilities whose daily waste $ is over their facility-type
+    High threshold, biggest first."""
+    rows = _daily_waste_rows(ds, run_date, backfill=False)
+    out = []
+    for r in rows:
+        th = reference.waste_daily_threshold(r.facility_type)
+        if r.dollars > th["high"]:
+            out.append({"facility": r.facility_name or "—", "facilityType": r.facility_type,
+                        "day": r.day, "dollars": r.dollars, "skus": r.skus,
+                        "band": "Urgent" if r.dollars > th["urgent"] else "High"})
+    return out
+
+
+def _daily_waste_facility(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """WASTE_DAILY_FACILITY — a facility's net waste $ for a day over its facility-type threshold.
+    Banded High/Urgent; routed by facility_type (Field Ops IKC/ProdCo) at assignment time."""
+    src = settings.bq_ledger_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    rows = _daily_waste_rows(ds, run_date, backfill=backfill)
+    findings, total = [], 0
+    for r in rows:
+        th = reference.waste_daily_threshold(r.facility_type)
+        if r.dollars <= th["high"]:
+            continue
+        total += 1
+        if len(findings) >= cap:   # rows are ordered by $ desc; keep the biggest
+            continue
+        sev = "Urgent" if r.dollars > th["urgent"] else "High"
+        ek = f"{r.facility_name}:{r.day}"
+        snap = {
+            "facility": r.facility_name or "—", "facility_type": r.facility_type, "day": r.day,
+            "waste_dollars": r.dollars, "sku_count": r.skus,
+            "high_threshold": th["high"], "urgent_threshold": th["urgent"],
+            "top_contributors": _top_contributors(r.top),
+            "breached_at": r.day,
+        }
+        findings.append(Finding("WASTE-DAILY", "WASTE_DAILY_FACILITY", sev, src, ek, snap))
+    return findings, total
+
+
+def recheck_daily_waste_facility(ds, keys):
+    """Current net waste $ for each open (facility, day) ticket — close once back under threshold."""
+    if not keys:
+        return {}
+    want = {"%s~~%s" % (f, d) for (f, d) in keys if f is not None and d is not None}
+    days = [d for (_, d) in keys if d]
+    if not want or not days:
+        return {}
+    # day-scoped, so recompute over the backfill window and pick out the wanted facility-days.
+    out = {}
+    for r in _daily_waste_rows(ds, max(days), backfill=True):
+        k = "%s~~%s" % (r.facility_name, r.day)
+        if k in want:
+            out[k] = {"dollars": r.dollars, "facility_type": r.facility_type}
+    return out
 
 
 _FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
-            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing, "WASTE-IMPL": _implausible_adjustment}
+            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
+            "WASTE-IMPL": _implausible_adjustment, "WASTE-DAILY": _daily_waste_facility}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:

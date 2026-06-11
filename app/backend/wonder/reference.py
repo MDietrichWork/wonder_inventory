@@ -57,11 +57,33 @@ FACILITY_TYPE_TEAM = {
 _DEFAULT_OVER_RECEIPT_TEAM = "Field Ops — ProdCo"
 
 
-def over_receipt_route(facility_type):
-    """(team, assignee) for a PO_OVER_RECEIPT finding, chosen by facility_type bucket."""
+def field_ops_facility_route(facility_type):
+    """(team, assignee) for a facility-scoped Field Ops finding, chosen by facility_type bucket.
+    Used by over-receipt and daily-waste routing."""
     team = FACILITY_TYPE_TEAM.get((facility_type or "").strip().upper(), _DEFAULT_OVER_RECEIPT_TEAM)
     assignee = (TEAMS.get(team) or ["Unassigned"])[0]
     return team, assignee
+
+
+# Back-compat alias (PO_OVER_RECEIPT routing).
+over_receipt_route = field_ops_facility_route
+
+
+# Daily waste $ per facility per day -> exception (WASTE_DAILY_FACILITY), by facility_type bucket,
+# with two severity bands. PLACEHOLDER $ values — to be tuned from day-over-day observation once the
+# standard-cost valuation is corrected. IKC selling units (HDR) are small; CK/DISH/PRODUCTION large.
+WASTE_DAILY_THRESHOLDS = {
+    "HDR":        {"high": 5_000,  "urgent": 15_000},
+    "CK":         {"high": 50_000, "urgent": 100_000},
+    "DISH":       {"high": 50_000, "urgent": 100_000},
+    "PRODUCTION": {"high": 50_000, "urgent": 100_000},
+}
+_DEFAULT_WASTE_THRESHOLD = {"high": 25_000, "urgent": 75_000}
+
+
+def waste_daily_threshold(facility_type):
+    """{'high': X, 'urgent': Y} daily-waste $ thresholds for a facility_type bucket."""
+    return WASTE_DAILY_THRESHOLDS.get((facility_type or "").strip().upper(), _DEFAULT_WASTE_THRESHOLD)
 
 MOVEMENT_TYPES = ["PO Receipt", "Transfer", "Production", "Sales / Outbound", "Expiration", "Adjustment"]
 
@@ -92,7 +114,9 @@ ERROR_TYPES = [
     {"type": "TRANSFER_ORDER_MISSING", "rule": "Picked Transfer Order exists", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
     {"type": "WASTE_IMPLAUSIBLE_QTY", "rule": "Adjustment quantity is plausible", "ruleType": "RANGE",
-     "owner": "SC Product (IMS)", "desc": "A single item's waste adjustment at one location in a day exceeds 100,000 units — a physically implausible quantity (e.g. the SKU number leaking into the qty field). Almost certainly bad data, not real waste; pulled out of the waste metric and flagged for review."},
+     "owner": "SC Product (IMS)", "desc": "A single item's NET waste at one location/day/action exceeds 100,000 units — a physically implausible quantity (e.g. the SKU number leaking into the qty field). Almost certainly bad data, not real waste; pulled out of the waste metric and flagged for review."},
+    {"type": "WASTE_DAILY_FACILITY", "rule": "Daily facility waste within threshold", "ruleType": "RANGE",
+     "owner": "Field Ops", "desc": "A facility's total NET waste $ for a day exceeds its facility-type threshold (small for IKC/HDR selling units, larger for CK/DISH/Production). Two bands: over the High threshold → High, over the Urgent threshold → Urgent. The drawer lists the top contributing SKUs (sorted) — investigation is the team's job. Routed by facility type (HDR → Field Ops/IKC; CK/DISH/PRODUCTION → Field Ops/ProdCo)."},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -160,8 +184,22 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
         "WHERE l1_action = 'Adjust'\n"
         "  AND l2_action IN ('Lost','Missing Items','Expiration','Damage','Recall','Recall Production','DISH Issue/Received Damaged')\n"
-        "GROUP BY consumable_sku, facility_name, day\n"
+        "GROUP BY consumable_sku, facility_name, facility_type, day, l2_action\n"
         "HAVING waste_qty > 100000"
+     ), "enabled": True},
+    {"id": "WASTE-DAILY", "name": "Daily facility waste within threshold", "primitive": "RANGE",
+     "error_type": "WASTE_DAILY_FACILITY", "target_table": "consolidated_inventory_ledger",
+     "severity": "High", "fail_type": "Soft", "owner_group": "Field Ops",
+     "params": {},  # thresholds come from reference.WASTE_DAILY_THRESHOLDS, banded by facility_type
+     "expression": (
+        "-- A facility's total NET waste $ for a day vs its facility-type threshold (excludes the\n"
+        "-- per-sku implausible rows, which WASTE_IMPLAUSIBLE_QTY handles). Net so same-day corrections\n"
+        "-- offset; banded High/Urgent by facility_type (see reference.WASTE_DAILY_THRESHOLDS).\n"
+        "SELECT facility_name, facility_type, DATE(datetime_utc) AS day,\n"
+        "       SUM(-consumable_quantity_change * unit_cost) AS waste_dollars\n"
+        "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` JOIN <standard_cost>\n"
+        "WHERE l1_action='Adjust' AND l2_action IN ('Lost','Missing Items','Expiration','Damage','Recall',...)\n"
+        "GROUP BY facility_name, facility_type, day"
      ), "enabled": True},
     {"id": "XFER-01", "name": "Picked Transfer Order exists", "primitive": "REFERENTIAL", "error_type": "TRANSFER_ORDER_MISSING",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
@@ -175,7 +213,7 @@ RULES = [
         "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL),\n"
         "to_pop AS (SELECT DISTINCT po AS to_id FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer')\n"
         "SELECT p.to_id FROM picks p LEFT JOIN to_pop t USING (to_id) WHERE t.to_id IS NULL"
-     ), "enabled": True},
+     ), "enabled": False},   # per Pavel: transfer orders are out of scope for now
     {"id": "PO-14", "name": "Received SKU listed on the PO", "primitive": "REFERENTIAL", "error_type": "PO_SKU_NOT_ON_PO",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {},  # BigQuery 3-way-match join; runs via the SQL finder, skipped by the fixtures engine
@@ -237,6 +275,9 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "Transfer Orders"},
     {"error_type": "WASTE_IMPLAUSIBLE_QTY", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_project": "WIQ", "jira_component": "Adjustment Integrity"},
+    # Fallback routing; overridden per-finding by facility_type in validate.py (Field Ops IKC/ProdCo).
+    {"error_type": "WASTE_DAILY_FACILITY", "team": "Field Ops — ProdCo", "assignee": "Priya Nair",
+     "jira_project": "WIQ", "jira_component": "Daily Waste"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team
