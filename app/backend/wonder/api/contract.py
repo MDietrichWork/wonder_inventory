@@ -73,8 +73,9 @@ def _exception(e: Error, today: str) -> Dict:
         "snapshot": snap,
         "rule": e.rule_id,
         "timeline": _timeline(e.events),
+        # notes = console comments, newest-first (descending) for the drawer
         "notes": [{"by": ev.actor, "at": ev.occurred_at, "text": ev.note}
-                  for ev in sorted(e.events, key=lambda x: x.occurred_at) if ev.to_status == "Comment"],
+                  for ev in sorted(e.events, key=lambda x: x.occurred_at, reverse=True) if ev.to_status == "Comment"],
         "age": age,
         "turnaround": turnaround,
         "slaTarget": sla,
