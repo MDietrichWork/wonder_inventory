@@ -186,7 +186,7 @@ select:focus, input:focus, button:focus-visible, .nav-item:focus-visible, .row:f
 .drillbar.show { display: flex; }
 .drill-from { font-size: 11.5px; color: var(--text-faint); }
 .fchip { display: inline-flex; align-items: center; gap: 8px; background: var(--accent-soft); border: 1px solid #2f4d80; color: #cfe0ff; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 20px; }
-.fchip-x { background: rgba(255,255,255,.12); border: 0; color: #cfe0ff; width: 16px; height: 16px; border-radius: 50%; cursor: pointer; font-size: 10px; line-height: 1; }
+.fchip-x { display: inline-flex; align-items: center; justify-content: center; padding: 0; background: rgba(255,255,255,.12); border: 0; color: #cfe0ff; width: 16px; height: 16px; border-radius: 50%; cursor: pointer; font-size: 10px; line-height: 1; }
 .fchip-x:hover { background: rgba(255,255,255,.28); }
 
 /* ---------- Bulk action bar ---------- */
