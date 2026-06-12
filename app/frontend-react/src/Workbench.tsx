@@ -78,7 +78,13 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
     await Promise.all(selected.map((e) => apiPost(`/exceptions/${e.pk}/assign`, { assignee: who })));
     setSel(new Set()); await refresh();
   };
-  const bulkComment = () => { if (!selected.length) return; const c = prompt(`Add a comment to ${selected.length} ticket(s):`, "Investigating batch root cause."); if (c) alert(`Mock: comment posted to ${selected.length} JIRA ticket(s).`); };
+  const bulkComment = async () => {
+    if (!selected.length) return;
+    const c = prompt(`Add a comment to ${selected.length} ticket(s) (posts to Jira):`, "Investigating batch root cause.");
+    if (!c) return;
+    await Promise.all(selected.map((e) => apiPost(`/exceptions/${e.pk}/comment`, { text: c })));
+    setSel(new Set()); await refresh();
+  };
   const bulkResolve = async () => { if (!selected.length) return; await Promise.all(selected.map((e) => apiPost(`/exceptions/${e.pk}/resolve`))); setSel(new Set()); await refresh(); };
 
   return (

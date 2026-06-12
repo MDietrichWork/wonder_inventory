@@ -9,11 +9,22 @@ import { Sla } from "./Sla";
 import { Admin } from "./Admin";
 
 type View = "dashboard" | "workbench" | "sla" | "admin";
+const VIEWS: View[] = ["dashboard", "workbench", "sla", "admin"];
+// Views are hash-routed (#workbench, #sla, …) so they're deep-linkable / bookmarkable and each
+// view can be loaded directly (incl. for headless UI verification). Unknown/empty hash → dashboard.
+const viewFromHash = (): View => {
+  const h = (typeof location !== "undefined" ? location.hash : "").replace(/^#\/?/, "");
+  return (VIEWS as string[]).includes(h) ? (h as View) : "dashboard";
+};
 
 export function App() {
   const [data, setData] = useState<Bootstrap | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [view, setView] = useState<View>("dashboard");
+  const [view, setViewState] = useState<View>(viewFromHash);
+  const setView = useCallback((v: View) => {
+    setViewState(v);
+    if (location.hash !== "#" + v) location.hash = v;   // reflect in the URL (fires hashchange → no-op re-set)
+  }, []);
   const [drill, setDrill] = useState<Drill>(null);
   const [openPk, setOpenPk] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -22,6 +33,13 @@ export function App() {
     try { setData(await getBootstrap()); } catch (e) { setErr(String(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  // Keep the active view in sync with the URL hash (back/forward, manual edits, direct links).
+  useEffect(() => {
+    const onHash = () => setViewState(viewFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   const drillTo = (label: string, test: (e: Exception) => boolean) => { setDrill({ label, test }); setView("workbench"); };
   const ownerQueue = (name: string) => drillTo("Primary owner: " + name, (e) => e.primaryOwner === name);
@@ -40,7 +58,7 @@ export function App() {
       if (e.key === "Escape") { setOpenPk(null); return; }
       if (e.key === "/") { e.preventDefault(); setView("workbench"); setTimeout(() => document.querySelector<HTMLInputElement>(".toolbar input[type=search]")?.focus(), 0); return; }
       const idx = ["1", "2", "3", "4"].indexOf(e.key);
-      if (idx > -1) setView((["dashboard", "workbench", "sla", "admin"] as View[])[idx]);
+      if (idx > -1) setView(VIEWS[idx]);
     };
     document.addEventListener("keydown", h);
     return () => document.removeEventListener("keydown", h);
