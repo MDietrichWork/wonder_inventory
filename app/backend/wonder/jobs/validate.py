@@ -115,7 +115,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
         from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_sku_on_po,
-                                        recheck_to_exists, recheck_daily_waste_facility)
+                                        recheck_to_exists, recheck_daily_waste_facility,
+                                        recheck_waste_sku_no_cost, recheck_consumable_cost)
         high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
@@ -124,6 +125,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
         dwf_errs = [e for e in open_errs if e.error_type == "WASTE_DAILY_FACILITY"]
+        nocost_errs = [e for e in open_errs if e.error_type == "WASTE_SKU_NO_COST"]
+        zerocost_errs = [e for e in open_errs if e.error_type == "CONSUMABLE_ZERO_COST"]
 
         # over-receipt family: received-vs-ordered + UoM
         pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
@@ -198,6 +201,25 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if cur["dollars"] <= threshold:
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: daily facility waste back under threshold — auto-closed." % run_date)
+                autoclosed += 1
+
+        # waste SKU with no standard-cost record: close once a cost record exists for the SKU
+        ncskus = list({(e.data_snapshot or {}).get("consumable_sku") for e in nocost_errs})
+        now_costed = recheck_waste_sku_no_cost(ds, ncskus) if ncskus else set()
+        for e in nocost_errs:
+            if str((e.data_snapshot or {}).get("consumable_sku")) in now_costed:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: standard-cost record now exists — auto-closed." % run_date)
+                autoclosed += 1
+
+        # consumable zero/null standard cost: close once a non-zero cost is set
+        zcskus = list({(e.data_snapshot or {}).get("consumable_sku") for e in zerocost_errs})
+        zccur = recheck_consumable_cost(ds, zcskus) if zcskus else {}
+        for e in zerocost_errs:
+            cur = zccur.get(str((e.data_snapshot or {}).get("consumable_sku")))
+            if cur and not cur["missing"]:  # a non-zero standard cost has been set
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: standard cost now populated — auto-closed." % run_date)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

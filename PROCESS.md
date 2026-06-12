@@ -20,6 +20,12 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-06-12 — Cost-data rules: waste SKU without cost + zero-cost consumable (#66)
+- Two new **Accounting (Cost Accountant)** rules off the now-wired ERP standard cost, both with an explicit per-finding **`why_flagged`** explanation surfaced as a callout at the top of the drawer (and carried into the Jira body):
+  - **`WASTE_SKU_NO_COST` (COST-01, High)** — a waste-active `consumable_sku` with **no** ERP cost record (no `ITEMID` match), so its waste can't be valued. Small population → **all** ticketed (5).
+  - **`CONSUMABLE_ZERO_COST` (COST-02, High, framework #66)** — a ledger-active `consumable_sku` that **has** a cost record but the standard cost is **$0/NULL**. 600+ in the full cost-table backlog, but only ~4–5 are ledger-active in the rolling window; **capped to 5** for the Jira test (`ZERO_COST_TEST_CAP`).
+- Both auto-close when the cost is set up / corrected in Dynamics. Drawer change: `why_flagged` + `uom_mismatch_note` render as a "Why this is flagged" callout (hidden from the raw snapshot grid).
+
 ### 2026-06-11 — Over-receipt re-tier + facility routing; waste refactor; cleanups
 - **Jira priority fix:** Jira's scheme was renamed to Urgent/High/Medium/Low (no "Highest"), so the old `Urgent→Highest` map was rejected and tickets silently fell back to Medium. Mapped identity; app Urgents now post as Jira **Urgent** (backfilled the existing tickets).
 - **Over-receipt re-tiered (per Pavel):** flag floor **5%→30%**; **30–99% over → High** (supply-chain signal), **≥100% over (received ≥2× ordered) → Urgent** (likely receiving error). The old >2× `PO_IMPLAUSIBLE_QTY` tier **folds into** the Urgent band (kept in the catalog as deprecated for historical tickets, no longer emitted).

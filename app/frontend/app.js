@@ -352,7 +352,22 @@
     // Offending data snapshot — hide backend-only fields; fold UoM into the qty line.
     var snap = e.snapshot;
     var SNAP_HIDE = { tolerance_pct: 1, uom_match: 1, status: 1, ordered_uom: 1, received_uom: 1,
-      breached_at: 1, first_receipt: 1, last_receipt: 1, consumable_uom: 1 };  // surfaced in the header timeline line / merged into qty
+      breached_at: 1, first_receipt: 1, last_receipt: 1, consumable_uom: 1,
+      why_flagged: 1, uom_mismatch_note: 1, uom_mismatch_count: 1 };  // rendered as callouts below, not raw rows
+
+    // Plain-language "why this is flagged" callout(s) at the top of the drawer body.
+    var notes = [];
+    if (snap.why_flagged) notes.push(snap.why_flagged);
+    if (snap.uom_mismatch_note) notes.push(snap.uom_mismatch_note);
+    if (notes.length) {
+      var nsec = el("div", { class: "section" }, [el("h3", {}, ["Why this is flagged"])]);
+      notes.forEach(function (t) {
+        nsec.appendChild(el("div", {
+          style: "padding:10px 12px;margin:6px 0;border-left:3px solid var(--crit,#e0533d);background:rgba(224,83,61,.08);border-radius:4px;font-size:13px;line-height:1.45"
+        }, [t]));
+      });
+      body.appendChild(nsec);
+    }
     var dsec = el("div", { class: "section" }, [el("h3", {}, ["Offending " + e.table + " snapshot"])]);
     var kv = el("div", { class: "kv" });
     Object.keys(snap).forEach(function (k) {

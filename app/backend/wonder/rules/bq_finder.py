@@ -583,9 +583,132 @@ def recheck_daily_waste_facility(ds, keys):
     return out
 
 
+ZERO_COST_TEST_CAP = 5   # CONSUMABLE_ZERO_COST: 600+ backlog; ticket a small sample while testing
+
+
+def _waste_sku_no_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """WASTE_SKU_NO_COST (High, Accounting) — a waste-active consumable_sku with NO ERP standard-cost
+    record (no ITEMID match), so its waste can't be valued. Small population — all are ticketed."""
+    bq = ds._bq
+    proj, dset, led = settings.gcp_project, settings.bq_dataset, settings.bq_ledger_table
+    src = led
+    excl = ", ".join("'%s'" % w for w in NON_WASTE_ADJUST_L2)
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    sql = f"""WITH {_cost_cte()},
+waste AS (
+  SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
+         ANY_VALUE(system_of_origin) AS system,
+         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
+         DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen
+  FROM `{proj}.{dset}.{led}`
+  WHERE l1_action = 'Adjust' AND l2_action NOT IN ({excl}) AND consumable_sku IS NOT NULL {date_filter}
+  GROUP BY consumable_sku),
+flagged AS (
+  SELECT w.* FROM waste w LEFT JOIN cost c ON CAST(w.consumable_sku AS STRING) = c.ITEMID
+  WHERE c.ITEMID IS NULL),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY waste_qty DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked ORDER BY waste_qty DESC"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "consumable_sku": r.consumable_sku, "item_name": r.item_name, "consumable_uom": r.consumable_uom,
+            "facility": r.facility or "—", "facility_type": r.facility_type, "system": r.system or "—",
+            "waste_qty_window": r.waste_qty, "first_seen": _d(r.first_seen), "last_seen": _d(r.last_seen),
+            "why_flagged": ("This consumable SKU has waste/adjustment activity but NO standard-cost record "
+                            "in the ERP cost table (no matching ITEMID), so its waste cannot be valued and it "
+                            "drops out of the waste $. Fix: set up a standard cost for this item in Dynamics."),
+            "breached_at": _d(r.first_seen) or run_date,
+        }
+        findings.append(Finding("COST-01", "WASTE_SKU_NO_COST", "High", src, r.consumable_sku, snap))
+    return findings, total
+
+
+def _consumable_zero_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """CONSUMABLE_ZERO_COST (High, Accounting) — framework #66. A ledger-active consumable_sku that
+    HAS an ERP cost record whose standard cost is 0/NULL. 600+ backlog; ticket a sample (TEST_CAP)."""
+    bq = ds._bq
+    proj, dset, led = settings.gcp_project, settings.bq_dataset, settings.bq_ledger_table
+    src = led
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    sql = f"""WITH {_cost_cte()},
+led AS (
+  SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
+         ANY_VALUE(system_of_origin) AS system, DATE(MAX(datetime_utc)) AS last_seen
+  FROM `{proj}.{dset}.{led}`
+  WHERE consumable_sku IS NOT NULL {date_filter}
+  GROUP BY consumable_sku),
+flagged AS (
+  SELECT l.*, c.unit_cost, c.cost_uom
+  FROM led l JOIN cost c ON CAST(l.consumable_sku AS STRING) = c.ITEMID
+  WHERE c.unit_cost IS NULL OR c.unit_cost = 0),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {ZERO_COST_TEST_CAP} ORDER BY last_seen DESC"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "consumable_sku": r.consumable_sku, "item_name": r.item_name, "consumable_uom": r.consumable_uom,
+            "facility": r.facility or "—", "facility_type": r.facility_type, "system": r.system or "—",
+            "standard_unit_cost": (0 if r.unit_cost == 0 else None), "cost_uom": r.cost_uom,
+            "last_seen": _d(r.last_seen),
+            "why_flagged": ("This consumable SKU is active in the ledger and HAS an ERP standard-cost record, "
+                            "but the standard cost is $0.00 / NULL — so waste, on-hand and COGS valuations for "
+                            "it are zero/wrong. Fix: correct the standard cost for this item in Dynamics. "
+                            "(One of 600+ in the backlog; a sample is ticketed for now.)"),
+            "breached_at": run_date,
+        }
+        findings.append(Finding("COST-02", "CONSUMABLE_ZERO_COST", "High", src, r.consumable_sku, snap))
+    return findings, total
+
+
+def recheck_waste_sku_no_cost(ds, skus):
+    """Which of these SKUs NOW have a standard-cost record — those can be auto-closed."""
+    if not skus:
+        return set()
+    bq = ds._bq
+    ids = [str(s) for s in skus if s is not None]
+    if not ids:
+        return set()
+    sql = f"""WITH {_cost_cte()}
+    SELECT DISTINCT ITEMID FROM cost WHERE ITEMID IN UNNEST(@ids)"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
+    return {r.ITEMID for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def recheck_consumable_cost(ds, skus):
+    """Current standard cost for these SKUs — {sku: still_zero_or_null bool}. Close once costed."""
+    if not skus:
+        return {}
+    bq = ds._bq
+    ids = [str(s) for s in skus if s is not None]
+    if not ids:
+        return {}
+    sql = f"""WITH {_cost_cte()}
+    SELECT ITEMID, unit_cost FROM cost WHERE ITEMID IN UNNEST(@ids)"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
+    return {r.ITEMID: {"missing": (r.unit_cost is None or r.unit_cost == 0)}
+            for r in ds.client.query(sql, job_config=cfg).result()}
+
+
 _FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
-            "WASTE-DAILY": _daily_waste_facility}
+            "WASTE-DAILY": _daily_waste_facility,
+            "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:

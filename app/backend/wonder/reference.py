@@ -117,6 +117,10 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
     {"type": "WASTE_DAILY_FACILITY", "rule": "Daily facility waste within threshold", "ruleType": "RANGE",
      "owner": "Field Ops", "desc": "A facility's total NET waste $ for a day exceeds its facility-type threshold (small for IKC/HDR selling units, larger for CK/DISH/Production). NET = all Adjust activity except transfers/admin corrections, so losses (Lost, Expiration, Damage, Recall, cycle-count shrink, …) net against Found / cycle-count recoveries of the same item; valued at standard cost. Two bands: over the High threshold → High, over the Urgent threshold → Urgent. The drawer lists the top loss-contributing SKUs (sorted) — investigation is the team's job. Routed by facility type (HDR → Field Ops/IKC; CK/DISH/PRODUCTION → Field Ops/ProdCo)."},
+    {"type": "WASTE_SKU_NO_COST", "rule": "Waste SKU has a standard-cost record", "ruleType": "RECONCILIATION",
+     "owner": "Accounting (Cost Accountant)", "desc": "A consumable SKU with waste/adjustment activity has NO matching standard-cost record in the ERP cost table (no ITEMID match) — its waste cannot be valued at all, so it silently drops out of the waste $. A standard cost must be set up in Dynamics for this item."},
+    {"type": "CONSUMABLE_ZERO_COST", "rule": "Consumable SKU has a non-zero standard cost", "ruleType": "NOT_NULL",
+     "owner": "Accounting (Cost Accountant)", "desc": "A consumable SKU active in the ledger HAS a standard-cost record, but its ERP standard cost is $0.00 or NULL — so any valuation (waste, on-hand, COGS) for this item is wrong/zero. The standard cost must be corrected in Dynamics. (Framework catalog #66.)"},
 ]
 
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
@@ -186,6 +190,29 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` JOIN <standard_cost>\n"
         "WHERE l1_action='Adjust' AND l2_action NOT IN ('Move From','Move To','Update Received Order','Shelf Life Extension')\n"
         "GROUP BY facility_name, facility_type, day"
+     ), "enabled": True},
+    {"id": "COST-01", "name": "Waste SKU has a standard-cost record", "primitive": "RECONCILIATION",
+     "error_type": "WASTE_SKU_NO_COST", "target_table": "consolidated_inventory_ledger ⋈ erp standard cost",
+     "severity": "High", "fail_type": "Hard", "owner_group": "Accounting (Cost Accountant)",
+     "params": {},  # all unmatched waste SKUs (small population)
+     "expression": (
+        "-- A consumable_sku with waste/adjust activity that has NO row in the ERP standard-cost table\n"
+        "-- (ITEMID), so its waste can't be valued. LEFT JOIN waste-active SKUs -> cost; flag the misses.\n"
+        "SELECT w.consumable_sku FROM (waste-active consumable_sku) w\n"
+        "LEFT JOIN (erp standard cost, ITEMID) c ON CAST(w.consumable_sku AS STRING)=c.ITEMID\n"
+        "WHERE c.ITEMID IS NULL"
+     ), "enabled": True},
+    {"id": "COST-02", "name": "Consumable SKU has a non-zero standard cost", "primitive": "RECONCILIATION",
+     "error_type": "CONSUMABLE_ZERO_COST", "target_table": "consolidated_inventory_ledger ⋈ erp standard cost",
+     "severity": "High", "fail_type": "Hard", "owner_group": "Accounting (Cost Accountant)",
+     "params": {"test_cap": 5},  # 600+ in the backlog; capped to a sample for now (Jira testing)
+     "expression": (
+        "-- Framework #66: a consumable_sku active in the ledger whose ERP standard cost (PRICE/PRICEUNIT)\n"
+        "-- is 0 or NULL — can't be costed. JOIN ledger SKUs -> cost; flag unit_cost IS NULL OR = 0.\n"
+        "-- 600+ in the backlog; capped to a small sample while testing the Jira flow.\n"
+        "SELECT l.consumable_sku, c.unit_cost FROM (ledger consumable_sku) l\n"
+        "JOIN (erp standard cost) c ON CAST(l.consumable_sku AS STRING)=c.ITEMID\n"
+        "WHERE c.unit_cost IS NULL OR c.unit_cost = 0"
      ), "enabled": True},
     {"id": "XFER-01", "name": "Picked Transfer Order exists", "primitive": "REFERENTIAL", "error_type": "TRANSFER_ORDER_MISSING",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
@@ -262,6 +289,10 @@ ROUTING = [
     # Fallback routing; overridden per-finding by facility_type in validate.py (Field Ops IKC/ProdCo).
     {"error_type": "WASTE_DAILY_FACILITY", "team": "Field Ops — ProdCo", "assignee": "Priya Nair",
      "jira_project": "WIQ", "jira_component": "Daily Waste"},
+    {"error_type": "WASTE_SKU_NO_COST", "team": "Accounting (Cost Accountant)", "assignee": "Mike Dietrich",
+     "jira_project": "WIQ", "jira_component": "Standard Cost"},
+    {"error_type": "CONSUMABLE_ZERO_COST", "team": "Accounting (Cost Accountant)", "assignee": "Mike Dietrich",
+     "jira_project": "WIQ", "jira_component": "Standard Cost"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team
