@@ -57,7 +57,7 @@ class JiraTicketSink(TicketSink):
         return self._acct_cache[email]
 
     def _summary(self, error) -> str:
-        return "%s // %s" % (error.error_type, error.entity_key)
+        return "%s // %s" % (reference.error_label(error.error_type), error.entity_key)
 
     def _description_adf(self, error) -> dict:
         """A clean, human-readable issue body (no raw JSON) for anyone working it in Jira."""

@@ -123,6 +123,32 @@ ERROR_TYPES = [
      "owner": "Accounting (Cost Accountant)", "desc": "A consumable SKU active in the ledger HAS a standard-cost record, but its ERP standard cost is $0.00 or NULL — so any valuation (waste, on-hand, COGS) for this item is wrong/zero. The standard cost must be corrected in Dynamics. (Framework catalog #66.)"},
 ]
 
+# Human-readable display labels for each error_type code. The code stays the stable internal key
+# (DB, routing, fingerprints, auto-close filters); these labels are what the console + Jira titles
+# show. Keep domain acronyms (PO, SKU, UoM) — users know them.
+ERROR_TYPE_LABELS = {
+    "NULL_PO_NUMBER": "Missing PO Number (Receipt)",
+    "PO_RECORD_MISSING": "PO Record Missing",
+    "PO_OVER_RECEIPT": "PO Over Receipt",
+    "PO_IMPLAUSIBLE_QTY": "PO Implausible Quantity",
+    "PO_UOM_MISMATCH": "PO UoM Mismatch",
+    "TRANSFER_WAREHOUSE_IMBALANCE": "Transfer Warehouse Imbalance",
+    "NEGATIVE_ON_HAND": "Negative On-Hand",
+    "PO_MISSING_PRICE": "PO Missing Price",
+    "PO_MISSING_NUMBER": "Missing PO Number (Master)",
+    "PO_SKU_NOT_ON_PO": "SKU Not on PO",
+    "TRANSFER_ORDER_MISSING": "Transfer Order Missing",
+    "WASTE_DAILY_FACILITY": "Daily Waste (Facility)",
+    "WASTE_SKU_NO_COST": "Waste SKU Without Cost",
+    "CONSUMABLE_ZERO_COST": "Consumable Missing Cost",
+}
+
+
+def error_label(error_type):
+    """Human-readable name for an error_type code (falls back to the code itself)."""
+    return ERROR_TYPE_LABELS.get(error_type, error_type)
+
+
 # Seed validation rules (rule_key drawn from the framework catalog where applicable).
 RULES = [
     {"id": "PO-01", "name": "PO number present", "primitive": "NOT_NULL", "error_type": "NULL_PO_NUMBER",

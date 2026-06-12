@@ -81,15 +81,15 @@
   $("#today-date").textContent = D.meta.today;
 
   /* ============================ FILTER POPULATION ============================ */
-  function fillSelect(sel, items, allLabel) {
+  function fillSelect(sel, items, allLabel, labelFn) {
     sel.appendChild(el("option", { value: "" }, [allLabel]));
-    items.forEach(function (it) { sel.appendChild(el("option", { value: it }, [it])); });
+    items.forEach(function (it) { sel.appendChild(el("option", { value: it }, [labelFn ? labelFn(it) : it])); });
   }
   // Derive facility/system options from the actual exceptions so filters match live data.
   var exVals = function (key) { return Array.from(new Set(EXC.map(function (e) { return e[key]; }).filter(Boolean))).sort(); };
   fillSelect($("#f-facility"), exVals("facility"), "All facilities");
   fillSelect($("#f-system"), exVals("system"), "All systems");
-  fillSelect($("#f-errortype"), D.errorTypes.map(function (t) { return t.type; }), "All error types");
+  fillSelect($("#f-errortype"), D.errorTypes.map(function (t) { return t.type; }), "All error types", errLabel);
   fillSelect($("#f-severity"), ["Urgent", "High", "Medium", "Low"], "All severities");
   fillSelect($("#f-status"), exVals("jiraStatus"), "All statuses");
   fillSelect($("#f-team"), Object.keys(D.teams), "All teams");
@@ -143,7 +143,7 @@
       if (f.team && e.team !== f.team) return false;
       if (f.owner && e.primaryOwner !== f.owner) return false;
       if (f.q) {
-        var hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
+        var hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + errLabel(e.errorType) + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
         if (hay.indexOf(f.q) === -1) return false;
       }
       return true;
@@ -317,6 +317,7 @@
   var activeId = null;
   function ruleFor(id) { return D.rules.filter(function (r) { return r.id === id; })[0]; }
   function errTypeMeta(t) { return D.errorTypes.filter(function (x) { return x.type === t; })[0]; }
+  function errLabel(t) { var m = errTypeMeta(t); return (m && m.label) || t; }   // human-readable error-type name
 
   function openDrawer(id) {
     var e = EXC.filter(function (x) { return x.id === id; })[0];
@@ -325,7 +326,7 @@
     var rule = ruleFor(e.rule) || {};
     var meta = errTypeMeta(e.errorType) || {};
 
-    $("#dr-id").textContent = e.id + " · " + e.errorType;
+    $("#dr-id").textContent = e.id + " · " + errLabel(e.errorType);
     var sub = $("#dr-sub"); clear(sub);
     sub.appendChild(sevPill(e.severity));
     sub.appendChild(statusPill(e.jiraStatus));
@@ -608,8 +609,8 @@
     renderSystemDonut();
 
     var byType = countBy(EXC, "errorType");
-    hbarDrill($("#type-bars"), Object.keys(byType).map(function (k2) { return [k2, byType[k2], k2]; }).sort(function (a, b) { return b[1] - a[1]; }),
-      function (v) { drillTo("Type: " + v, function (e) { return e.errorType === v; }); });
+    hbarDrill($("#type-bars"), Object.keys(byType).map(function (k2) { return [errLabel(k2), byType[k2], k2]; }).sort(function (a, b) { return b[1] - a[1]; }),
+      function (v) { drillTo("Type: " + errLabel(v), function (e) { return e.errorType === v; }); });
 
     var byFac = countBy(EXC, "facility");
     hbarDrill($("#facility-bars"), Object.keys(byFac).map(function (f) { return [f, byFac[f], f]; })
@@ -707,14 +708,14 @@
       var row = el("div", { class: "lb-row clickable" }, [
         el("div", { class: "lb-rank" }, [String(i + 1)]),
         el("div", {}, [
-          el("div", { class: "lb-title" }, [r.errorType.replace(/_/g, " ")]),
+          el("div", { class: "lb-title" }, [errLabel(r.errorType)]),
           el("div", { class: "lb-sub" }, [r.facility + " · " + r.team + " · recurred " + r.count30d + "× / 30d"])
         ]),
         el("div", { class: "tr-ico " + trCls }, [trIco]),
         el("div", { class: "lb-count" + (r.count30d >= 4 ? " hot" : "") }, ["×" + r.count30d])
       ]);
       row.addEventListener("click", function () {
-        drillTo(r.errorType.replace(/_/g, " ") + " @ " + r.facility, function (e) { return e.errorType === r.errorType && e.facility === r.facility; });
+        drillTo(errLabel(r.errorType) + " @ " + r.facility, function (e) { return e.errorType === r.errorType && e.facility === r.facility; });
       });
       lb.appendChild(row);
     });
@@ -821,7 +822,7 @@
       var row = el("tr", { style: "cursor:pointer" }, [
         el("td", { class: "mono" }, [e.id]),
         el("td", {}, [el("a", { class: "jira-link", href: "#" }, [e.jira])]),
-        el("td", {}, [e.errorType]),
+        el("td", {}, [errLabel(e.errorType)]),
         el("td", {}, [sevPill(e.severity)]),
         el("td", {}, [e.assignee]),
         el("td", {}, [e.subAssign ? el("span", { class: "subtag" }, ["↳ " + e.subAssign.toTeam]) : document.createTextNode("—")]),
@@ -855,7 +856,7 @@
     var rmt = $("#routing-table tbody"); clear(rmt);
     D.routing.forEach(function (r) {
       rmt.appendChild(el("tr", {}, [
-        el("td", { class: "mono" }, [r.errorType]),
+        el("td", {}, [errLabel(r.errorType)]),
         el("td", {}, [r.team]),
         el("td", {}, [r.assignee]),
         el("td", { class: "mono" }, [r.project]),
@@ -882,7 +883,7 @@
     f.appendChild(fr("Target table", (function () {
       var s = el("select", {}); D.sourceTables.forEach(function (t) { var o = el("option", { value: t }, [t]); if (t === r.target) o.selected = true; s.appendChild(o); }); return s;
     })()));
-    f.appendChild(fr("Maps to error", el("input", { type: "text", value: r.errorType, readonly: "readonly" })));
+    f.appendChild(fr("Maps to error", el("input", { type: "text", value: errLabel(r.errorType), readonly: "readonly" })));
     var sevSel = el("select", {});
     ["Urgent", "High", "Medium", "Low"].forEach(function (s) { var o = el("option", { value: s }, [s]); if (s === r.severity) o.selected = true; sevSel.appendChild(o); });
     f.appendChild(fr("Severity", sevSel));

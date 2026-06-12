@@ -126,7 +126,7 @@ def build_bootstrap(db) -> Dict:
         "systems": reference.SYSTEMS,
         "sourceTables": ["unified_ledger", "po_table"],
         "movementTypes": reference.MOVEMENT_TYPES,
-        "errorTypes": reference.ERROR_TYPES,
+        "errorTypes": [dict(et, label=reference.error_label(et["type"])) for et in reference.ERROR_TYPES],
         "teams": reference.TEAMS,
         "slaTargets": reference.SLA_TARGETS,
         "rules": rules,
