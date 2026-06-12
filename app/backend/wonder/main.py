@@ -9,7 +9,9 @@ from .config import settings
 from .db import init_db
 from .api.routes import router
 
-FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+# Production: serve the built React app (app/frontend-react/dist) at / when it exists.
+# In dev there is no build — use the Vite dev server on :5173 (it proxies /api here); :8000 is API-only.
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend-react" / "dist"
 
 app = FastAPI(title="Wonder Inventory Data-Quality Console", version="0.1.0")
 app.add_middleware(
@@ -26,6 +28,6 @@ def _startup():
 
 app.include_router(router)
 
-# Serve the console last so /api/* keeps priority.
+# Serve the built React console last so /api/* keeps priority (skipped in dev when no build exists).
 if FRONTEND_DIR.exists():
     app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="console")

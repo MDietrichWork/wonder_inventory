@@ -1,5 +1,15 @@
-# Wonder DQ console — single image: FastAPI API + the static console.
-# Build context is ./app (so both backend/ and frontend/ are available).
+# Wonder DQ console — single image: FastAPI API + the built React console.
+# Build context is ./app (so backend/ and frontend-react/ are available).
+
+# --- Stage 1: build the React console (Vite) ---
+FROM node:20-slim AS web
+WORKDIR /web
+COPY frontend-react/package.json frontend-react/package-lock.json ./
+RUN npm ci
+COPY frontend-react/ ./
+RUN npm run build           # -> /web/dist
+
+# --- Stage 2: API image, serving the built console ---
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -12,9 +22,9 @@ WORKDIR /app/backend
 COPY backend/requirements.txt .
 RUN pip install -r requirements.txt
 
-# App code: keep the on-disk layout main.py expects (frontend at ../../frontend).
+# App code + the React build (main.py serves it from /app/frontend-react/dist).
 COPY backend/ /app/backend/
-COPY frontend/ /app/frontend/
+COPY --from=web /web/dist /app/frontend-react/dist
 
 EXPOSE 8000
 
