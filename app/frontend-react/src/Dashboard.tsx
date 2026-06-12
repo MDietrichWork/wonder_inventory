@@ -1,5 +1,5 @@
 import type { Bootstrap, Drill } from "./types";
-import { countBy, movementOf, metrics } from "./lib";
+import { countBy, movementOf, metrics, labelFor } from "./lib";
 import { HBars, Trend, SystemDonut } from "./charts";
 
 export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label: string, test: Drill extends null ? never : (e: any) => boolean) => void }) {
@@ -18,7 +18,7 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
   const byFac = countBy(exc, "facility");
   const byMove = countBy(exc, movementOf);
 
-  const typeEntries = Object.entries(byType).map(([k, v]) => [k, v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]);
+  const typeEntries = Object.entries(byType).map(([k, v]) => [labelFor(data.errorTypes, k), v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]);
   const facEntries = Object.entries(byFac).map(([k, v]) => [k, v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]).slice(0, 10);
   const moveEntries = Object.entries(byMove).map(([k, v]) => [k, v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]);
   const sevEntries = ["Urgent", "High", "Medium", "Low"].map((s) => [s, exc.filter((e) => e.severity === s).length, s] as [string, number, string]);
@@ -62,7 +62,7 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
         <div className="panels equal">
           <div className="card">
             <h2>Errors by type <span className="hint">click a bar to drill</span></h2>
-            <div className="hbars"><HBars entries={typeEntries} onDrill={(v) => drillTo("Type: " + v, ((e: any) => e.errorType === v) as any)} /></div>
+            <div className="hbars"><HBars entries={typeEntries} onDrill={(v) => drillTo("Type: " + labelFor(data.errorTypes, v), ((e: any) => e.errorType === v) as any)} /></div>
           </div>
           <div className="card">
             <h2>Errors by facility <span className="hint">click a bar to drill</span></h2>
@@ -107,10 +107,10 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
           <div className="card-sub">Where the same defect keeps coming back — prime candidates for an upstream fix.</div>
           <div className="lb">
             {data.recurring.map((r, i) => (
-              <div key={i} className="lb-row clickable" onClick={() => drillTo("Type: " + r.errorType, ((e: any) => e.errorType === r.errorType) as any)}>
+              <div key={i} className="lb-row clickable" onClick={() => drillTo("Type: " + labelFor(data.errorTypes, r.errorType), ((e: any) => e.errorType === r.errorType) as any)}>
                 <div className="lb-rank">{i + 1}</div>
                 <div>
-                  <div className="lb-title">{r.errorType.replace(/_/g, " ")}</div>
+                  <div className="lb-title">{labelFor(data.errorTypes, r.errorType)}</div>
                   <div className="tip">{r.facility} · routed to {r.team} · last seen {r.lastSeen}</div>
                 </div>
                 <div className="lb-count">{r.count30d}×</div>

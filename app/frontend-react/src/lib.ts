@@ -17,6 +17,12 @@ export function movementOf(e: Exception): string {
 
 export const statusClass = (s: string) => "st-" + s.replace(/[^A-Za-z]/g, "");
 
+// Human-readable name for an error_type code, from the bootstrap errorTypes (falls back to the code).
+export function labelFor(errorTypes: { type: string; label?: string }[], type: string): string {
+  const m = errorTypes.find((t) => t.type === type);
+  return (m && m.label) || type;
+}
+
 export function fmtNum(v: any): string {
   if (v == null) return "—";
   const n = Number(v);

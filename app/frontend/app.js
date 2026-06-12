@@ -204,7 +204,8 @@
       COLS.forEach(function (c) {
         var td = el("td", { class: c.cls || "" });
         var v = e[c.key];
-        if (c.key === "severity") td.appendChild(sevPill(v));
+        if (c.key === "errorType") td.textContent = errLabel(v);
+        else if (c.key === "severity") td.appendChild(sevPill(v));
         else if (c.key === "jiraStatus") td.appendChild(statusPill(v));
         else if (c.key === "currentHolder") {
           // Only show an assignee once it's been handed off; blank means the primary owner still holds it.

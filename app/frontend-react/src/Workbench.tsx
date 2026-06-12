@@ -1,6 +1,6 @@
 import { useState, useMemo } from "react";
 import type { Bootstrap, Drill, Exception } from "./types";
-import { SEVRANK, statusClass } from "./lib";
+import { SEVRANK, statusClass, labelFor } from "./lib";
 import { apiPost } from "./api";
 
 const COLS: { key: keyof Exception | "currentHolder"; label: string; cls?: string; num?: boolean }[] = [
@@ -49,7 +49,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
       if (f.team && e.team !== f.team) return false;
       if (f.owner && e.primaryOwner !== f.owner) return false;
       if (f.q) {
-        const hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
+        const hay = (e.id + " " + e.entityKey + " " + e.jira + " " + e.errorType + " " + labelFor(data.errorTypes, e.errorType) + " " + e.primaryOwner + " " + e.currentHolder + " " + e.facility).toLowerCase();
         if (!hay.includes(f.q.toLowerCase())) return false;
       }
       return true;
@@ -93,7 +93,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
         <span className="vline" />
         <label className="flt">Facility <Select v={f.facility} set={(v) => set("facility", v)} opts={uniq(exc, "facility")} all="All facilities" /></label>
         <label className="flt">System <Select v={f.system} set={(v) => set("system", v)} opts={uniq(exc, "system")} all="All systems" /></label>
-        <label className="flt">Error type <Select v={f.errortype} set={(v) => set("errortype", v)} opts={data.errorTypes.map((t) => t.type)} all="All error types" /></label>
+        <label className="flt">Error type <Select v={f.errortype} set={(v) => set("errortype", v)} opts={data.errorTypes.map((t) => t.type)} all="All error types" labelFn={(o) => labelFor(data.errorTypes, o)} /></label>
         <label className="flt">Severity <Select v={f.severity} set={(v) => set("severity", v)} opts={["Urgent", "High", "Medium", "Low"]} all="All severities" /></label>
         <label className="flt">Status <Select v={f.status} set={(v) => set("status", v)} opts={uniq(exc, "jiraStatus")} all="All statuses" /></label>
         <label className="flt">Team <Select v={f.team} set={(v) => set("team", v)} opts={Object.keys(data.teams)} all="All teams" /></label>
@@ -146,6 +146,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
                     if (c.key === "currentHolder") return (
                       <td key="currentHolder">{handed ? <>{e.currentHolder}<span className="subtag" title={"Held " + e.heldDays + "d"}>↳ held {e.heldDays}d</span></> : ""}</td>
                     );
+                    if (c.key === "errorType") return <td key="errorType">{labelFor(data.errorTypes, e.errorType)}</td>;
                     return <td key={c.key as string} className={c.cls || ""}>{String((e as any)[c.key])}</td>;
                   })}
                 </tr>
@@ -159,11 +160,11 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
   );
 }
 
-function Select({ v, set, opts, all }: { v: string; set: (v: string) => void; opts: string[]; all: string }) {
+function Select({ v, set, opts, all, labelFn }: { v: string; set: (v: string) => void; opts: string[]; all: string; labelFn?: (o: string) => string }) {
   return (
     <select value={v} onChange={(e) => set(e.target.value)}>
       <option value="">{all}</option>
-      {opts.map((o) => <option key={o} value={o}>{o}</option>)}
+      {opts.map((o) => <option key={o} value={o}>{labelFn ? labelFn(o) : o}</option>)}
     </select>
   );
 }

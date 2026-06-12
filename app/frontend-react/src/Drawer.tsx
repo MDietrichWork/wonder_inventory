@@ -64,7 +64,7 @@ export function Drawer({ data, exc, onClose, refresh }: {
       <aside className="drawer show" role="dialog" aria-label="Exception detail">
         <div className="drawer-head">
           <div>
-            <div className="drawer-title">{exc.id} · {exc.errorType}</div>
+            <div className="drawer-title">{exc.id} · {meta?.label || exc.errorType}</div>
             <div className="drawer-sub">
               {sevPill(exc.severity)}{statusPill(exc.jiraStatus)}
               <span className="tag">{exc.facility} · {exc.system}</span>

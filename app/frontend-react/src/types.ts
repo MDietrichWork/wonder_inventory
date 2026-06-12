@@ -41,7 +41,7 @@ export interface Bootstrap {
   systems: string[];
   sourceTables: string[];
   movementTypes: string[];
-  errorTypes: { type: string; rule: string; ruleType: string; owner: string; desc: string }[];
+  errorTypes: { type: string; label: string; rule: string; ruleType: string; owner: string; desc: string }[];
   teams: Record<string, string[]>;
   slaTargets: Record<string, number>;
   rules: { id: string; name: string; type: string; errorType: string; target: string; severity: string; expression: string; enabled: boolean }[];

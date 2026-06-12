@@ -1,5 +1,6 @@
 import type { Bootstrap, Exception } from "./types";
 import { sevPill } from "./Workbench";
+import { labelFor } from "./lib";
 
 export function Sla({ data, drillTo, ownerQueue, openExc }: {
   data: Bootstrap;
@@ -137,7 +138,7 @@ export function Sla({ data, drillTo, ownerQueue, openExc }: {
                 <tr key={e.pk} style={{ cursor: "pointer" }} onClick={() => openExc(e.pk)}>
                   <td className="mono">{e.id}</td>
                   <td><a className="jira-link" href="#" onClick={(ev) => ev.preventDefault()}>{e.jira}</a></td>
-                  <td>{e.errorType}</td>
+                  <td>{labelFor(data.errorTypes, e.errorType)}</td>
                   <td>{sevPill(e.severity)}</td>
                   <td>{e.primaryOwner}</td>
                   <td>{e.subAssign ? <span className="subtag">↳ {e.subAssign.toTeam}</span> : "—"}</td>

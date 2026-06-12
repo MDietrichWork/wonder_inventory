@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Bootstrap } from "./types";
 import { sevPill } from "./Workbench";
+import { labelFor } from "./lib";
 
 export function Admin({ data }: { data: Bootstrap }) {
   const [enabled, setEnabled] = useState<Record<string, boolean>>(Object.fromEntries(data.rules.map((r) => [r.id, r.enabled])));
@@ -49,7 +50,7 @@ export function Admin({ data }: { data: Bootstrap }) {
                 <FormRow label="Target table">
                   <select defaultValue={rule.target}>{data.sourceTables.map((t) => <option key={t}>{t}</option>)}</select>
                 </FormRow>
-                <FormRow label="Maps to error"><input type="text" value={rule.errorType} readOnly /></FormRow>
+                <FormRow label="Maps to error"><input type="text" value={labelFor(data.errorTypes, rule.errorType)} readOnly /></FormRow>
                 <FormRow label="Severity">
                   <select defaultValue={rule.severity}>{["Urgent", "High", "Medium", "Low"].map((s) => <option key={s}>{s}</option>)}</select>
                 </FormRow>
@@ -75,7 +76,7 @@ export function Admin({ data }: { data: Bootstrap }) {
             <tbody>
               {data.routing.map((r, i) => (
                 <tr key={i}>
-                  <td className="mono">{r.errorType}</td><td>{r.team}</td><td>{r.assignee}</td>
+                  <td>{labelFor(data.errorTypes, r.errorType)}</td><td>{r.team}</td><td>{r.assignee}</td>
                   <td className="mono">{r.project}</td><td><span className="tag">{r.component}</span></td>
                 </tr>
               ))}
