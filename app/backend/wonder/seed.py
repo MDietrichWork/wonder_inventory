@@ -7,7 +7,8 @@ from datetime import date, timedelta
 from sqlalchemy import select
 
 from .db import reset_db, SessionLocal
-from .models import Rule, RoutingMap, SlaTarget, ValidationRun, Error, TicketEvent, AuditLog
+from .models import (Rule, RoutingMap, SlaTarget, FacilityThreshold, WasteActionCombo,
+                     ValidationRun, Error, TicketEvent, AuditLog)
 from . import reference
 from .config import settings
 from .datasource import get_datasource
@@ -34,6 +35,42 @@ def _seed_demo_subassignment(db, run_date: str):
     db.commit()
 
 
+def sync_catalog(db):
+    """Idempotently insert any rules / routing / threshold bands defined in reference but missing from
+    the DB (e.g. a rule added in code since the last seed). INSERT-MISSING ONLY — never updates or
+    deletes existing rows, so Admin edits (enabled toggles, tuned thresholds) are preserved. Runs on
+    startup so new code-defined rules become live + visible without a full reseed."""
+    added = {"rules": 0, "routing": 0, "thresholds": 0, "waste_combos": 0}
+    have_rules = {r for r in db.scalars(select(Rule.id))}
+    for r in reference.RULES:
+        if r["id"] not in have_rules:
+            db.add(Rule(id=r["id"], name=r["name"], primitive=r["primitive"], error_type=r["error_type"],
+                        target_table=r["target_table"], params=r["params"], severity=r["severity"],
+                        fail_type=r["fail_type"], owner_group=r["owner_group"], expression=r["expression"],
+                        enabled=r["enabled"]))
+            added["rules"] += 1
+    have_routing = {e for e in db.scalars(select(RoutingMap.error_type))}
+    for r in reference.ROUTING:
+        if r["error_type"] not in have_routing:
+            db.add(RoutingMap(error_type=r["error_type"], team=r["team"], assignee=r["assignee"],
+                              jira_project=r["jira_project"], jira_component=r["jira_component"]))
+            added["routing"] += 1
+    have_th = {(t.error_type, t.facility_type) for t in db.scalars(select(FacilityThreshold))}
+    for row in reference.default_threshold_rows():
+        if (row["error_type"], row["facility_type"]) not in have_th:
+            db.add(FacilityThreshold(**row))
+            added["thresholds"] += 1
+    have_combos = {(c.l1_action, c.l2_action)
+                   for c in db.execute(select(WasteActionCombo.l1_action, WasteActionCombo.l2_action)).all()}
+    for row in reference.default_waste_combo_rows():
+        if (row["l1_action"], row["l2_action"]) not in have_combos:
+            db.add(WasteActionCombo(**row))
+            added["waste_combos"] += 1
+    if any(added.values()):
+        db.commit()
+    return added
+
+
 def _run_dates():
     latest = date.fromisoformat(settings.run_date) if settings.run_date else date.today()
     n = settings.history_days
@@ -54,6 +91,10 @@ def seed():
                               jira_project=r["jira_project"], jira_component=r["jira_component"]))
         for sev, days in reference.SLA_TARGETS.items():
             db.add(SlaTarget(severity=sev, resolution_days=days))
+        for row in reference.default_threshold_rows():
+            db.add(FacilityThreshold(**row))
+        for row in reference.default_waste_combo_rows():
+            db.add(WasteActionCombo(**row))
         db.commit()
 
         # Operating model: one initial BACKFILL that catches the existing backlog (BigQuery: a

@@ -99,7 +99,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
         <span className="vline" />
         <label className="flt">Facility <Select v={f.facility} set={(v) => set("facility", v)} opts={uniq(exc, "facility")} all="All facilities" /></label>
         <label className="flt">System <Select v={f.system} set={(v) => set("system", v)} opts={uniq(exc, "system")} all="All systems" /></label>
-        <label className="flt">Error type <Select v={f.errortype} set={(v) => set("errortype", v)} opts={data.errorTypes.map((t) => t.type)} all="All error types" labelFn={(o) => labelFor(data.errorTypes, o)} /></label>
+        <label className="flt">Error type <Select v={f.errortype} set={(v) => set("errortype", v)} opts={[...data.errorTypes].sort((a, b) => a.label.localeCompare(b.label)).map((t) => t.type)} all="All error types" labelFn={(o) => labelFor(data.errorTypes, o)} /></label>
         <label className="flt">Severity <Select v={f.severity} set={(v) => set("severity", v)} opts={["Urgent", "High", "Medium", "Low"]} all="All severities" /></label>
         <label className="flt">Status <Select v={f.status} set={(v) => set("status", v)} opts={uniq(exc, "jiraStatus")} all="All statuses" /></label>
         <label className="flt">Team <Select v={f.team} set={(v) => set("team", v)} opts={Object.keys(data.teams)} all="All teams" /></label>

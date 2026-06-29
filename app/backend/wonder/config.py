@@ -55,5 +55,13 @@ class Settings(BaseSettings):
     # --- Dev server ---
     cors_origins: str = "*"
 
+    # --- Daily scheduler (localhost stand-in for Cloud Scheduler) ---
+    # Off by default; at go-live leave this off and let Cloud Scheduler drive POST /api/run instead
+    # (so the job isn't double-triggered). When on, the backend runs the prior-day validation nightly.
+    scheduler_enabled: bool = False
+    scheduler_hour: int = 0     # America/Los_Angeles — 00:15 PST = just after the data day closes
+    scheduler_minute: int = 15
+    scheduler_catchup_on_start: bool = True  # if the latest run is behind yesterday, run once at startup
+
 
 settings = Settings()

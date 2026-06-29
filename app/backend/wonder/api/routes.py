@@ -1,7 +1,8 @@
 """REST API. The console fetches /api/bootstrap once (the full DATA contract) and renders
 all screens client-side; the action endpoints persist mock-but-real mutations."""
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -14,7 +15,7 @@ from ..datasource import get_datasource
 from ..tickets import get_ticket_sink
 from ..jobs import run_validation
 from ..status_map import APP_TO_JIRA, CLOSED_STATES as CLOSED_AT_STATES
-from .contract import build_bootstrap
+from .contract import build_bootstrap, latest_run_date
 
 router = APIRouter(prefix="/api")
 
@@ -48,6 +49,39 @@ class CommentBody(BaseModel):
     text: str
 
 
+class RunBody(BaseModel):
+    # Daily batch target. Omit to run the most-recently-completed day (yesterday PST);
+    # Cloud Scheduler calls with an empty body. An explicit date is used for backfill / testing.
+    run_date: Optional[str] = None
+
+
+class RulePatch(BaseModel):
+    enabled: Optional[bool] = None
+    severity: Optional[str] = None
+    name: Optional[str] = None
+
+
+class ThresholdBand(BaseModel):
+    errorType: str
+    facilityType: str
+    high: float
+    urgent: float
+
+
+class ThresholdsBody(BaseModel):
+    bands: List[ThresholdBand]
+
+
+class WasteCombo(BaseModel):
+    l1Action: str
+    l2Action: str
+    enabled: bool = True
+
+
+class WasteCombosBody(BaseModel):
+    combos: List[WasteCombo]
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -79,16 +113,114 @@ def _waste_by_location(run_date: str):
     return rows
 
 
+@router.get("/runinfo")
+def runinfo(db=Depends(get_db)):
+    """Cheap poll target: just the latest run date (the app's 'as-of' day). The console polls
+    this and offers a refresh when it advances past the data it's currently showing."""
+    return {"runDate": latest_run_date(db)}
+
+
 @router.post("/run")
-def run(db=Depends(get_db)):
-    dates = sorted({d for d in db.scalars(select(ValidationRun.run_date).distinct())})
-    if not dates:
-        raise HTTPException(400, "No prior runs; seed the database first.")
-    ds = get_datasource(dates)
-    sink = get_ticket_sink()
-    run = run_validation(db, dates[-1], ds, sink)
+def run(body: Optional[RunBody] = None, db=Depends(get_db)):
+    from ..jobs.daily import run_daily
+    try:
+        run = run_daily(db, body.run_date if body else None)
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
     return {"ran": run.run_date, "scanned": run.rows_scanned, "seen": run.error_count,
             "new": run.new_count, "autoClosed": run.autoclosed_count}
+
+
+@router.patch("/rules/{rule_id}")
+def patch_rule(rule_id: str, body: RulePatch, db=Depends(get_db)):
+    """Persist editable Rule fields. `enabled` is the meaningful runtime control (the next validation
+    run honors it); `severity`/`name` are metadata. The query LOGIC is code-owned (bq_finder.py) — the
+    rule's `expression` is documentation and is not edited here."""
+    from ..models import Rule
+    r = db.get(Rule, rule_id)
+    if not r:
+        raise HTTPException(404, "Rule %s not found" % rule_id)
+    before = {"enabled": r.enabled, "severity": r.severity, "name": r.name}
+    if body.enabled is not None:
+        r.enabled = body.enabled
+    if body.severity is not None:
+        r.severity = body.severity
+    if body.name is not None and body.name.strip():
+        r.name = body.name.strip()
+    after = {"enabled": r.enabled, "severity": r.severity, "name": r.name}
+    if before != after:
+        db.add(AuditLog(actor="admin", action="edit_rule", entity="rule", entity_id=rule_id,
+                        before=before, after=after, at=_now()))
+        db.commit()
+    return {"id": r.id, "enabled": r.enabled, "severity": r.severity, "name": r.name}
+
+
+@router.put("/thresholds")
+def update_thresholds(body: ThresholdsBody, db=Depends(get_db)):
+    """Edit the High/Urgent $ bands for the banded daily rules (Daily Waste / Daily Adjustments).
+    Writes the facility_threshold table + an audit log; the next validation run / bootstrap picks
+    up the new values via reference's live bands."""
+    from ..models import FacilityThreshold
+    from .. import thresholds as _thresholds
+    changed = 0
+    for b in body.bands:
+        ft = (b.facilityType or "").strip().upper()
+        row = db.get(FacilityThreshold, (b.errorType, ft))
+        before = {"high": row.high, "urgent": row.urgent} if row else None
+        after = {"high": b.high, "urgent": b.urgent}
+        if before == after:
+            continue
+        if row:
+            row.high, row.urgent = b.high, b.urgent
+        else:
+            db.add(FacilityThreshold(error_type=b.errorType, facility_type=ft, high=b.high, urgent=b.urgent))
+        db.add(AuditLog(actor="admin", action="edit_threshold", entity="facility_threshold",
+                        entity_id="%s/%s" % (b.errorType, ft), before=before, after=after, at=_now()))
+        changed += 1
+    db.commit()
+    _thresholds.refresh(db)
+    return {"updated": changed}
+
+
+@router.put("/waste-combos")
+def update_waste_combos(body: WasteCombosBody, db=Depends(get_db)):
+    """Replace the editable Daily-Waste action allowlist (waste_action_combo) with the full set the
+    Admin UI submits: insert new (l1_action, l2_action) pairs, drop removed ones, update toggled
+    enabled flags. Writes an audit log and refreshes reference's live allowlist so the next run /
+    bootstrap uses it. The query LOGIC stays in code (bq_finder.py); only the allowlist is data."""
+    from ..models import WasteActionCombo
+    from .. import thresholds as _thresholds
+    # desired set, keyed by (l1, l2); blanks dropped, later dups win
+    desired = {}
+    for c in body.combos:
+        l1, l2 = (c.l1Action or "").strip(), (c.l2Action or "").strip()
+        if l1 and l2:
+            desired[(l1, l2)] = bool(c.enabled)
+    existing = {(r.l1_action, r.l2_action): r for r in db.scalars(select(WasteActionCombo))}
+    added = removed = updated = 0
+    for key, enabled in desired.items():
+        row = existing.get(key)
+        if row is None:
+            db.add(WasteActionCombo(l1_action=key[0], l2_action=key[1], enabled=enabled))
+            added += 1
+        elif row.enabled != enabled:
+            row.enabled = enabled
+            updated += 1
+    for key, row in existing.items():
+        if key not in desired:
+            db.delete(row)
+            removed += 1
+    if added or removed or updated:
+        db.add(AuditLog(actor="admin", action="edit_waste_combos", entity="waste_action_combo",
+                        entity_id="WASTE_DAILY_FACILITY",
+                        before={"count": len(existing)},
+                        after={"count": len(desired), "added": added, "removed": removed, "updated": updated},
+                        at=_now()))
+        db.commit()
+    _thresholds.refresh(db)
+    enabled_count = sum(1 for v in desired.values() if v)
+    return {"total": len(desired), "enabled": enabled_count,
+            "added": added, "removed": removed, "updated": updated}
 
 
 @router.post("/sync")

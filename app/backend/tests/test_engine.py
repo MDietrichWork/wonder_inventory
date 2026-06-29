@@ -58,6 +58,32 @@ def test_over_receipt_severity_bands():
     assert "PO-4:S4" not in sev            # 20% over is below the 30% floor
 
 
+def test_over_receipt_nets_corrections():
+    """Received qty is a NET: a later negative correction on the SAME PO cancels an over-log.
+
+    A receiver double-logs (or fat-fingers) a receipt, then a correction is booked back
+    against the PO — auto as a negative receipt, or manually (e.g. 'Update Received Order').
+    Both arrive as PO_RECEIPT rows, so summing them must net to the true quantity. Without
+    netting, PO-5 below would falsely flag at 60% over; with netting it lands exactly on the
+    ordered qty and must NOT flag. PO-6 stays Urgent because the correction only partly offsets.
+    """
+    po = [{"po_number": "PO-5", "sku": "S5", "ordered_qty": 100},
+          {"po_number": "PO-6", "sku": "S6", "ordered_qty": 100}]
+    ledger = [
+        # PO-5: received 160, then a -60 correction tied to the PO -> net 100 (not over)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-5", "sku": "S5", "qty": 160, "facility": "F1", "system_of_origin": "Sys"},
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-5", "sku": "S5", "qty": -60, "facility": "F1", "system_of_origin": "Sys"},
+        # PO-6: received 260, then a -30 correction -> net 230 (still >=100% over -> Urgent)
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-6", "sku": "S6", "qty": 260, "facility": "F1", "system_of_origin": "Sys"},
+        {"txn_type": "PO_RECEIPT", "po_number": "PO-6", "sku": "S6", "qty": -30, "facility": "F1", "system_of_origin": "Sys"},
+    ]
+    r = _rule("PO-03", "OVER_RECEIPT", "PO_OVER_RECEIPT", {})
+    found = {f.entity_key: f for f in run_rules([r], _Stub(ledger, po), "2026-06-09")}
+    assert "PO-5:S5" not in found            # 160 - 60 = 100 net -> not over, correction netted out
+    assert found["PO-6:S6"].severity == "Urgent"   # 260 - 30 = 230 net -> still 130% over
+    assert found["PO-6:S6"].snapshot["received_qty"] == 230
+
+
 def test_over_receipt_facility_routing():
     from wonder import reference
     assert reference.over_receipt_route("HDR") == ("Field Ops — IKC", "Diego Alvarez")

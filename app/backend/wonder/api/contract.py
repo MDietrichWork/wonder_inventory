@@ -6,7 +6,7 @@ from typing import Dict, List
 
 from sqlalchemy import select
 
-from ..models import Error, TicketEvent, ValidationRun
+from ..models import Error, TicketEvent, ValidationRun, Rule, WasteActionCombo
 from .. import reference
 from ..config import settings
 
@@ -110,15 +110,54 @@ def build_bootstrap(db) -> Dict:
         "trend": "up" if e.recurrence >= 4 else "flat",
     } for e in top]
 
+    # Rules come from the DB (the editable source of truth that validation also reads), ordered by the
+    # reference catalog so the Admin list stays in its curated order. Edits via PATCH /api/rules show here.
+    _order = {r["id"]: i for i, r in enumerate(reference.RULES)}
+    db_rules = sorted(db.scalars(select(Rule)), key=lambda r: _order.get(r.id, 999))
     rules = [{
-        "id": r["id"], "name": r["name"], "type": PRIMITIVE_DISPLAY.get(r["primitive"], r["primitive"]),
-        "errorType": r["error_type"], "target": r["target_table"], "severity": r["severity"],
-        "expression": r["expression"], "enabled": r["enabled"],
-    } for r in reference.RULES]
+        "id": r.id, "name": r.name, "type": PRIMITIVE_DISPLAY.get(r.primitive, r.primitive),
+        "errorType": r.error_type, "target": r.target_table, "severity": r.severity,
+        "expression": r.expression, "enabled": r.enabled,
+    } for r in db_rules]
     routing = [{
         "errorType": r["error_type"], "team": r["team"], "assignee": r["assignee"],
         "project": r["jira_project"], "component": r["jira_component"],
     } for r in reference.ROUTING]
+
+    # Editable facility threshold bands (DB-backed). refresh() also loads them into reference so the
+    # dashboard waste metric computed later in this request uses the current values.
+    from .. import thresholds as _thresholds
+    threshold_rows = _thresholds.refresh(db)
+    thresholds_payload = [{
+        "errorType": t.error_type, "errorLabel": reference.error_label(t.error_type),
+        "facilityType": t.facility_type, "high": t.high, "urgent": t.urgent,
+    } for t in sorted(threshold_rows, key=lambda x: (x.error_type, x.facility_type))]
+
+    # Editable Daily-Waste action allowlist (DB-backed). The Admin UI adds/removes/toggles these
+    # (l1_action, l2_action) pairs and the next run honors them (refresh() above reloaded them).
+    waste_combos = [{"l1Action": c.l1_action, "l2Action": c.l2_action, "enabled": c.enabled}
+                    for c in sorted(db.scalars(select(WasteActionCombo)),
+                                    key=lambda c: (c.l1_action, c.l2_action))]
+    # The reference SQL is code-owned (read-only in the UI), so always serve it from code rather than
+    # the DB copy — sync_catalog only INSERTs new rules, so an existing rule's stored expression goes
+    # stale when the code changes. SQL-backed rules show the exact daily query they run (generated from
+    # the finders — paste into BigQuery to reproduce that rule's exceptions, reflecting the live
+    # waste-action allowlist + facility-type thresholds loaded by refresh() above); catalog-only rules
+    # fall back to their hand-written reference SQL.
+    _ref_expr = {r["id"]: r["expression"] for r in reference.RULES}
+    try:
+        from ..rules import bq_finder
+        _doc = bq_finder.doc_sql
+    except Exception:  # pragma: no cover - keep bootstrap resilient if the finder import fails
+        _doc = lambda _id: None
+    for _r in rules:
+        try:
+            sql = _doc(_r["id"])
+        except Exception:  # pragma: no cover
+            sql = None
+        sql = sql or _ref_expr.get(_r["id"])
+        if sql:
+            _r["expression"] = sql
 
     return {
         "meta": {"today": today, "runDate": today, "jiraProject": settings.jira_project_key,
@@ -127,11 +166,14 @@ def build_bootstrap(db) -> Dict:
         "systems": reference.SYSTEMS,
         "sourceTables": ["unified_ledger", "po_table"],
         "movementTypes": reference.MOVEMENT_TYPES,
-        "errorTypes": [dict(et, label=reference.error_label(et["type"])) for et in reference.ERROR_TYPES],
+        "errorTypes": [dict(et, label=reference.error_label(et["type"]),
+                            plain=reference.error_plain(et["type"])) for et in reference.ERROR_TYPES],
         "teams": reference.TEAMS,
         "slaTargets": reference.SLA_TARGETS,
         "rules": rules,
         "routing": routing,
+        "thresholds": thresholds_payload,
+        "wasteActionCombos": waste_combos,
         "exceptions": exceptions,
         "trend": trend,
         "recurring": recurring,

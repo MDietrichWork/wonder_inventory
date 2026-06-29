@@ -24,6 +24,33 @@ app.add_middleware(
 @app.on_event("startup")
 def _startup():
     init_db()
+    # Self-heal the config tables: insert any rules / routing / thresholds defined in code but not yet
+    # in the DB (preserves existing Admin edits). Best-effort — never block startup on it.
+    try:
+        from .db import SessionLocal
+        from .seed import sync_catalog
+        db = SessionLocal()
+        try:
+            sync_catalog(db)
+        finally:
+            db.close()
+    except Exception:  # pragma: no cover - never crash startup over a catalog sync
+        pass
+    # Daily scheduler (localhost stand-in for Cloud Scheduler). No-op unless SCHEDULER_ENABLED=true.
+    try:
+        from . import scheduler
+        scheduler.start()
+    except Exception:  # pragma: no cover - never crash startup over the scheduler
+        pass
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    try:
+        from . import scheduler
+        scheduler.shutdown()
+    except Exception:  # pragma: no cover
+        pass
 
 
 app.include_router(router)

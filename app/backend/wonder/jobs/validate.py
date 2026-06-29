@@ -44,6 +44,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
 
     rules = list(db.scalars(select(Rule).where(Rule.enabled.is_(True))))
     routing: Dict[str, RoutingMap] = {r.error_type: r for r in db.scalars(select(RoutingMap))}
+    from .. import thresholds
+    thresholds.refresh(db)   # load the (Admin-editable) facility threshold bands for this run
 
     if settings.data_source == "bigquery":
         from ..rules.bq_finder import find_bigquery
@@ -78,7 +80,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         routed_assignee = route.assignee if route else "Unassigned"
         # Over-receipt and daily-facility-waste route by facility type (HDR -> Field Ops/IKC,
         # CK·DISH·PRODUCTION -> Field Ops/ProdCo) rather than the flat error_type map.
-        if f.error_type in ("PO_OVER_RECEIPT", "WASTE_DAILY_FACILITY"):
+        if f.error_type in ("PO_OVER_RECEIPT", "WASTE_DAILY_FACILITY", "ADJ_DAILY_FACILITY"):
             routed_team, routed_assignee = reference.field_ops_facility_route((f.snapshot or {}).get("facility_type"))
         # SLA/age anchor = when the error actually began in the data (breach date), not when the
         # batch happened to detect it. detected_at keeps the real detection timestamp.
@@ -116,6 +118,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
         from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_sku_on_po,
                                         recheck_to_exists, recheck_daily_waste_facility,
+                                        recheck_daily_adjust_facility,
                                         recheck_waste_sku_no_cost, recheck_consumable_cost)
         high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
@@ -125,6 +128,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
         dwf_errs = [e for e in open_errs if e.error_type == "WASTE_DAILY_FACILITY"]
+        adj_errs = [e for e in open_errs if e.error_type == "ADJ_DAILY_FACILITY"]
         nocost_errs = [e for e in open_errs if e.error_type == "WASTE_SKU_NO_COST"]
         zerocost_errs = [e for e in open_errs if e.error_type == "CONSUMABLE_ZERO_COST"]
 
@@ -201,6 +205,21 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if cur["dollars"] <= threshold:
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: daily facility waste back under threshold — auto-closed." % run_date)
+                autoclosed += 1
+
+        # daily facility adjustments: close once the facility-day ABSOLUTE adjustment $ is back under High
+        akeys = list({((e.data_snapshot or {}).get("facility"), (e.data_snapshot or {}).get("day"))
+                      for e in adj_errs if (e.data_snapshot or {}).get("facility")})
+        acur = recheck_daily_adjust_facility(ds, akeys) if akeys else {}
+        for e in adj_errs:
+            snap = e.data_snapshot or {}
+            cur = acur.get("%s~~%s" % (snap.get("facility"), snap.get("day")))
+            if cur is None:
+                continue  # couldn't recompute — leave open rather than false-close
+            threshold = reference.adjust_daily_threshold(snap.get("facility_type"))["high"]
+            if cur["dollars"] <= threshold:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: daily facility adjustments back under threshold — auto-closed." % run_date)
                 autoclosed += 1
 
         # waste SKU with no standard-cost record: close once a cost record exists for the SKU

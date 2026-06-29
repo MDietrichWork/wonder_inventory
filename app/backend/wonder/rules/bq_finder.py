@@ -52,6 +52,14 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: flo
            PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv
   FROM `{proj}.{dset}.{led}` l{join}
+  -- ref_order_type='Purchase Order' INTENTIONALLY captures EVERY ledger line tied to the PO,
+  -- positive and negative, so SUM(q) below is a true NET. A receiver may double-log / over-log
+  -- a receipt and then a correction is booked back against the same PO — either an auto negative
+  -- receipt (l1/l2 = Remove/PO Receipt) or a manual fix (Adjust/Update Received Order). Both are
+  -- ref_order_type='Purchase Order', so they net out here. Do NOT narrow this to l1_action='Add'
+  -- or l2_action LIKE '%Receipt%' — that would drop the manual corrections and re-break netting.
+  -- (Corrections booked as generic Adjust/Cycle-Count carry NO PO ref and are deliberately left
+  -- alone: they can't be attributed to a specific PO without a fuzzy SKU+facility+window guess.)
   WHERE l.ref_order_type = 'Purchase Order' AND l.consumable_sku IS NOT NULL
     AND DATE(l.datetime_utc) <= @run_date
     AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY))"""
@@ -441,10 +449,22 @@ def recheck_to_exists(ds, to_ids):
     return {r.id for r in ds.client.query(sql, job_config=cfg).result()}
 
 
-# Daily facility waste = the NET of all l1='Adjust' activity (losses negative, Found / cycle-count
-# recoveries positive), so same-day offsets cancel — per Pavel. These l2_actions are NOT waste and
-# are excluded: location transfers (Move From/To) and receiving/admin corrections.
+# Daily ADJUSTMENT churn (ADJ_DAILY_FACILITY) + the waste-SKU-without-cost rule still scope to all
+# l1='Adjust' activity minus location transfers (Move From/To) and receiving/admin corrections.
+# (Daily WASTE no longer uses this — see _waste_combo_sql / reference.waste_action_combos.)
 NON_WASTE_ADJUST_L2 = ("Move From", "Move To", "Update Received Order", "Shelf Life Extension")
+
+
+def _waste_combo_sql() -> str:
+    """SQL predicate selecting ledger rows whose (l1_action, l2_action) is in the editable Daily-Waste
+    allowlist (reference.waste_action_combos; Pavel-approved defaults, DB-overridable in Admin). Built
+    as a CONCAT-key IN-list so the pairs match exactly; a row with a NULL action CONCATs to NULL and
+    is naturally excluded. Empty allowlist -> FALSE (nothing counts as waste)."""
+    combos = reference.waste_action_combos()
+    if not combos:
+        return "FALSE"
+    keys = ", ".join("'%s'" % ("%s||%s" % (l1, l2)).replace("'", "\\'") for (l1, l2) in combos)
+    return f"CONCAT(l1_action, '||', l2_action) IN ({keys})"
 
 
 def _cost_cte() -> str:
@@ -469,27 +489,23 @@ def _cost_cte() -> str:
   GROUP BY ITEMID)"""
 
 
-def _daily_waste_rows(ds, run_date, backfill=False):
-    """Per (facility, facility_type, day) NET waste $ for the run_date (or backfill window), valued
-    at the derived consumable-unit cost. NET over all l1='Adjust' activity except transfers / admin
-    corrections (NON_WASTE_ADJUST_L2): losses are negative, Found / cycle-count recoveries positive,
-    so a same-day loss+find of an item cancels. waste_dollars > 0 means net lost value. Each row
-    carries the top loss-contributing SKUs (sorted). Shared by the dashboard metric + the exception."""
-    bq = ds._bq
+def _daily_waste_sql(backfill=False) -> str:
+    """The per (facility, facility_type, day) NET waste $ query (parameterized by @run_date). Extracted
+    so the finder and the copy-paste reference SQL (doc_sql) share one source of truth — what the app
+    runs IS what the Admin SQL box shows."""
     proj, dset = settings.gcp_project, settings.bq_dataset
     led = settings.bq_ledger_table
-    excl = ", ".join("'%s'" % w for w in NON_WASTE_ADJUST_L2)
     lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
                    f"AND DATE(datetime_utc) <= @run_date "
                    f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
-    sql = f"""WITH {_cost_cte()},
+    return f"""WITH {_cost_cte()},
 adj AS (   -- signed net per (facility, sku, day): losses (-) net against Found / recoveries (+)
   SELECT facility_name, facility_type, DATE(datetime_utc) AS day, consumable_sku,
          ANY_VALUE(consumable_uom) AS consumable_uom,
          SUM(consumable_quantity_change) AS net_change
   FROM `{proj}.{dset}.{led}`
-  WHERE l1_action = 'Adjust' AND l2_action NOT IN ({excl}) {date_filter}
+  WHERE {_waste_combo_sql()} {date_filter}
   GROUP BY facility_name, facility_type, day, consumable_sku),
 costed AS (   -- net lost value per sku (positive = net loss); only valued when cost UoM matches
   SELECT a.facility_name, a.facility_type, a.day, a.consumable_sku, a.net_change,
@@ -506,9 +522,19 @@ SELECT facility_name, facility_type, CAST(day AS STRING) AS day,
                  IGNORE NULLS LIMIT 8) AS mismatch_skus
 FROM costed GROUP BY facility_name, facility_type, day
 HAVING dollars > 0 ORDER BY dollars DESC"""
+
+
+def _daily_waste_rows(ds, run_date, backfill=False):
+    """Per (facility, facility_type, day) NET waste $ for the run_date (or backfill window), valued
+    at the derived consumable-unit cost. NET over the editable waste-action allowlist
+    (reference.waste_action_combos — Pavel-approved (l1_action, l2_action) pairs, DB-overridable in
+    Admin): losses are negative, Found / cycle-count recoveries positive, so a same-day loss+find of
+    an item cancels. waste_dollars > 0 means net lost value. Each row carries the top loss-contributing
+    SKUs (sorted). Shared by the dashboard metric + the exception."""
+    bq = ds._bq
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
-    return list(ds.client.query(sql, job_config=cfg).result())
+    return list(ds.client.query(_daily_waste_sql(backfill), job_config=cfg).result())
 
 
 def _top_contributors(top):
@@ -583,21 +609,120 @@ def recheck_daily_waste_facility(ds, keys):
     return out
 
 
-ZERO_COST_TEST_CAP = 5   # CONSUMABLE_ZERO_COST: 600+ backlog; ticket a small sample while testing
-
-
-def _waste_sku_no_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """WASTE_SKU_NO_COST (High, Accounting) — a waste-active consumable_sku with NO ERP standard-cost
-    record (no ITEMID match), so its waste can't be valued. Small population — all are ticketed."""
-    bq = ds._bq
-    proj, dset, led = settings.gcp_project, settings.bq_dataset, settings.bq_ledger_table
-    src = led
+# ---- Daily ABSOLUTE adjustments by facility (ADJ_DAILY_FACILITY) ---------------------------------
+# Same Adjust activity / cost as daily waste, but the MAGNITUDE: SUM(|per-SKU net x cost|) at the
+# facility level instead of the signed net. So a same-day loss + offsetting recovery still counts as
+# adjustment churn (waste nets them to ~$0). Per-SKU netting is kept (a same-item loss+find within a
+# day is a reversal, not churn). Mirrors _daily_waste_rows so the cost/UoM handling is identical.
+def _daily_adjust_sql(backfill=False) -> str:
+    """The per (facility, facility_type, day) ABSOLUTE adjustment $ query (parameterized by @run_date).
+    Extracted so the finder and the copy-paste reference SQL (doc_sql) share one source of truth."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
     excl = ", ".join("'%s'" % w for w in NON_WASTE_ADJUST_L2)
     lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
                    f"AND DATE(datetime_utc) <= @run_date "
                    f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
-    sql = f"""WITH {_cost_cte()},
+    return f"""WITH {_cost_cte()},
+adj AS (   -- per (facility, sku, day): signed net Adjust qty (same grain as waste)
+  SELECT facility_name, facility_type, DATE(datetime_utc) AS day, consumable_sku,
+         ANY_VALUE(consumable_uom) AS consumable_uom,
+         SUM(consumable_quantity_change) AS net_change
+  FROM `{proj}.{dset}.{led}`
+  WHERE l1_action = 'Adjust' AND l2_action NOT IN ({excl}) {date_filter}
+  GROUP BY facility_name, facility_type, day, consumable_sku),
+costed AS (   -- absolute adjustment value per sku; only valued when cost UoM matches the ledger UoM
+  SELECT a.facility_name, a.facility_type, a.day, a.consumable_sku, a.net_change,
+         ABS(a.net_change * c.unit_cost) AS dollars,
+         (c.unit_cost IS NOT NULL AND LOWER(c.cost_uom) = LOWER(a.consumable_uom)) AS uom_ok
+  FROM adj a LEFT JOIN cost c ON CAST(a.consumable_sku AS STRING) = c.ITEMID)
+SELECT facility_name, facility_type, CAST(day AS STRING) AS day,
+       ROUND(SUM(IF(uom_ok, dollars, 0)), 0) AS dollars,            -- only UoM-matched items valued
+       COUNTIF(uom_ok AND dollars > 0) AS skus,                     -- # adjusted SKUs valued
+       COUNTIF(NOT uom_ok AND net_change <> 0) AS uom_mismatch_skus,  -- adjusted items we couldn't value
+       ARRAY_AGG(IF(uom_ok AND dollars > 0, STRUCT(consumable_sku AS sku, ROUND(dollars, 0) AS d), NULL)
+                 IGNORE NULLS ORDER BY IF(uom_ok, dollars, 0) DESC LIMIT 5) AS top,
+       ARRAY_AGG(IF(NOT uom_ok AND net_change <> 0, consumable_sku, NULL)
+                 IGNORE NULLS LIMIT 8) AS mismatch_skus
+FROM costed GROUP BY facility_name, facility_type, day
+HAVING dollars > 0 ORDER BY dollars DESC"""
+
+
+def _daily_adjust_rows(ds, run_date, backfill=False):
+    """Per (facility, facility_type, day) ABSOLUTE adjustment $ for the run_date (or backfill window),
+    valued at the derived consumable-unit cost. dollars = SUM over SKUs of |net_change x cost|; only
+    UoM-matched SKUs are valued. Each row carries the top contributing SKUs (by absolute $)."""
+    bq = ds._bq
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    return list(ds.client.query(_daily_adjust_sql(backfill), job_config=cfg).result())
+
+
+def _daily_adjust_facility(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """ADJ_DAILY_FACILITY — a facility's absolute adjustment $ for a day over its facility-type
+    threshold. Banded High/Urgent; routed by facility_type (Field Ops IKC/ProdCo) at assignment."""
+    src = settings.bq_ledger_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    rows = _daily_adjust_rows(ds, run_date, backfill=backfill)
+    findings, total, per_band = [], 0, {"High": 0, "Urgent": 0}
+    for r in rows:
+        th = reference.adjust_daily_threshold(r.facility_type)
+        if r.dollars <= th["high"]:
+            continue
+        total += 1
+        sev = "Urgent" if r.dollars > th["urgent"] else "High"
+        if per_band[sev] >= cap:
+            continue
+        per_band[sev] += 1
+        ek = f"{r.facility_name}:{r.day}"
+        snap = {
+            "facility": r.facility_name or "—", "facility_type": r.facility_type, "day": r.day,
+            "adjust_dollars": r.dollars, "sku_count": r.skus,
+            "high_threshold": th["high"], "urgent_threshold": th["urgent"],
+            "top_contributors": _top_contributors(r.top),
+            "breached_at": r.day,
+        }
+        if r.uom_mismatch_skus:
+            snap["uom_mismatch_count"] = r.uom_mismatch_skus
+            shown = list(r.mismatch_skus or [])
+            snap["uom_mismatch_note"] = ("%d adjusted SKU(s) not valued — ERP cost UoM ≠ ledger UoM (reconcile): %s%s"
+                                         % (r.uom_mismatch_skus, ", ".join(shown),
+                                            " …" if r.uom_mismatch_skus > len(shown) else ""))
+        findings.append(Finding("ADJ-DAILY", "ADJ_DAILY_FACILITY", sev, src, ek, snap))
+    return findings, total
+
+
+def recheck_daily_adjust_facility(ds, keys):
+    """Current absolute adjustment $ for each open (facility, day) ticket — close once back under
+    its facility-type High threshold."""
+    if not keys:
+        return {}
+    want = {"%s~~%s" % (f, d) for (f, d) in keys if f is not None and d is not None}
+    days = [d for (_, d) in keys if d]
+    if not want or not days:
+        return {}
+    out = {}
+    for r in _daily_adjust_rows(ds, max(days), backfill=True):
+        k = "%s~~%s" % (r.facility_name, r.day)
+        if k in want:
+            out[k] = {"dollars": r.dollars, "facility_type": r.facility_type}
+    return out
+
+
+ZERO_COST_TEST_CAP = 5   # CONSUMABLE_ZERO_COST: 600+ backlog; ticket a small sample while testing
+
+
+def _waste_sku_no_cost_sql(backfill=False) -> str:
+    """The waste-active-SKU-without-cost query (parameterized by @run_date). Extracted so the finder
+    and the copy-paste reference SQL share one source of truth."""
+    proj, dset, led = settings.gcp_project, settings.bq_dataset, settings.bq_ledger_table
+    excl = ", ".join("'%s'" % w for w in NON_WASTE_ADJUST_L2)
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH {_cost_cte()},
 waste AS (
   SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
          ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
@@ -612,9 +737,16 @@ flagged AS (
   WHERE c.ITEMID IS NULL),
 ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY waste_qty DESC) AS rn FROM flagged)
 SELECT * EXCEPT(rn) FROM ranked ORDER BY waste_qty DESC"""
+
+
+def _waste_sku_no_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """WASTE_SKU_NO_COST (High, Accounting) — a waste-active consumable_sku with NO ERP standard-cost
+    record (no ITEMID match), so its waste can't be valued. Small population — all are ticketed."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
-    rows = list(ds.client.query(sql, job_config=cfg).result())
+    rows = list(ds.client.query(_waste_sku_no_cost_sql(backfill), job_config=cfg).result())
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
         snap = {
@@ -630,17 +762,15 @@ SELECT * EXCEPT(rn) FROM ranked ORDER BY waste_qty DESC"""
     return findings, total
 
 
-def _consumable_zero_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """CONSUMABLE_ZERO_COST (High, Accounting) — framework #66. A ledger-active consumable_sku that
-    HAS an ERP cost record whose standard cost is 0/NULL. 600+ backlog; ticket a sample (TEST_CAP)."""
-    bq = ds._bq
+def _consumable_zero_cost_sql(backfill=False) -> str:
+    """The ledger-active-SKU-with-zero/NULL-cost query (parameterized by @run_date). Extracted so the
+    finder and the copy-paste reference SQL share one source of truth."""
     proj, dset, led = settings.gcp_project, settings.bq_dataset, settings.bq_ledger_table
-    src = led
     lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
                    f"AND DATE(datetime_utc) <= @run_date "
                    f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
-    sql = f"""WITH {_cost_cte()},
+    return f"""WITH {_cost_cte()},
 led AS (
   SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
          ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
@@ -654,9 +784,16 @@ flagged AS (
   WHERE c.unit_cost IS NULL OR c.unit_cost = 0),
 ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
 SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {ZERO_COST_TEST_CAP} ORDER BY last_seen DESC"""
+
+
+def _consumable_zero_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """CONSUMABLE_ZERO_COST (High, Accounting) — framework #66. A ledger-active consumable_sku that
+    HAS an ERP cost record whose standard cost is 0/NULL. 600+ backlog; ticket a sample (TEST_CAP)."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
-    rows = list(ds.client.query(sql, job_config=cfg).result())
+    rows = list(ds.client.query(_consumable_zero_cost_sql(backfill), job_config=cfg).result())
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
         snap = {
@@ -705,9 +842,83 @@ def recheck_consumable_cost(ds, skus):
             for r in ds.client.query(sql, job_config=cfg).result()}
 
 
+# ---- Copy-paste reference SQL (Admin → rule editor) ---------------------------------------------
+# The exact daily query each SQL-backed rule runs, made standalone: @run_date becomes a DECLARE so
+# the whole thing pastes into the BigQuery console and returns the offending rows that become this
+# rule's exceptions. Generated from the SAME builders the validator uses, so doc == reality. The
+# per-band 500-row cap (RESULT_CAP) the finders apply is reflected where it lives in SQL; for the
+# banded daily rules the facility-type threshold (applied in Python) is injected here too, so the
+# pasted query returns exactly the flagged facility-days.
+_RUN_DATE_DECL = ("DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);"
+                  "  -- daily batch target = the just-closed day (yesterday PST in prod)\n\n")
+
+
+def _standalone(note, body):
+    """Prepend the rule note + a run_date DECLARE and bind @run_date so the query runs as-is."""
+    return note + _RUN_DATE_DECL + body.replace("@run_date", "run_date")
+
+
+def _banded_daily_doc(error_type, inner_sql, what):
+    """Wrap a daily waste/adjust aggregate (column `dollars`) with the live facility-type threshold so
+    the pasted query returns only the flagged facility-days, tagged with the severity band."""
+    high = reference.threshold_case_sql(error_type, "t.facility_type", "high")
+    urgent = reference.threshold_case_sql(error_type, "t.facility_type", "urgent")
+    note = ("-- %s.\n"
+            "-- Flagged when the day's $ is above the facility-type HIGH threshold; above the URGENT\n"
+            "-- threshold is Urgent, else High. Thresholds are the live Admin values. The app also caps\n"
+            "-- each band at %d rows/run (not shown here).\n" % (what, RESULT_CAP))
+    body = (f"SELECT t.*, IF(t.dollars > {urgent}, 'Urgent', 'High') AS severity_band,\n"
+            f"       {high} AS high_threshold,\n"
+            f"       {urgent} AS urgent_threshold\n"
+            f"FROM (\n{inner_sql}\n) t\n"
+            f"WHERE t.dollars > {high}\n"
+            f"ORDER BY t.dollars DESC")
+    return _standalone(note, body)
+
+
+def doc_sql(rule_id):
+    """Standalone, copy-paste BigQuery SQL for a SQL-backed rule (the daily query it runs, returning
+    the offending rows). None for catalog-only rules with no finder — their reference SQL stays the
+    hand-written documentation in reference.RULES."""
+    lb, cap = RECEIPT_LOOKBACK_DAYS, RESULT_CAP
+    if rule_id == "PO-03":
+        return _standalone(
+            "-- PO over-receipt + UoM mismatch (daily: POs that received on run_date, cumulative vs\n"
+            "-- ordered). uom_mismatch=TRUE rows become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT\n"
+            "-- (over_frac >= %.2f -> Urgent, else High).\n" % settings.over_receipt_urgent_pct,
+            _build_sql(False, lb, settings.over_receipt_high_pct, cap, settings.over_receipt_urgent_pct))
+    if rule_id == "PO-09":
+        return _standalone("-- CLOSED Purchase PO lines with a $0/NULL vendor price (can't be costed).\n",
+                           _build_price_sql(False, lb, cap))
+    if rule_id == "PO-13":
+        return _standalone("-- Purchase rows in the PO master with a NULL/blank PO number (safety-net).\n",
+                           _build_null_po_sql(False, lb, cap))
+    if rule_id == "PO-14":
+        return _standalone("-- 3-way match: a consumable_sku received against an existing PO but not on its lines.\n",
+                           _build_sku_not_on_po_sql(False, lb, cap))
+    if rule_id == "XFER-01":
+        return _standalone("-- A Transfer Out pick against a Transfer Order id absent from the transfer population.\n",
+                           _build_transfer_order_missing_sql(False, lb, cap))
+    if rule_id == "WASTE-DAILY":
+        return _banded_daily_doc("WASTE_DAILY_FACILITY", _daily_waste_sql(False),
+                                 "Daily facility NET waste $ (net over the editable waste-action allowlist, "
+                                 "valued at ERP standard cost)")
+    if rule_id == "ADJ-DAILY":
+        return _banded_daily_doc("ADJ_DAILY_FACILITY", _daily_adjust_sql(False),
+                                 "Daily facility ABSOLUTE adjustment $ (SUM of |per-SKU net x cost|)")
+    if rule_id == "COST-01":
+        return _standalone("-- Waste-active consumable_sku with NO ERP standard-cost record (no ITEMID match).\n",
+                           _waste_sku_no_cost_sql(False))
+    if rule_id == "COST-02":
+        return _standalone("-- Ledger-active consumable_sku whose ERP standard cost is 0/NULL "
+                           "(sample of %d of the 600+ backlog).\n" % ZERO_COST_TEST_CAP,
+                           _consumable_zero_cost_sql(False))
+    return None
+
+
 _FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
-            "WASTE-DAILY": _daily_waste_facility,
+            "WASTE-DAILY": _daily_waste_facility, "ADJ-DAILY": _daily_adjust_facility,
             "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}
 
 

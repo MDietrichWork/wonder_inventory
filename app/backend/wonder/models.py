@@ -92,6 +92,27 @@ class SlaTarget(Base):
     resolution_days: Mapped[int] = mapped_column(Integer)
 
 
+class FacilityThreshold(Base):
+    """Editable High/Urgent $ bands for the banded-by-facility-type daily rules (Daily Waste,
+    Daily Adjustments). Seeded from reference defaults; editable in the Admin UI."""
+    __tablename__ = "facility_threshold"
+    error_type: Mapped[str] = mapped_column(String(64), primary_key=True)
+    facility_type: Mapped[str] = mapped_column(String(24), primary_key=True)
+    high: Mapped[float] = mapped_column(Float)
+    urgent: Mapped[float] = mapped_column(Float)
+
+
+class WasteActionCombo(Base):
+    """Editable allowlist of ledger (l1_action, l2_action) movements that count as 'waste' for the
+    Daily Waste rule (WASTE_DAILY_FACILITY). Seeded from reference's Pavel-approved defaults; the
+    Admin UI adds/removes/toggles combos and the next validation run honors them (see
+    reference.set_waste_combos via wonder.thresholds.refresh)."""
+    __tablename__ = "waste_action_combo"
+    l1_action: Mapped[str] = mapped_column(String(64), primary_key=True)
+    l2_action: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(primary_key=True)

@@ -14,3 +14,8 @@ psycopg[binary]>=3.1
 
 # BigQuery — required when DATA_SOURCE=bigquery (prod). Harmless to install in fixtures mode.
 google-cloud-bigquery>=3.17
+
+# In-process daily scheduler (localhost stand-in for Cloud Scheduler when SCHEDULER_ENABLED=true).
+# At go-live, Cloud Scheduler drives /api/run instead and this stays disabled.
+apscheduler>=3.10,<4
+

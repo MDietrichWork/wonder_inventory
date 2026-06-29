@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { Bootstrap, Drill, Exception } from "./types";
-import { getBootstrap, apiPost } from "./api";
+import { getBootstrap, getRunInfo, apiPost } from "./api";
 import { metrics } from "./lib";
 import { Dashboard } from "./Dashboard";
 import { Workbench } from "./Workbench";
@@ -33,6 +33,28 @@ export function App() {
     try { setData(await getBootstrap()); } catch (e) { setErr(String(e)); }
   }, []);
   useEffect(() => { load(); }, [load]);
+
+  // Daily-batch auto-refresh. The validation run rolls forward overnight (Cloud Scheduler →
+  // /api/run); poll the cheap run date and, when it advances past what we're showing, offer a
+  // refresh banner. We never swap data out from under the user mid-triage — they click to refresh.
+  const [newRunDate, setNewRunDate] = useState<string | null>(null);
+  const runDateRef = useRef<string | null>(null);   // latest runDate we're displaying (avoids stale closure)
+  const dismissedRef = useRef<string | null>(null);  // a run date the user dismissed; don't nag again
+  useEffect(() => { runDateRef.current = data?.meta.runDate ?? null; }, [data]);
+  useEffect(() => {
+    const POLL_MS = 10 * 60 * 1000;
+    const check = async () => {
+      try {
+        const { runDate } = await getRunInfo();
+        const cur = runDateRef.current;
+        if (cur && runDate > cur && runDate !== dismissedRef.current) setNewRunDate(runDate);
+      } catch { /* transient poll error — try again next tick */ }
+    };
+    const id = setInterval(check, POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+  const refreshToLatest = async () => { await load(); setNewRunDate(null); };
+  const dismissNewRun = () => { dismissedRef.current = newRunDate; setNewRunDate(null); };
 
   // Keep the active view in sync with the URL hash (back/forward, manual edits, direct links).
   useEffect(() => {
@@ -107,10 +129,23 @@ export function App() {
         {view === "dashboard" && <Dashboard data={data} drillTo={drillTo as any} />}
         {view === "workbench" && <Workbench data={data} drill={drill} clearDrill={() => setDrill(null)} onOpen={(e) => setOpenPk(e.pk)} refresh={load} />}
         {view === "sla" && <Sla data={data} drillTo={drillTo} ownerQueue={ownerQueue} openExc={openExc} />}
-        {view === "admin" && <Admin data={data} />}
+        {view === "admin" && <Admin data={data} refresh={load} />}
       </main>
 
       {openException && <Drawer data={data} exc={openException} onClose={() => setOpenPk(null)} refresh={load} />}
+      {newRunDate && (
+        <div className="update-banner" role="status" style={{
+          position: "fixed", top: 12, left: "50%", transform: "translateX(-50%)", zIndex: 1000,
+          display: "flex", alignItems: "center", gap: 12, padding: "10px 14px", borderRadius: 8,
+          background: "#1f6feb", color: "#fff", boxShadow: "0 6px 20px rgba(0,0,0,.35)", fontSize: 13,
+        }}>
+          <span>New validation data for <b>{newRunDate}</b> is available.</span>
+          <button className="btn sm" onClick={refreshToLatest}
+            style={{ background: "#fff", color: "#1f6feb", border: "none", fontWeight: 600 }}>↻ Refresh</button>
+          <button onClick={dismissNewRun} aria-label="Dismiss"
+            style={{ background: "transparent", color: "#fff", border: "none", cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+      )}
       <div className="proto-banner">PROTOTYPE · <b>React console</b> · live API + validation engine</div>
     </div>
   );
