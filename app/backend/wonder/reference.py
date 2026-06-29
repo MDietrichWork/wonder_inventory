@@ -407,10 +407,11 @@ RULES = [
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {"column": "po_number", "where": {"txn_type": ["PO_RECEIPT", "ADD"]}},
      "expression": (
-        "-- Catalog rule (framework PO-01). Documents the check; NOT yet wired into the daily finder,\n"
-        "-- so it produces no exceptions today. A PO-order-type receiving row that carries no PO id.\n"
+        # NOTE: PO-01 is now LIVE — the editor/doc show the generated daily query from bq_finder.doc_sql
+        # (contract.py prefers doc_sql over this hand-written fallback). Kept only as a backstop.
+        "-- A PO-order-type receiving row that carries no PO id (ref_order_id NULL/blank).\n"
         "DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);\n"
-        "SELECT _id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,\n"
+        "SELECT id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,\n"
         "       consumable_sku, item_name, ref_order_type, ref_order_id\n"
         "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
         "WHERE ref_order_type = 'Purchase Order'\n"

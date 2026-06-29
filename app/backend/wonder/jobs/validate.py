@@ -12,6 +12,7 @@ from ..rules import run_rules
 from ..schema_map import LEDGER_TABLE, PO_TABLE
 from ..config import settings
 from .. import reference
+from . import resolution
 
 OPEN_STATES = ("Open", "In Progress", "In Review")
 CLOSED_STATES = ("Resolved", "Closed", "Auto-Closed")
@@ -25,10 +26,16 @@ def _ts(run_date: str) -> str:
     return run_date + "T05:30:00Z"  # the overnight batch timestamp (deterministic)
 
 
-def _auto_close(db, e, as_of, sink, note):
-    """Mark an open error auto-closed + transition its Jira issue to Done."""
+def _auto_close(db, e, as_of, sink, note, resolution=None):
+    """Mark an open error auto-closed + transition its Jira issue to Done. When a resolution is
+    given (the WAS→NOW correction that made it pass), stamp it onto the snapshot so the drawer can
+    show the fix + the date — reassign the dict so SQLAlchemy detects the JSON mutation."""
     e.status = "Auto-Closed"
     e.resolved_at = as_of
+    if resolution:
+        snap = dict(e.data_snapshot or {})
+        snap["resolution"] = resolution
+        e.data_snapshot = snap
     db.add(TicketEvent(error_id=e.id, jira_issue_key=e.jira_issue_key, from_status="Open",
                        to_status="Auto-Closed", actor="batch-validator", occurred_at=as_of, note=note))
     db.add(AuditLog(actor="batch-validator", action="auto_close", entity="error",
@@ -116,15 +123,15 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
     else:
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
-        from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_sku_on_po,
-                                        recheck_to_exists, recheck_daily_waste_facility,
+        from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_null_po_ledger,
+                                        recheck_sku_on_po, recheck_to_exists, recheck_daily_waste_facility,
                                         recheck_daily_adjust_facility,
                                         recheck_waste_sku_no_cost, recheck_consumable_cost)
-        high = settings.over_receipt_high_pct
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
         price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
+        nullpo_led_errs = [e for e in open_errs if e.error_type == "NULL_PO_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
         dwf_errs = [e for e in open_errs if e.error_type == "WASTE_DAILY_FACILITY"]
@@ -139,13 +146,11 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         for e in over_errs:
             snap = e.data_snapshot or {}
             cur = current.get((snap.get("po"), snap.get("consumable_sku")))
-            if not cur or cur.get("recv") is None or not cur.get("ord"):
-                continue  # no recent receipts / no PO line — can't confirm; leave open
-            over = (cur["recv"] / cur["ord"]) - 1
-            uom_mismatch = bool(cur.get("ouom") and cur.get("ruom") and cur["ouom"] != cur["ruom"])
-            if over <= high and not uom_mismatch:  # received now within tolerance AND UoMs agree
+            res = resolution.over_receipt(run_date, snap, cur)
+            if res:  # received now within tolerance AND UoMs agree
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: received now within tolerance / UoM reconciled — auto-closed." % run_date)
+                            "Re-check on run %s: received now within tolerance / UoM reconciled — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
         # missing-price: close once a vendor price has been set
@@ -155,11 +160,11 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         for e in price_errs:
             snap = e.data_snapshot or {}
             cur = pcurrent.get((snap.get("po"), snap.get("supplier_sku")))
-            if not cur:
-                continue  # PO line not found — can't confirm; leave open
-            if not cur["missing"]:  # a vendor price has been set
+            res = resolution.missing_price(run_date, snap, cur)
+            if res:  # a vendor price has been set
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: vendor price now populated — auto-closed." % run_date)
+                            "Re-check on run %s: vendor price now populated — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
         # missing PO number (master table): close once a PO number is set
@@ -169,7 +174,19 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             cur = ncurrent.get(str((e.data_snapshot or {}).get("po_id")))
             if cur and not cur["missing"]:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: PO number now populated — auto-closed." % run_date)
+                            "Re-check on run %s: PO number now populated — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "PO number now populated on the PO record."))
+                autoclosed += 1
+
+        # missing PO number (ledger receipt, PO-01): close once that ledger row carries a PO number
+        lids = list({(e.data_snapshot or {}).get("ledger_id") for e in nullpo_led_errs if (e.data_snapshot or {}).get("ledger_id")})
+        lcurrent = recheck_null_po_ledger(ds, lids) if lids else {}
+        for e in nullpo_led_errs:
+            cur = lcurrent.get(str((e.data_snapshot or {}).get("ledger_id")))
+            if cur and not cur["missing"]:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: PO number now populated on the ledger row — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "PO number now populated on the ledger row."))
                 autoclosed += 1
 
         # received SKU not on the PO: close once the SKU appears on the PO's lines
@@ -180,7 +197,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             snap = e.data_snapshot or {}
             if "%s~~%s" % (snap.get("po"), snap.get("consumable_sku")) in now_on_po:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: SKU now listed on the PO — auto-closed." % run_date)
+                            "Re-check on run %s: SKU now listed on the PO — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "SKU now listed on the PO's lines."))
                 autoclosed += 1
 
         # transfer order missing: close once the transfer order exists in the population
@@ -189,7 +207,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         for e in to_errs:
             if (e.data_snapshot or {}).get("transfer_order") in now_exist:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: transfer order now exists — auto-closed." % run_date)
+                            "Re-check on run %s: transfer order now exists — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Transfer order now exists in the population."))
                 autoclosed += 1
 
         # daily facility waste: close once the facility-day NET waste $ is back under its High threshold
@@ -199,12 +218,11 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         for e in dwf_errs:
             snap = e.data_snapshot or {}
             cur = dcur.get("%s~~%s" % (snap.get("facility"), snap.get("day")))
-            if cur is None:
-                continue  # couldn't recompute — leave open rather than false-close
-            threshold = reference.waste_daily_threshold(snap.get("facility_type"))["high"]
-            if cur["dollars"] <= threshold:
+            res = resolution.daily_waste(run_date, snap, cur)
+            if res:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: daily facility waste back under threshold — auto-closed." % run_date)
+                            "Re-check on run %s: daily facility waste back under threshold — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
         # daily facility adjustments: close once the facility-day ABSOLUTE adjustment $ is back under High
@@ -214,31 +232,35 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         for e in adj_errs:
             snap = e.data_snapshot or {}
             cur = acur.get("%s~~%s" % (snap.get("facility"), snap.get("day")))
-            if cur is None:
-                continue  # couldn't recompute — leave open rather than false-close
-            threshold = reference.adjust_daily_threshold(snap.get("facility_type"))["high"]
-            if cur["dollars"] <= threshold:
+            res = resolution.daily_adjust(run_date, snap, cur)
+            if res:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: daily facility adjustments back under threshold — auto-closed." % run_date)
+                            "Re-check on run %s: daily facility adjustments back under threshold — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
         # waste SKU with no standard-cost record: close once a cost record exists for the SKU
         ncskus = list({(e.data_snapshot or {}).get("consumable_sku") for e in nocost_errs})
-        now_costed = recheck_waste_sku_no_cost(ds, ncskus) if ncskus else set()
+        now_costed = recheck_waste_sku_no_cost(ds, ncskus) if ncskus else {}
         for e in nocost_errs:
-            if str((e.data_snapshot or {}).get("consumable_sku")) in now_costed:
+            snap = e.data_snapshot or {}
+            res = resolution.waste_sku_no_cost(run_date, snap, now_costed.get(str(snap.get("consumable_sku"))))
+            if res:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: standard-cost record now exists — auto-closed." % run_date)
+                            "Re-check on run %s: standard-cost record now exists — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
         # consumable zero/null standard cost: close once a non-zero cost is set
         zcskus = list({(e.data_snapshot or {}).get("consumable_sku") for e in zerocost_errs})
         zccur = recheck_consumable_cost(ds, zcskus) if zcskus else {}
         for e in zerocost_errs:
-            cur = zccur.get(str((e.data_snapshot or {}).get("consumable_sku")))
-            if cur and not cur["missing"]:  # a non-zero standard cost has been set
+            snap = e.data_snapshot or {}
+            res = resolution.consumable_zero_cost(run_date, snap, zccur.get(str(snap.get("consumable_sku"))))
+            if res:  # a non-zero standard cost has been set
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: standard cost now populated — auto-closed." % run_date)
+                            "Re-check on run %s: standard cost now populated — auto-closed." % run_date,
+                            resolution=res)
                 autoclosed += 1
 
     run.rows_scanned = rows_scanned

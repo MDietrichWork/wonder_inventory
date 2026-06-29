@@ -248,7 +248,7 @@ def recheck_price(ds, pairs):
                             query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
     out = {}
     for row in ds.client.query(sql, job_config=cfg).result():
-        out[(row.po, row.sku)] = {"missing": (row.price is None or row.price == 0)}
+        out[(row.po, row.sku)] = {"missing": (row.price is None or row.price == 0), "price": row.price}
     return out
 
 
@@ -302,6 +302,67 @@ def recheck_null_po(ds, ids):
     po = settings.bq_po_table
     sql = f"""SELECT CAST(_id AS STRING) AS id, MAX(IF(po IS NULL OR TRIM(po) = '', 1, 0)) AS still_null
     FROM `{proj}.{dset}.{po}` WHERE CAST(_id AS STRING) IN UNNEST(@ids) GROUP BY id"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", [str(i) for i in ids])])
+    return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def _build_null_po_ledger_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """PO-01: a PO-order-type receiving row in the LEDGER carrying no PO number (ref_order_id is
+    NULL/blank) — so the receipt can't be matched to what was ordered. Safety-net: finds 0 on
+    current data (every PO receipt is numbered today), wired so it tickets + auto-closes the moment
+    upstream ever degrades. Ledger sibling of PO-13 (which checks the PO master table)."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH flagged AS (
+  SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
+         ANY_VALUE(system_of_origin) AS system, ANY_VALUE(consumable_sku) AS consumable_sku,
+         ANY_VALUE(item_name) AS item_name, ANY_VALUE(l1_action) AS l1_action,
+         ANY_VALUE(l2_action) AS l2_action, MIN(datetime_utc) AS datetime_utc
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type = 'Purchase Order' AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '') {date_filter}
+  GROUP BY id),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY datetime_utc DESC"""
+
+
+def _null_po_ledger(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """NULL_PO_NUMBER (Urgent, SC Product (IMS)) — a PO-receipt ledger row with no PO number."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_null_po_ledger_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "ledger_id": r.id, "ref_order_type": "Purchase Order", "ref_order_id": None,
+            "consumable_sku": r.consumable_sku, "item_name": r.item_name,
+            "facility": r.facility or "—", "system": r.system or "—",
+            "movement": ("%s / %s" % (r.l1_action, r.l2_action)) if r.l1_action else None,
+            "datetime_utc": str(r.datetime_utc) if r.datetime_utc else None,
+            "breached_at": (r.datetime_utc.date().isoformat() if r.datetime_utc else run_date),
+        }
+        findings.append(Finding("PO-01", "NULL_PO_NUMBER", "Urgent", src, r.id, snap))
+    return findings, total
+
+
+def recheck_null_po_ledger(ds, ids):
+    """Whether each open PO-01 ticket's ledger row still has a null/blank PO number — close once
+    a PO number has been populated on that row."""
+    if not ids:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    sql = f"""SELECT CAST(id AS STRING) AS id, MAX(IF(ref_order_id IS NULL OR TRIM(ref_order_id) = '', 1, 0)) AS still_null
+    FROM `{proj}.{dset}.{led}` WHERE CAST(id AS STRING) IN UNNEST(@ids) GROUP BY id"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("ids", "STRING", [str(i) for i in ids])])
     return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
@@ -812,18 +873,21 @@ def _consumable_zero_cost(ds, run_date, backfill=False) -> Tuple[List[Finding], 
 
 
 def recheck_waste_sku_no_cost(ds, skus):
-    """Which of these SKUs NOW have a standard-cost record — those can be auto-closed."""
+    """Which of these SKUs NOW have a standard-cost record — {ITEMID: {unit_cost, cost_uom}} for the
+    ones that do (auto-closeable); absent = still no cost record. Carries the new cost so the
+    resolution can show what the now-costed item is valued at."""
     if not skus:
-        return set()
+        return {}
     bq = ds._bq
     ids = [str(s) for s in skus if s is not None]
     if not ids:
-        return set()
+        return {}
     sql = f"""WITH {_cost_cte()}
-    SELECT DISTINCT ITEMID FROM cost WHERE ITEMID IN UNNEST(@ids)"""
+    SELECT ITEMID, unit_cost, cost_uom FROM cost WHERE ITEMID IN UNNEST(@ids)"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
-    return {r.ITEMID for r in ds.client.query(sql, job_config=cfg).result()}
+    return {r.ITEMID: {"unit_cost": r.unit_cost, "cost_uom": r.cost_uom}
+            for r in ds.client.query(sql, job_config=cfg).result()}
 
 
 def recheck_consumable_cost(ds, skus):
@@ -835,10 +899,11 @@ def recheck_consumable_cost(ds, skus):
     if not ids:
         return {}
     sql = f"""WITH {_cost_cte()}
-    SELECT ITEMID, unit_cost FROM cost WHERE ITEMID IN UNNEST(@ids)"""
+    SELECT ITEMID, unit_cost, cost_uom FROM cost WHERE ITEMID IN UNNEST(@ids)"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
-    return {r.ITEMID: {"missing": (r.unit_cost is None or r.unit_cost == 0)}
+    return {r.ITEMID: {"missing": (r.unit_cost is None or r.unit_cost == 0),
+                       "unit_cost": r.unit_cost, "cost_uom": r.cost_uom}
             for r in ds.client.query(sql, job_config=cfg).result()}
 
 
@@ -881,6 +946,9 @@ def doc_sql(rule_id):
     the offending rows). None for catalog-only rules with no finder — their reference SQL stays the
     hand-written documentation in reference.RULES."""
     lb, cap = RECEIPT_LOOKBACK_DAYS, RESULT_CAP
+    if rule_id == "PO-01":
+        return _standalone("-- A PO-order-type receiving row in the ledger with a NULL/blank PO number (safety-net).\n",
+                           _build_null_po_ledger_sql(False, lb, cap))
     if rule_id == "PO-03":
         return _standalone(
             "-- PO over-receipt + UoM mismatch (daily: POs that received on run_date, cumulative vs\n"
@@ -916,10 +984,17 @@ def doc_sql(rule_id):
     return None
 
 
-_FINDERS = {"PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
+_FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
             "WASTE-DAILY": _daily_waste_facility, "ADJ-DAILY": _daily_adjust_facility,
             "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}
+
+
+def wired_rule_ids():
+    """Rule IDs that have a live SQL finder (i.e. actually run in the daily job and can create
+    exceptions). Rules NOT in this set are catalog-only: defined/documented but with no detector
+    wired yet, so they produce nothing even when enabled."""
+    return set(_FINDERS.keys())
 
 
 def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], int]:
@@ -951,7 +1026,10 @@ def breakdown(ds, po: str, consumable_sku: str, system: str = None):
     SELECT 'LEDGER', consumable_quantity_change, consumable_uom, CAST(NULL AS STRING),
            l1_action, l2_action, CAST(NULL AS STRING), facility_name, datetime_utc
     FROM `{proj}.{dset}.{led}`
-    WHERE ref_order_id = @po AND consumable_sku = @sku {sys_filter}
+    -- ref_order_type='Purchase Order' = the exact rows the finder nets, so the movement shown here
+    -- (positive receipts + negative corrections) sums to the flagged net received_qty. Don't drop it,
+    -- or the drawer's running balance won't tie out to the flagged total.
+    WHERE ref_order_id = @po AND consumable_sku = @sku AND ref_order_type = 'Purchase Order' {sys_filter}
       AND datetime_utc >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {BACKFILL_LOOKBACK_DAYS + 35} DAY)
     ORDER BY (source = 'LEDGER'), ts
     """

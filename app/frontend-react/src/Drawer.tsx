@@ -4,8 +4,14 @@ import { fmtNum } from "./lib";
 import { getBreakdown, jiraUrl, apiPost } from "./api";
 import { sevPill, statusPill } from "./Workbench";
 
-const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt", "consumable_uom"]);
+const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt", "consumable_uom", "resolution"]);
 const STATUS_OPTS = ["Open", "In Progress", "In Review", "Resolved"];
+
+function fmtVal(v: any, unit?: string): string {
+  if (v == null) return "—";
+  if (unit === "$") return "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return fmtNum(v) + (unit ? " " + unit : "");
+}
 
 function snapValue(k: string, val: any, snap: Record<string, any>): { text: string; neg: boolean } {
   let out: any = val;
@@ -87,6 +93,28 @@ export function Drawer({ data, exc, onClose, refresh }: {
               })}
             </div>
           </div>
+
+          {/* Correction applied — what the data looks like now that it auto-closed */}
+          {snap.resolution && (
+            <div className="section">
+              <h3>✔ Correction applied{exc.resolved ? " · resolved " + exc.resolved : ""}</h3>
+              <div className="tip" style={{ marginBottom: 8 }}>{snap.resolution.summary}</div>
+              {(snap.resolution.fields || []).length > 0 && (
+                <table className="mini">
+                  <thead><tr><th>Field</th><th className="num">Was (flagged)</th><th className="num">Now (corrected)</th></tr></thead>
+                  <tbody>
+                    {snap.resolution.fields.map((f: any, i: number) => (
+                      <tr key={i}>
+                        <td>{f.label}</td>
+                        <td className="num neg">{fmtVal(f.was, f.unit)}</td>
+                        <td className="num ok">{fmtVal(f.now, f.unit)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
 
           {/* Why this flagged — full breakdown */}
           {isReceipt && (
@@ -180,29 +208,47 @@ export function Drawer({ data, exc, onClose, refresh }: {
 }
 
 function Breakdown({ bd }: { bd: any }) {
-  if (!bd) return <div className="tip">Loading the PO line and ledger receipts…</div>;
+  if (!bd) return <div className="tip">Loading the PO line and every ledger movement on it…</div>;
   if (!bd.available) return <div className="tip">{bd.error ? "Breakdown unavailable: " + bd.error : "Live record breakdown is available when connected to BigQuery."}</div>;
+  const rows = bd.rows || [];
+  const ledger = rows.filter((r: any) => r.source === "LEDGER");
+  const ruom = bd.received_uom || (ledger[0] && ledger[0].uom) || "";
+  // running net of every PO-tagged movement (positive receipts + negative corrections) — the last
+  // value lands on the flagged received_qty, so the user can trace exactly how we got to the total.
+  let net = 0;
   return (
     <>
       <div className="tip" style={{ marginBottom: 8 }}>
-        Ordered {fmtNum(bd.ordered_qty)} {bd.ordered_uom || ""} · received {fmtNum(bd.received_qty)} {bd.received_uom || ""} ({bd.over_by_pct}% over) · {bd.ledger_count} ledger receipt(s)
+        Ordered {fmtNum(bd.ordered_qty)} {bd.ordered_uom || ""} · received {fmtNum(bd.received_qty)} {bd.received_uom || ""} ({bd.over_by_pct}% over) — netted from {bd.ledger_count} ledger movement{bd.ledger_count === 1 ? "" : "s"} on this PO.
       </div>
       {bd.uom_match === false && <div className="dup-warn">⚠ Unit-of-measure mismatch — ordered in {bd.ordered_uom || "?"} but received in {bd.received_uom || "?"}. The over-receipt % may be apples-to-oranges until reconciled.</div>}
       {bd.duplicate_suspected && <div className="dup-warn">⚠ Possible duplicate receipt — multiple identical Add / PO Receipt events. Inventory was added (l1 = Add), not adjusted out, so the receipt looks double-logged.</div>}
       <table className="mini">
-        <thead><tr><th>Source</th><th className="num">Qty</th><th>UoM</th><th>Type / action</th><th>Facility</th><th>When</th></tr></thead>
+        <thead><tr><th>Source</th><th className="num">Qty</th><th>UoM</th><th>Type / action</th><th>Facility</th><th>When</th><th className="num">Net to date</th></tr></thead>
         <tbody>
-          {(bd.rows || []).map((r: any, i: number) => (
-            <tr key={i} className={r.source === "PO" ? "bd-po" : ""}>
-              <td><span className="tag">{r.source}</span></td>
-              <td className="num">{fmtNum(r.qty)}</td>
-              <td>{r.uom || "—"}</td>
-              <td>{r.source === "PO" ? (r.order_type || "—") : (r.l1_action || "") + (r.l2_action ? " / " + r.l2_action : "")}</td>
-              <td>{r.facility || "—"}</td>
-              <td className="mono" style={{ fontSize: 11 }}>{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
-            </tr>
-          ))}
+          {rows.map((r: any, i: number) => {
+            const isLed = r.source === "LEDGER";
+            const q = Number(r.qty) || 0;
+            if (isLed) net += q;
+            return (
+              <tr key={i} className={r.source === "PO" ? "bd-po" : ""}>
+                <td><span className="tag">{r.source}</span></td>
+                <td className={"num" + (q < 0 ? " neg" : "")}>{fmtNum(r.qty)}</td>
+                <td>{r.uom || "—"}</td>
+                <td>{r.source === "PO" ? (r.order_type || "—") : (r.l1_action || "") + (r.l2_action ? " / " + r.l2_action : "")}</td>
+                <td>{r.facility || "—"}</td>
+                <td className="mono" style={{ fontSize: 11 }}>{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
+                <td className="num">{isLed ? fmtNum(net) : "—"}</td>
+              </tr>
+            );
+          })}
         </tbody>
+        <tfoot>
+          <tr className="bd-total">
+            <td colSpan={6}>Net received against this PO line — the flagged total</td>
+            <td className="num">{fmtNum(bd.received_qty)}{ruom ? " " + ruom : ""}</td>
+          </tr>
+        </tfoot>
       </table>
     </>
   );

@@ -148,8 +148,10 @@ def build_bootstrap(db) -> Dict:
     try:
         from ..rules import bq_finder
         _doc = bq_finder.doc_sql
+        _wired = bq_finder.wired_rule_ids()
     except Exception:  # pragma: no cover - keep bootstrap resilient if the finder import fails
         _doc = lambda _id: None
+        _wired = set()
     for _r in rules:
         try:
             sql = _doc(_r["id"])
@@ -158,6 +160,8 @@ def build_bootstrap(db) -> Dict:
         sql = sql or _ref_expr.get(_r["id"])
         if sql:
             _r["expression"] = sql
+        # Does this rule have a live detector wired in? (False = catalog-only — defined but inert.)
+        _r["wired"] = _r["id"] in _wired
 
     return {
         "meta": {"today": today, "runDate": today, "jiraProject": settings.jira_project_key,

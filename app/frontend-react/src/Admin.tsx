@@ -4,6 +4,36 @@ import { sevPill } from "./Workbench";
 import { labelFor } from "./lib";
 import { apiPatch, putThresholds, putWasteCombos } from "./api";
 
+// A rule's live status. Two switches decide whether it actually produces tickets: the Enabled
+// toggle (user-controlled) AND whether a detector query is wired into the engine (data.wired).
+// Catalog-only = defined/documented + enabled, but no detector yet, so it silently finds nothing.
+function ruleStatus(r: Bootstrap["rules"][number]) {
+  if (!r.enabled) return { label: "Paused", cls: "rs-paused", title: "Disabled — toggled off, so it does not run." };
+  if (r.wired) return { label: "Live", cls: "rs-live", title: "Enabled and a detector is wired in — runs in the daily validation job and can create tickets." };
+  return { label: "Catalog-only", cls: "rs-catalog", title: "Enabled, but no detector query is wired in yet — defined and documented, but it produces no exceptions." };
+}
+
+export function statusBadge(r: Bootstrap["rules"][number]) {
+  const s = ruleStatus(r);
+  return <span className={"pill " + s.cls} title={s.title}><span className="rs-dot" />{s.label}</span>;
+}
+
+// Group rules by their ID family for display: the PO-* family first, then the other families
+// alphabetically; within a family, numeric suffixes ascending (PO-01, PO-02, … PO-14).
+function ruleSortKey(id: string): [number, string, number, string] {
+  const m = id.match(/^([A-Za-z]+)-?(.*)$/);
+  const prefix = m ? m[1] : id;
+  const rest = m ? m[2] : "";
+  const num = /^\d+$/.test(rest) ? parseInt(rest, 10) : Number.MAX_SAFE_INTEGER;
+  return [prefix === "PO" ? 0 : 1, prefix, num, rest];
+}
+
+function byRuleId(a: Bootstrap["rules"][number], b: Bootstrap["rules"][number]) {
+  const [ga, pa, na, ra] = ruleSortKey(a.id);
+  const [gb, pb, nb, rb] = ruleSortKey(b.id);
+  return ga - gb || pa.localeCompare(pb) || na - nb || ra.localeCompare(rb);
+}
+
 export function Admin({ data, refresh }: { data: Bootstrap; refresh: () => Promise<void> | void }) {
   const [selId, setSelId] = useState(data.rules[0]?.id);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -26,14 +56,16 @@ export function Admin({ data, refresh }: { data: Bootstrap; refresh: () => Promi
           <div className="card">
             <h2>Validation rules</h2>
             <table className="mini">
-              <thead><tr><th>Rule</th><th>Type</th><th>Target table</th><th>Severity</th><th className="num">Enabled</th></tr></thead>
+              <thead><tr><th>Rule</th><th>Error type</th><th>Type</th><th>Target table</th><th>Severity</th><th>Status</th><th className="num">Enabled</th></tr></thead>
               <tbody>
-                {data.rules.map((r) => (
+                {[...data.rules].sort(byRuleId).map((r) => (
                   <tr key={r.id} style={{ cursor: "pointer", opacity: r.enabled ? 1 : 0.5 }} onClick={() => setSelId(r.id)} className={selId === r.id ? "selected" : ""}>
-                    <td><b>{r.name}</b><div className="tip mono">{r.id} → {r.errorType}</div></td>
+                    <td className="mono"><b>{r.id}</b></td>
+                    <td><b>{labelFor(data.errorTypes, r.errorType)}</b></td>
                     <td><span className="tag">{r.type}</span></td>
                     <td className="mono">{r.target}</td>
                     <td>{sevPill(r.severity)}</td>
+                    <td>{statusBadge(r)}</td>
                     <td className="num">
                       <span className={"toggle" + (r.enabled ? " on" : "")} role="switch" aria-checked={r.enabled} tabIndex={0}
                         title={r.enabled ? "Enabled — click to disable" : "Disabled — click to enable"}

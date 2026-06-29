@@ -44,7 +44,7 @@ export interface Bootstrap {
   errorTypes: { type: string; label: string; rule: string; ruleType: string; owner: string; desc: string; plain: string }[];
   teams: Record<string, string[]>;
   slaTargets: Record<string, number>;
-  rules: { id: string; name: string; type: string; errorType: string; target: string; severity: string; expression: string; enabled: boolean }[];
+  rules: { id: string; name: string; type: string; errorType: string; target: string; severity: string; expression: string; enabled: boolean; wired?: boolean }[];
   routing: { errorType: string; team: string; assignee: string; project: string; component: string }[];
   thresholds: { errorType: string; errorLabel: string; facilityType: string; high: number; urgent: number }[];
   wasteActionCombos: { l1Action: string; l2Action: string; enabled: boolean }[];
