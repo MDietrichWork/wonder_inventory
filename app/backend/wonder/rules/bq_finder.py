@@ -252,6 +252,211 @@ def recheck_price(ds, pairs):
     return out
 
 
+def _build_no_receipt_overdue_sql(cap: int, overdue_days: int, lookback_days: int = 0) -> str:
+    """PO-07: a Purchase PO with NOTHING received against it (SUM(received_qty)=0 across ALL its lines)
+    that still has an OPEN line more than `overdue_days` past its expected receipt date — i.e. it's
+    still awaiting receipt and hasn't been cancelled/closed. Aggregated to PO grain (one finding per
+    PO). 'Nothing received' is judged over the whole PO, so a partially-received PO is NOT flagged
+    (that's framework PO-08); the open/overdue test uses the still-OPEN lines. State-based: returns the
+    current open-overdue backlog each run (dedup prevents re-tickets; the recheck auto-closes once a
+    receipt lands or Supply Chain cancels/closes it). Only the cap differs between daily and backfill;
+    ordered oldest-expected first so the most overdue surface within the cap."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    # Optional recency floor: only POs whose expected receipt date is within the last `lookback_days`
+    # (keeps the rule on recently-overdue POs, not the full historical backlog). 0 = no floor.
+    window = (f"\n    AND expected_date >= DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)"
+              if lookback_days and lookback_days > 0 else "")
+    return f"""WITH po_agg AS (
+  SELECT po,
+         ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(destination_id)   AS facility_id,
+         ANY_VALUE(supplier_name)    AS supplier_name,
+         ANY_VALUE(po_source_system) AS system,
+         MIN(po_date_utc)            AS po_date_utc,
+         SUM(COALESCE(received_qty, 0)) AS total_received,          -- across ALL lines of the PO
+         LOGICAL_OR(UPPER(status) = 'OPEN') AS has_open_line,       -- still awaiting receipt somewhere
+         STRING_AGG(DISTINCT status, ', ') AS po_status,            -- the actual PO line status(es)
+         COUNT(*) AS line_count,
+         -- schedule + ordered qty measured on the OPEN (unreceived) lines only
+         MAX(IF(UPPER(status) = 'OPEN', expected_date, NULL)) AS expected_date,
+         SUM(IF(UPPER(status) = 'OPEN', COALESCE(consumable_sku_qty, 0), 0)) AS total_ordered,
+         COUNTIF(UPPER(status) = 'OPEN') AS open_line_count
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
+  GROUP BY po),
+flagged AS (
+  SELECT *,
+         DATE_ADD(expected_date, INTERVAL {overdue_days} DAY) AS breach_date,
+         DATE_DIFF(@run_date, expected_date, DAY)             AS days_overdue
+  FROM po_agg
+  WHERE total_received = 0              -- nothing received on the whole PO
+    AND has_open_line                  -- still open / not cancelled or closed out
+    AND expected_date IS NOT NULL
+    AND expected_date < DATE_SUB(@run_date, INTERVAL {overdue_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY expected_date ASC"""
+
+
+def _no_receipt_overdue(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_NO_RECEIPT_OVERDUE (Medium, Procurement) — framework PO-07. Open Purchase PO past its
+    expected receipt date by settings.po_no_receipt_overdue_days with nothing received and not
+    cancelled. One finding per PO; entity_key = PO number."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    days = settings.po_no_receipt_overdue_days
+    sql = _build_no_receipt_overdue_sql(cap, days, settings.po_no_receipt_overdue_lookback_days)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "po": r.po, "facility": r.facility or "—",
+            "supplier_name": r.supplier_name, "system": r.system,
+            "po_status": r.po_status,                                   # e.g. "Open" — still awaiting receipt, not cancelled
+            "expected_date": r.expected_date.isoformat() if r.expected_date else None,
+            "days_overdue": r.days_overdue, "overdue_days_threshold": days,
+            "ordered_qty": r.total_ordered, "received_qty": 0,
+            "open_lines": r.open_line_count, "line_count": r.line_count,
+            "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
+        }
+        if r.facility_id:
+            snap["facility_id"] = r.facility_id
+        if r.po_date_utc:
+            snap["po_date_utc"] = str(r.po_date_utc)
+        findings.append(Finding("PO-07", "PO_NO_RECEIPT_OVERDUE", "Medium", src, r.po, snap))
+    return findings, total
+
+
+def recheck_no_receipt_overdue(ds, pos):
+    """For each open PO-07 ticket's PO, whether it now PASSES: a receipt has landed, or Supply Chain
+    has cancelled/closed it (no longer OPEN). Returns {po: {"received", "open", "cancelled"}}."""
+    keys = [p for p in pos if p]
+    if not keys:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    sql = f"""SELECT po,
+       SUM(COALESCE(received_qty, 0)) AS total_received,
+       LOGICAL_OR(UPPER(status) = 'OPEN') AS still_open,
+       LOGICAL_OR(UPPER(status) IN ('CANCELLED', 'CANCELED', 'VOIDED')) AS cancelled
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Purchase' AND po IN UNNEST(@pos)
+    GROUP BY po"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("pos", "STRING", keys)])
+    return {r.po: {"received": r.total_received, "open": bool(r.still_open), "cancelled": bool(r.cancelled)}
+            for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+# Statuses that mean Supply Chain has finished with the PO (nothing left to close out).
+_PO_CLOSED_STATES = "('CLOSED', 'COMPLETED', 'CANCELLED', 'CANCELED', 'VOIDED')"
+
+
+def _build_partial_not_closed_sql(cap: int, overdue_days: int, lookback_days: int = 0) -> str:
+    """PO-08: a Purchase PO that received SOMETHING but less than ordered (short by even 1) and is more
+    than `overdue_days` past its expected receipt date while still not closed by Supply Chain.
+    Aggregated to PO grain: total received vs total ordered are summed over ALL lines; ordered is taken
+    in SUPPLIER units (received_qty tracks supplier_sku_qty). 'Not closed' = the PO still has at least
+    one line in a non-terminal status. The expected/overdue test uses the non-closed lines' schedule.
+    State-based (dedup + recheck handle re-tickets / auto-close); only the cap differs daily vs
+    backfill; ordered oldest-expected first so the most overdue surface within the cap."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    window = (f"\n    AND expected_date >= DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)"
+              if lookback_days and lookback_days > 0 else "")
+    return f"""WITH po_agg AS (
+  SELECT po,
+         ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(destination_id)   AS facility_id,
+         ANY_VALUE(supplier_name)    AS supplier_name,
+         ANY_VALUE(po_source_system) AS system,
+         MIN(po_date_utc)            AS po_date_utc,
+         SUM(COALESCE(received_qty, 0))     AS total_received,   -- supplier units, across ALL lines
+         SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered,   -- supplier units, across ALL lines
+         LOGICAL_OR(UPPER(status) NOT IN {_PO_CLOSED_STATES}) AS not_closed,  -- still open somewhere
+         STRING_AGG(DISTINCT status, ', ') AS po_status,
+         COUNT(*) AS line_count,
+         -- schedule measured on the not-yet-closed lines (the outstanding balance)
+         MAX(IF(UPPER(status) NOT IN {_PO_CLOSED_STATES}, expected_date, NULL)) AS expected_date,
+         COUNTIF(UPPER(status) NOT IN {_PO_CLOSED_STATES}) AS open_line_count
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
+  GROUP BY po),
+flagged AS (
+  SELECT *,
+         total_ordered - total_received AS shortfall_qty,
+         DATE_ADD(expected_date, INTERVAL {overdue_days} DAY) AS breach_date,
+         DATE_DIFF(@run_date, expected_date, DAY)             AS days_overdue
+  FROM po_agg
+  WHERE total_received > 0                       -- received something
+    AND total_received < total_ordered - 0.001   -- but under-received (short by even 1)
+    AND not_closed                               -- not closed by Supply Chain
+    AND expected_date IS NOT NULL
+    AND expected_date < DATE_SUB(@run_date, INTERVAL {overdue_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY expected_date ASC"""
+
+
+def _partial_not_closed(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_PARTIAL_NOT_CLOSED (Medium, Procurement) — framework PO-08. Under-received Purchase PO
+    (received > 0, short by even 1) still not closed past expected + N days. One finding per PO."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    days = settings.po_partial_not_closed_days
+    sql = _build_partial_not_closed_sql(cap, days, settings.po_partial_not_closed_lookback_days)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "po": r.po, "facility": r.facility or "—",
+            "supplier_name": r.supplier_name, "system": r.system,
+            "po_status": r.po_status,                                   # e.g. "Open, Closed" — partly received, not closed
+            "expected_date": r.expected_date.isoformat() if r.expected_date else None,
+            "days_overdue": r.days_overdue, "overdue_days_threshold": days,
+            "ordered_qty": r.total_ordered, "received_qty": r.total_received,
+            "shortfall_qty": r.shortfall_qty,
+            "open_lines": r.open_line_count, "line_count": r.line_count,
+            "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
+        }
+        if r.facility_id:
+            snap["facility_id"] = r.facility_id
+        if r.po_date_utc:
+            snap["po_date_utc"] = str(r.po_date_utc)
+        findings.append(Finding("PO-08", "PO_PARTIAL_NOT_CLOSED", "Medium", src, r.po, snap))
+    return findings, total
+
+
+def recheck_partial_not_closed(ds, pos):
+    """For each open PO-08 ticket's PO, whether it now PASSES: fully received, or Supply Chain closed
+    it (no longer any non-terminal line). Returns {po: {"received", "ordered", "not_closed"}}."""
+    keys = [p for p in pos if p]
+    if not keys:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    sql = f"""SELECT po,
+       SUM(COALESCE(received_qty, 0)) AS total_received,
+       SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered,
+       LOGICAL_OR(UPPER(status) NOT IN {_PO_CLOSED_STATES}) AS not_closed
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Purchase' AND po IN UNNEST(@pos)
+    GROUP BY po"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("pos", "STRING", keys)])
+    return {r.po: {"received": r.total_received, "ordered": r.total_ordered, "not_closed": bool(r.not_closed)}
+            for r in ds.client.query(sql, job_config=cfg).result()}
+
+
 def _build_null_po_sql(backfill: bool, lookback: int, cap: int) -> str:
     """PO-13: a Purchase row in the master PO table with a NULL/blank PO number. Safety-net —
     finds 0 on current data; wired so it tickets + auto-closes if upstream ever degrades."""
@@ -516,16 +721,22 @@ def recheck_to_exists(ds, to_ids):
 NON_WASTE_ADJUST_L2 = ("Move From", "Move To", "Update Received Order", "Shelf Life Extension")
 
 
+def _waste_combo_keys() -> list:
+    """The editable Daily-Waste allowlist as CONCAT keys ('l1||l2'), bound as the @waste_keys array
+    parameter (see _daily_waste_rows) so the values are NEVER interpolated into SQL."""
+    return ["%s||%s" % (l1, l2) for (l1, l2) in reference.waste_action_combos()]
+
+
 def _waste_combo_sql() -> str:
     """SQL predicate selecting ledger rows whose (l1_action, l2_action) is in the editable Daily-Waste
-    allowlist (reference.waste_action_combos; Pavel-approved defaults, DB-overridable in Admin). Built
-    as a CONCAT-key IN-list so the pairs match exactly; a row with a NULL action CONCATs to NULL and
-    is naturally excluded. Empty allowlist -> FALSE (nothing counts as waste)."""
-    combos = reference.waste_action_combos()
-    if not combos:
+    allowlist (reference.waste_action_combos; Pavel-approved defaults, DB-overridable in Admin). The
+    pairs are matched via CONCAT-key against the @waste_keys array parameter (bound in _daily_waste_rows)
+    — user-editable values are parameterized, never interpolated, so this is injection-safe. A row with
+    a NULL action CONCATs to NULL and is naturally excluded. Empty allowlist -> FALSE (nothing counts
+    as waste)."""
+    if not reference.waste_action_combos():
         return "FALSE"
-    keys = ", ".join("'%s'" % ("%s||%s" % (l1, l2)).replace("'", "\\'") for (l1, l2) in combos)
-    return f"CONCAT(l1_action, '||', l2_action) IN ({keys})"
+    return "CONCAT(l1_action, '||', l2_action) IN UNNEST(@waste_keys)"
 
 
 def _cost_cte() -> str:
@@ -593,8 +804,11 @@ def _daily_waste_rows(ds, run_date, backfill=False):
     an item cancels. waste_dollars > 0 means net lost value. Each row carries the top loss-contributing
     SKUs (sorted). Shared by the dashboard metric + the exception."""
     bq = ds._bq
-    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
-                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    params = [bq.ScalarQueryParameter("run_date", "DATE", run_date)]
+    keys = _waste_combo_keys()
+    if keys:  # only bound when the allowlist is non-empty (else the predicate is a literal FALSE)
+        params.append(bq.ArrayQueryParameter("waste_keys", "STRING", keys))
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3), query_parameters=params)
     return list(ds.client.query(_daily_waste_sql(backfill), job_config=cfg).result())
 
 
@@ -955,6 +1169,22 @@ def doc_sql(rule_id):
             "-- ordered). uom_mismatch=TRUE rows become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT\n"
             "-- (over_frac >= %.2f -> Urgent, else High).\n" % settings.over_receipt_urgent_pct,
             _build_sql(False, lb, settings.over_receipt_high_pct, cap, settings.over_receipt_urgent_pct))
+    if rule_id == "PO-07":
+        lbk = settings.po_no_receipt_overdue_lookback_days
+        return _standalone(
+            "-- Open Purchase PO past expected_date + %d days with nothing received and not cancelled\n"
+            "-- (framework PO-07)%s. One row per PO; auto-closes once received or cancelled/closed.\n"
+            % (settings.po_no_receipt_overdue_days,
+               (", limited to the last %d days" % lbk) if lbk and lbk > 0 else ""),
+            _build_no_receipt_overdue_sql(cap, settings.po_no_receipt_overdue_days, lbk))
+    if rule_id == "PO-08":
+        lbk = settings.po_partial_not_closed_lookback_days
+        return _standalone(
+            "-- Under-received Purchase PO (received>0 but < ordered) still not closed %d days past\n"
+            "-- expected_date (framework PO-08)%s. One row per PO; auto-closes once fully received or closed.\n"
+            % (settings.po_partial_not_closed_days,
+               (", limited to the last %d days" % lbk) if lbk and lbk > 0 else ""),
+            _build_partial_not_closed_sql(cap, settings.po_partial_not_closed_days, lbk))
     if rule_id == "PO-09":
         return _standalone("-- CLOSED Purchase PO lines with a $0/NULL vendor price (can't be costed).\n",
                            _build_price_sql(False, lb, cap))
@@ -984,7 +1214,8 @@ def doc_sql(rule_id):
     return None
 
 
-_FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-09": _missing_price, "PO-13": _null_po,
+_FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-07": _no_receipt_overdue,
+            "PO-08": _partial_not_closed, "PO-09": _missing_price, "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
             "WASTE-DAILY": _daily_waste_facility, "ADJ-DAILY": _daily_adjust_facility,
             "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}

@@ -50,6 +50,35 @@ def missing_price(run_date, snap, cur):
                 [_field("supplier_price", snap.get("supplier_price"), cur.get("price"), "$")])
 
 
+def no_receipt_overdue(run_date, snap, cur):
+    """PO-07 — close once a receipt lands against the PO, or Supply Chain cancels/closes it."""
+    if not cur:
+        return None
+    received = cur.get("received") or 0
+    if received > 0:
+        return _res(run_date, "Receipt now recorded against the PO.",
+                    [_field("received_qty", snap.get("received_qty", 0), received)])
+    if cur.get("cancelled"):
+        return _res(run_date, "PO marked Cancelled by Supply Chain.")
+    if not cur.get("open"):
+        return _res(run_date, "PO closed by Supply Chain (no longer open).")
+    return None
+
+
+def partial_not_closed(run_date, snap, cur):
+    """PO-08 — close once the PO is fully received, or Supply Chain closes/cancels it."""
+    if not cur:
+        return None
+    if not cur.get("not_closed"):
+        return _res(run_date, "PO closed by Supply Chain.")
+    received, ordered = cur.get("received") or 0, cur.get("ordered") or 0
+    if ordered and received >= ordered - 0.001:
+        return _res(run_date, "PO now fully received.",
+                    [_field("received_qty", snap.get("received_qty"), received),
+                     _field("ordered_qty", snap.get("ordered_qty"), ordered)])
+    return None
+
+
 def consumable_zero_cost(run_date, snap, cur):
     if not cur or cur.get("missing"):
         return None

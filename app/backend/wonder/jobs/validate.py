@@ -123,13 +123,17 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
     else:
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
-        from ..rules.bq_finder import (recheck, recheck_price, recheck_null_po, recheck_null_po_ledger,
+        from ..rules.bq_finder import (recheck, recheck_price, recheck_no_receipt_overdue,
+                                        recheck_partial_not_closed,
+                                        recheck_null_po, recheck_null_po_ledger,
                                         recheck_sku_on_po, recheck_to_exists, recheck_daily_waste_facility,
                                         recheck_daily_adjust_facility,
                                         recheck_waste_sku_no_cost, recheck_consumable_cost)
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
         over_errs = [e for e in open_errs if e.error_type in OVER_TYPES]
         price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
+        noreceipt_errs = [e for e in open_errs if e.error_type == "PO_NO_RECEIPT_OVERDUE"]
+        partial_errs = [e for e in open_errs if e.error_type == "PO_PARTIAL_NOT_CLOSED"]
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
         nullpo_led_errs = [e for e in open_errs if e.error_type == "NULL_PO_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
@@ -164,6 +168,30 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             if res:  # a vendor price has been set
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: vendor price now populated — auto-closed." % run_date,
+                            resolution=res)
+                autoclosed += 1
+
+        # PO no-receipt overdue (PO-07): close once a receipt lands or Supply Chain cancels/closes it
+        nrpos = list({(e.data_snapshot or {}).get("po") for e in noreceipt_errs if (e.data_snapshot or {}).get("po")})
+        nrcur = recheck_no_receipt_overdue(ds, nrpos) if nrpos else {}
+        for e in noreceipt_errs:
+            snap = e.data_snapshot or {}
+            res = resolution.no_receipt_overdue(run_date, snap, nrcur.get(snap.get("po")))
+            if res:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: PO received or cancelled/closed — auto-closed." % run_date,
+                            resolution=res)
+                autoclosed += 1
+
+        # PO partially received & not closed (PO-08): close once fully received or closed by SC
+        pnpos = list({(e.data_snapshot or {}).get("po") for e in partial_errs if (e.data_snapshot or {}).get("po")})
+        pncur = recheck_partial_not_closed(ds, pnpos) if pnpos else {}
+        for e in partial_errs:
+            snap = e.data_snapshot or {}
+            res = resolution.partial_not_closed(run_date, snap, pncur.get(snap.get("po")))
+            if res:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: PO fully received or closed — auto-closed." % run_date,
                             resolution=res)
                 autoclosed += 1
 

@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     over_receipt_high_pct: float = 0.30    # flag + High floor: received exceeds ordered by >30%
     over_receipt_urgent_pct: float = 1.00  # over-receipt severity split: 30-99% over -> High, >=100% -> Urgent
 
+    # PO-07: an open Purchase PO with nothing received is flagged once it's this many days past its
+    # expected receipt date without being cancelled/closed by Supply Chain.
+    po_no_receipt_overdue_days: int = 2
+    # Only look back this many days from the expected receipt date, so the rule focuses on recently-
+    # overdue POs instead of the full historical backlog (keeps the initial run small). 0 = no floor.
+    po_no_receipt_overdue_lookback_days: int = 7
+
+    # PO-08: a Purchase PO that received SOMETHING but less than ordered and hasn't been closed by
+    # Supply Chain this many days past its expected receipt date. Same lookback semantics as PO-07.
+    po_partial_not_closed_days: int = 3
+    po_partial_not_closed_lookback_days: int = 7
+
     # --- Waste thresholds ---
     # Daily facility waste $ thresholds are per-facility-type and live in
     # reference.WASTE_DAILY_THRESHOLDS (banded High/Urgent), not here.

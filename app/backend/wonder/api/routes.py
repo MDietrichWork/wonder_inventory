@@ -4,8 +4,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 
+import re
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from ..db import SessionLocal
@@ -72,10 +74,25 @@ class ThresholdsBody(BaseModel):
     bands: List[ThresholdBand]
 
 
+# Ledger action names are short human labels: letters/digits/spaces and a few punctuation marks seen
+# in the approved allowlist (e.g. "DISH Issue/Received Damaged", "Self-Directed Location Count"). This
+# rejects SQL metacharacters (quotes, backslash, semicolons) as defense-in-depth on top of the bound
+# @waste_keys parameter used in bq_finder.
+_ACTION_RE = re.compile(r"^[A-Za-z0-9 /&().,-]{1,64}$")
+
+
 class WasteCombo(BaseModel):
     l1Action: str
     l2Action: str
     enabled: bool = True
+
+    @field_validator("l1Action", "l2Action")
+    @classmethod
+    def _valid_action(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not _ACTION_RE.match(v):
+            raise ValueError("action must be 1-64 chars of letters, digits, spaces, or / & ( ) . , -")
+        return v
 
 
 class WasteCombosBody(BaseModel):

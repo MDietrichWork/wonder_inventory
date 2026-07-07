@@ -326,6 +326,10 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "Cumulative on-hand quantity went negative for an item / location."},
     {"type": "PO_MISSING_PRICE", "rule": "Vendor SKU price present", "ruleType": "NOT_NULL",
      "owner": "Procurement", "desc": "Purchase PO line has a $0.00 or NULL vendor (supplier) price — the receipt can't be costed into the GL until a price is set."},
+    {"type": "PO_NO_RECEIPT_OVERDUE", "rule": "Open PO received or cancelled within X days of expected", "ruleType": "AGING",
+     "owner": "Procurement", "desc": "An OPEN Purchase PO has nothing received against any of its lines and is more than X days past its expected receipt date, yet Supply Chain hasn't cancelled or closed it (framework PO-07). The PO is in limbo — either the goods are late and need chasing, or the order is dead and should be cancelled. One ticket per PO; the X-day grace is configurable (default 2). Auto-closes once a receipt is booked or the PO is cancelled/closed."},
+    {"type": "PO_PARTIAL_NOT_CLOSED", "rule": "Partially-received PO closed within Y days of expected", "ruleType": "AGING",
+     "owner": "Procurement", "desc": "A Purchase PO received SOME but not all of what was ordered (received > 0 and short by even 1) and, more than Y days past its expected receipt date, still hasn't been closed by Supply Chain (framework PO-08). The outstanding balance is in limbo — either the rest is still coming or the PO should be closed short. One ticket per PO; the Y-day grace is configurable (default 3). Auto-closes once the PO is fully received or closed. Ordered qty compared in supplier units (received_qty vs supplier_sku_qty)."},
     {"type": "PO_MISSING_NUMBER", "rule": "PO number present (master table)", "ruleType": "NOT_NULL",
      "owner": "SC Product (IMS)", "desc": "A row in the PO master table has a NULL/blank PO number — a broken master record with nothing to receive against. Safety-net rule: currently finds 0 on live data, kept to catch upstream degradation."},
     {"type": "PO_SKU_NOT_ON_PO", "rule": "Received SKU listed on the PO", "ruleType": "REFERENTIAL",
@@ -354,6 +358,8 @@ ERROR_TYPE_LABELS = {
     "TRANSFER_WAREHOUSE_IMBALANCE": "Transfer Warehouse Imbalance (WIP)",
     "NEGATIVE_ON_HAND": "Negative On-Hand",
     "PO_MISSING_PRICE": "PO Missing Price",
+    "PO_NO_RECEIPT_OVERDUE": "PO Overdue — No Receipt",
+    "PO_PARTIAL_NOT_CLOSED": "PO Partially Received — Not Closed",
     "PO_MISSING_NUMBER": "PO Table Missing PO Number",
     "PO_SKU_NOT_ON_PO": "SKU Not on PO",
     "TRANSFER_ORDER_MISSING": "Transfer Order Missing (WIP)",
@@ -381,6 +387,8 @@ ERROR_TYPE_PLAIN = {
     "TRANSFER_WAREHOUSE_IMBALANCE": "What shipped out of the transfer warehouse doesn't equal what was received, so stock is stuck in limbo between locations.",
     "NEGATIVE_ON_HAND": "Our records say there's less than zero of an item on hand — physically impossible, so a transaction is missing or wrong.",
     "PO_MISSING_PRICE": "A purchase-order line has no vendor price (it's blank or $0), so the receipt can't be costed into the books.",
+    "PO_NO_RECEIPT_OVERDUE": "A purchase order is past its expected delivery date, nothing has been received against it, and nobody has cancelled it — so it's sitting in limbo and needs to be chased or cancelled.",
+    "PO_PARTIAL_NOT_CLOSED": "A purchase order got some but not all of what was ordered, it's past its expected date, and it hasn't been closed — so the leftover balance is stuck: either the rest still needs to arrive or the order should be closed out.",
     "PO_MISSING_NUMBER": "A row in the purchase-order master table has no PO number at all — a broken record with nothing to receive against.",
     "PO_SKU_NOT_ON_PO": "An item was received against a real purchase order, but that item isn't listed on the PO — a wrong item, an undocumented substitution, or a PO line that was never set up.",
     "TRANSFER_ORDER_MISSING": "Items were picked for a transfer order that doesn't exist in our records.",
@@ -600,6 +608,39 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
         "WHERE order_type = 'Purchase' AND (po IS NULL OR TRIM(po) = '')"
      ), "enabled": True},
+    {"id": "PO-07", "name": "Open PO received or cancelled within X days of expected", "primitive": "AGING",
+     "error_type": "PO_NO_RECEIPT_OVERDUE", "target_table": "int_ledger_purchase_orders",
+     "severity": "Medium", "fail_type": "Soft", "owner_group": "Procurement",
+     "params": {"overdue_days": "settings.po_no_receipt_overdue_days"},  # live value read from config at run time
+     "expression": (
+        "-- Framework PO-07: an OPEN Purchase PO past expected_date + N days with nothing received and\n"
+        "-- not cancelled/closed. Aggregated to PO grain — a PO is 'nothing received' only when NO line\n"
+        "-- has any received_qty. N = po_no_receipt_overdue_days (default 2). Live query: bq_finder.doc_sql.\n"
+        "SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,\n"
+        "       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received\n"
+        "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
+        "WHERE order_type = 'Purchase' AND UPPER(status) = 'OPEN'\n"
+        "GROUP BY po\n"
+        "HAVING total_received = 0 AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
+     ), "enabled": True},
+    {"id": "PO-08", "name": "Partially-received PO closed within Y days of expected", "primitive": "AGING",
+     "error_type": "PO_PARTIAL_NOT_CLOSED", "target_table": "int_ledger_purchase_orders",
+     "severity": "Medium", "fail_type": "Soft", "owner_group": "Procurement",
+     "params": {"overdue_days": "settings.po_partial_not_closed_days"},  # live value read from config at run time
+     "expression": (
+        "-- Framework PO-08: a Purchase PO under-received (received > 0 but < ordered) that is still not\n"
+        "-- closed Y days past expected_date. PO grain; ordered compared in supplier units. N = \n"
+        "-- po_partial_not_closed_days (default 3). Live query: bq_finder.doc_sql.\n"
+        "SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,\n"
+        "       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received,\n"
+        "       SUM(COALESCE(supplier_sku_qty,0)) AS total_ordered\n"
+        "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
+        "WHERE order_type = 'Purchase'\n"
+        "  AND UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')\n"
+        "GROUP BY po\n"
+        "HAVING total_received > 0 AND total_received < total_ordered\n"
+        "   AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)"
+     ), "enabled": True},
     {"id": "PO-09", "name": "Vendor SKU price present", "primitive": "NOT_NULL", "error_type": "PO_MISSING_PRICE",
      "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "Procurement",
      "params": {"column": "supplier_price", "where": {"order_type": ["Purchase"]}},
@@ -628,6 +669,10 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "On-Hand Recon"},
     {"error_type": "PO_MISSING_PRICE", "team": "Procurement", "assignee": "Tom Becker",
      "jira_project": "WIQ", "jira_component": "Vendor Pricing"},
+    {"error_type": "PO_NO_RECEIPT_OVERDUE", "team": "Procurement", "assignee": "Tom Becker",
+     "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
+    {"error_type": "PO_PARTIAL_NOT_CLOSED", "team": "Procurement", "assignee": "Tom Becker",
+     "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
     {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
      "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
     {"error_type": "PO_SKU_NOT_ON_PO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",

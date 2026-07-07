@@ -10,6 +10,21 @@ import { Admin } from "./Admin";
 
 type View = "dashboard" | "workbench" | "sla" | "admin";
 const VIEWS: View[] = ["dashboard", "workbench", "sla", "admin"];
+
+// Validation is a single blocking POST /api/run (no server-side progress stream), so we surface
+// staged status text that advances on a timer — enough to show the run is live and touching Jira.
+const RUN_STEPS = [
+  "Scanning inventory data…",
+  "Applying validation rules…",
+  "Creating & updating Jira tickets…",
+  "Auto-closing resolved exceptions…",
+];
+type RunResult = { ran: string; scanned: number; seen: number; new: number; autoClosed: number };
+type RunStatus =
+  | { phase: "running"; step: number }
+  | { phase: "done"; result: RunResult }
+  | { phase: "error"; message: string }
+  | null;
 // Views are hash-routed (#workbench, #sla, …) so they're deep-linkable / bookmarkable and each
 // view can be loaded directly (incl. for headless UI verification). Unknown/empty hash → dashboard.
 const viewFromHash = (): View => {
@@ -72,6 +87,30 @@ export function App() {
     try { await apiPost(path); await load(); } finally { setBusy(null); }
   };
 
+  // Run validation with a visible progress overlay: advance the step ticker on a timer while the
+  // blocking POST is in flight, then show a completion summary (new / auto-closed ticket counts).
+  const [runStatus, setRunStatus] = useState<RunStatus>(null);
+  const runValidation = async () => {
+    if (busy) return;
+    setBusy("run");
+    setRunStatus({ phase: "running", step: 0 });
+    const stepper = setInterval(() => {
+      setRunStatus((s) => s && s.phase === "running"
+        ? { phase: "running", step: Math.min(s.step + 1, RUN_STEPS.length - 1) } : s);
+    }, 1400);
+    try {
+      const result = (await apiPost("/run")) as RunResult;
+      clearInterval(stepper);
+      await load();
+      setRunStatus({ phase: "done", result });
+    } catch (e) {
+      clearInterval(stepper);
+      setRunStatus({ phase: "error", message: String(e) });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   // keyboard: 1-4 switch views, / focus search, Esc close drawer
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -104,7 +143,7 @@ export function App() {
         <span className="run-pill">JIRA project <b>{data.meta.jiraProject}</b></span>
         <span className="spacer" />
         <span className="tip">Press <span className="kbd">1</span>–<span className="kbd">4</span> · <span className="kbd">/</span> search · <span className="kbd">Esc</span> close</span>
-        <button className="btn sm" disabled={!!busy} onClick={() => runAction("run", "/run")}>{busy === "run" ? "Running…" : "↻ Run validation"}</button>
+        <button className="btn sm" disabled={!!busy} onClick={runValidation}>{busy === "run" ? <><span className="spinner sm" /> Running…</> : "↻ Run validation"}</button>
         <button className="btn sm" disabled={!!busy} onClick={() => runAction("sync", "/sync")}>{busy === "sync" ? "Syncing…" : "⟲ Sync from Jira"}</button>
         <span className="user"><span className="avatar">MD</span> Mike Dietrich · Accounting</span>
       </header>
@@ -144,6 +183,53 @@ export function App() {
             style={{ background: "#fff", color: "#1f6feb", border: "none", fontWeight: 600 }}>↻ Refresh</button>
           <button onClick={dismissNewRun} aria-label="Dismiss"
             style={{ background: "transparent", color: "#fff", border: "none", cursor: "pointer", fontSize: 16, lineHeight: 1 }}>✕</button>
+        </div>
+      )}
+      {runStatus && (
+        <div className="run-overlay" role="dialog" aria-modal="true" aria-label="Validation run">
+          <div className="run-card">
+            {runStatus.phase === "running" && (
+              <>
+                <h3><span className="spinner" /> Running validation…</h3>
+                <p className="sub">Scanning inventory and updating Jira tickets — this can take a moment. You can keep this open.</p>
+                <ul className="run-steps">
+                  {RUN_STEPS.map((label, i) => {
+                    const state = i < runStatus.step ? "done" : i === runStatus.step ? "active" : "";
+                    return (
+                      <li key={i} className={state}>
+                        <span className="step-ico">
+                          {state === "done" ? <span className="check">✓</span>
+                            : state === "active" ? <span className="spinner sm" />
+                            : <span className="pending" />}
+                        </span>
+                        {label}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </>
+            )}
+            {runStatus.phase === "done" && (
+              <>
+                <h3><span className="ok-check">✓</span> Validation complete</h3>
+                <p className="sub">Run for <b>{runStatus.result.ran}</b></p>
+                <div className="run-summary">
+                  <div className="stat"><div className="n">{runStatus.result.new}</div><div className="l">New tickets</div></div>
+                  <div className="stat"><div className="n">{runStatus.result.autoClosed}</div><div className="l">Auto-closed</div></div>
+                  <div className="stat"><div className="n">{runStatus.result.seen}</div><div className="l">Open exceptions</div></div>
+                  <div className="stat"><div className="n">{runStatus.result.scanned}</div><div className="l">Rows scanned</div></div>
+                </div>
+                <div className="actions"><button className="btn primary sm" onClick={() => setRunStatus(null)}>Done</button></div>
+              </>
+            )}
+            {runStatus.phase === "error" && (
+              <>
+                <h3><span className="err-mark">⚠</span> Validation failed</h3>
+                <div className="err">{runStatus.message}</div>
+                <div className="actions"><button className="btn sm" onClick={() => setRunStatus(null)}>Close</button></div>
+              </>
+            )}
+          </div>
         </div>
       )}
       <div className="proto-banner">PROTOTYPE · <b>React console</b> · live API + validation engine</div>

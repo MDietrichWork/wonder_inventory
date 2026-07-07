@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useEffect } from "react";
 import type { Bootstrap, Drill, Exception } from "./types";
 import { SEVRANK, statusClass, labelFor } from "./lib";
 import { apiPost } from "./api";
@@ -30,20 +30,21 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
   data: Bootstrap; drill: Drill; clearDrill: () => void; onOpen: (e: Exception) => void; refresh: () => Promise<void>;
 }) {
   const exc = data.exceptions;
-  const [f, setF] = useState({ q: "", facility: "", system: "", errortype: "", severity: "", status: "", team: "", owner: "" });
+  const [f, setF] = useState({ q: "", facility: "", system: "", errortypes: [] as string[], severity: "", status: "", team: "", owner: "" });
   const [sortKey, setSortKey] = useState<string>("severity");
   const [sortDir, setSortDir] = useState(1);
   const [sel, setSel] = useState<Set<number>>(new Set());
 
   const set = (k: string, v: string) => setF((p) => ({ ...p, [k]: v }));
-  const clearFilters = () => { setF({ q: "", facility: "", system: "", errortype: "", severity: "", status: "", team: "", owner: "" }); clearDrill(); };
+  const setErrorTypes = (v: string[]) => setF((p) => ({ ...p, errortypes: v }));
+  const clearFilters = () => { setF({ q: "", facility: "", system: "", errortypes: [], severity: "", status: "", team: "", owner: "" }); clearDrill(); };
 
   const rows = useMemo(() => {
     const out = exc.filter((e) => {
       if (drill && !drill.test(e)) return false;
       if (f.facility && e.facility !== f.facility) return false;
       if (f.system && e.system !== f.system) return false;
-      if (f.errortype && e.errorType !== f.errortype) return false;
+      if (f.errortypes.length && !f.errortypes.includes(e.errorType)) return false;
       if (f.severity && e.severity !== f.severity) return false;
       if (f.status && e.jiraStatus !== f.status) return false;
       if (f.team && e.team !== f.team) return false;
@@ -99,7 +100,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
         <span className="vline" />
         <label className="flt">Facility <Select v={f.facility} set={(v) => set("facility", v)} opts={uniq(exc, "facility")} all="All facilities" /></label>
         <label className="flt">System <Select v={f.system} set={(v) => set("system", v)} opts={uniq(exc, "system")} all="All systems" /></label>
-        <label className="flt">Error type <Select v={f.errortype} set={(v) => set("errortype", v)} opts={[...data.errorTypes].sort((a, b) => a.label.localeCompare(b.label)).map((t) => t.type)} all="All error types" labelFn={(o) => labelFor(data.errorTypes, o)} /></label>
+        <div className="flt">Error type <MultiSelect sel={f.errortypes} setSel={setErrorTypes} opts={[...data.errorTypes].sort((a, b) => a.label.localeCompare(b.label)).map((t) => t.type)} all="All error types" labelFn={(o) => labelFor(data.errorTypes, o)} /></div>
         <label className="flt">Severity <Select v={f.severity} set={(v) => set("severity", v)} opts={["Urgent", "High", "Medium", "Low"]} all="All severities" /></label>
         <label className="flt">Status <Select v={f.status} set={(v) => set("status", v)} opts={uniq(exc, "jiraStatus")} all="All statuses" /></label>
         <label className="flt">Team <Select v={f.team} set={(v) => set("team", v)} opts={Object.keys(data.teams)} all="All teams" /></label>
@@ -172,5 +173,43 @@ function Select({ v, set, opts, all, labelFn }: { v: string; set: (v: string) =>
       <option value="">{all}</option>
       {opts.map((o) => <option key={o} value={o}>{labelFn ? labelFn(o) : o}</option>)}
     </select>
+  );
+}
+
+// Checkbox dropdown for filters that accept several values at once (e.g. Error type). Closes on
+// outside-click / Esc; the trigger shows the single label, "N selected", or the "all" placeholder.
+function MultiSelect({ sel, setSel, opts, all, labelFn }: {
+  sel: string[]; setSel: (v: string[]) => void; opts: string[]; all: string; labelFn?: (o: string) => string;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  const toggle = (o: string) => setSel(sel.includes(o) ? sel.filter((x) => x !== o) : [...sel, o]);
+  const label = sel.length === 0 ? all : sel.length === 1 ? (labelFn ? labelFn(sel[0]) : sel[0]) : `${sel.length} selected`;
+  return (
+    <div className={"multiselect" + (open ? " open" : "")} ref={ref}>
+      <button type="button" className={"ms-btn" + (sel.length ? " active" : "")} onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox" aria-expanded={open}>
+        <span className="ms-label">{label}</span><span className="ms-caret">▾</span>
+      </button>
+      {open && (
+        <div className="ms-pop" role="listbox" aria-multiselectable="true">
+          {sel.length > 0 && <button type="button" className="ms-clear" onClick={() => setSel([])}>Clear selection ({sel.length})</button>}
+          {opts.map((o) => (
+            <label key={o} className="ms-opt">
+              <input type="checkbox" checked={sel.includes(o)} onChange={() => toggle(o)} />
+              <span>{labelFn ? labelFn(o) : o}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
