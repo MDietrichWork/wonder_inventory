@@ -385,6 +385,287 @@ just an over-shipment).
 
 ---
 
+## PO-07 · PO Overdue — No Receipt
+
+> **In one sentence:** find **open** purchase orders that are **past their expected delivery date**
+> with **nothing received** against them and **not cancelled** — the order is in limbo and needs to be
+> chased or cancelled.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | PO-07 |
+| **Rule type** | `AGING` (a "this should have happened by now" timeliness check) |
+| **Severity** | **Medium** — 2-day SLA |
+| **Owner / routed team** | Procurement |
+| **Default assignee** | Tom Becker |
+| **Jira** | Project **WIQ** · Component **PO Fulfillment** |
+| **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Grain** | **One ticket per PO** (not per line). |
+| **Key settings** | `po_no_receipt_overdue_days` = **2** (grace days past expected) · `po_no_receipt_overdue_lookback_days` = **7** (only recently-overdue POs; 0 = full backlog) |
+| **Live status** | 🟢 **Live — runs daily.** With the 7-day window it flagged **2** POs on the 2026-07-06 run (`KAN-1041`, `KAN-1042`). |
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Framework PO-07: an OPEN Purchase PO past expected_date + N days with nothing received and
+-- not cancelled. Aggregated to PO grain — a PO is 'nothing received' only when NO line has any
+-- received_qty. N = po_no_receipt_overdue_days (default 2).
+SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,
+       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received
+FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+WHERE order_type = 'Purchase' AND UPPER(status) = 'OPEN'
+GROUP BY po
+HAVING total_received = 0 AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- Open Purchase PO past expected_date + 2 days with nothing received and not cancelled
+-- (framework PO-07), limited to the last 7 days. One row per PO.
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+
+WITH po_agg AS (
+  SELECT po,
+         ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(supplier_name)    AS supplier_name,
+         ANY_VALUE(po_source_system) AS system,
+         SUM(COALESCE(received_qty, 0)) AS total_received,          -- across ALL lines of the PO
+         LOGICAL_OR(UPPER(status) = 'OPEN') AS has_open_line,       -- still awaiting receipt somewhere
+         STRING_AGG(DISTINCT status, ', ') AS po_status,
+         COUNT(*) AS line_count,
+         MAX(IF(UPPER(status) = 'OPEN', expected_date, NULL)) AS expected_date,
+         SUM(IF(UPPER(status) = 'OPEN', COALESCE(consumable_sku_qty, 0), 0)) AS total_ordered,
+         COUNTIF(UPPER(status) = 'OPEN') AS open_line_count
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
+  GROUP BY po),
+flagged AS (
+  SELECT *,
+         DATE_ADD(expected_date, INTERVAL 2 DAY) AS breach_date,
+         DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
+  FROM po_agg
+  WHERE total_received = 0              -- nothing received on the whole PO
+    AND has_open_line                  -- still open / not cancelled or closed out
+    AND expected_date IS NOT NULL
+    AND expected_date < DATE_SUB(run_date, INTERVAL 2 DAY)
+    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)),   -- recency window
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY expected_date ASC
+```
+
+### Plain-English walkthrough
+
+This rule reads a single table (the **PO Table**) and rolls every PO line up to **one row per PO**,
+so the whole order is judged together — not each line separately.
+
+1. **`run_date` = yesterday.**
+
+2. **`po_agg` — summarise each PO.** Group all of a PO's lines and compute:
+   - `total_received` = the sum of received quantity across **every** line. A PO only counts as
+     "nothing received" when this is exactly **0** — so a partially-received order is *not* caught here
+     (that's PO-08).
+   - `has_open_line` = is any line still **Open**? If yes, the order is still awaiting receipt and
+     hasn't been cancelled or closed.
+   - `expected_date` = the latest expected date **among the still-open lines** — the schedule for the
+     part that hasn't arrived.
+
+3. **`flagged` — keep the stuck POs.** Keep a PO only when **all** are true:
+   - `total_received = 0` — nothing received at all.
+   - `has_open_line` — still open (so, by definition, **not cancelled and not closed**).
+   - `expected_date < run_date − 2 days` — more than the 2-day grace past due.
+   - `expected_date >= run_date − 7 days` — the **recency window**: only POs that came due in the last
+     week, so the first rollout is a small, current batch instead of years of backlog. Set the
+     `..._lookback_days` setting to 0 to switch this off and sweep the full backlog (e.g. at go-live).
+   - `breach_date` (expected + 2 days) is stamped on the ticket as the age/SLA anchor; `days_overdue`
+     is shown for triage.
+
+4. **`ranked` + final line — cap.** Stamp the total match count on every row, order oldest-expected
+   first (most overdue surface first), keep the first 500, drop the helper column.
+
+**Auto-close:** each day the rule re-checks every open PO-07 ticket and closes it once the PO has a
+receipt, or Supply Chain cancels/closes it.
+
+### Tables & columns used
+
+**Table:** PO Table — `int_ledger_purchase_orders`. **Joins:** none (single-table, grouped by PO).
+
+| Column | Plain meaning | Role in this rule |
+|---|---|---|
+| `received_qty` | How much has been received on the line. | **The check** — summed per PO; must be 0. |
+| `status` | The PO line's lifecycle status. | **The check** — at least one line must be `Open`. |
+| `expected_date` | When the line was due to be received. | **The check** — must be >2 days (and ≤7 days) before yesterday. |
+| `order_type` | Purchase vs Transfer. | **Filter** — purchases only. |
+| `consumable_sku_qty` | Ordered quantity (consumable units). | Context (ordered qty) shown on the ticket. |
+| `po`, `destination_name`, `supplier_name` | PO number, facility, vendor. | Triage context on the ticket. |
+
+### Example of a flagged record (from the dashboard)
+
+A live exception opened by the 2026-07-06 run — **Jira KAN-1041**, routed to Procurement:
+
+| Field | Value |
+|---|---|
+| `po` | `FB-8991` |
+| `supplier_name` | `Baldor Specialty Foods` |
+| `facility` | `CK1` |
+| `po_status` | `Open` ← still open, not cancelled |
+| `expected_date` | `2026-06-29` |
+| `days_overdue` | `7` ← **the problem** |
+| `received_qty` | `0` |
+
+**Why it's flagged:** the PO was due 2026-06-29, nothing has been received, and it's still Open (not
+cancelled) 7 days later — Procurement needs to chase the delivery or cancel the order.
+
+---
+
+## PO-08 · PO Partially Received — Not Closed
+
+> **In one sentence:** find purchase orders that received **some but not all** of what was ordered
+> (short by even 1) and are **past their expected date without being closed** — the outstanding balance
+> is stuck in limbo.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | PO-08 |
+| **Rule type** | `AGING` (a "this should have happened by now" timeliness check) |
+| **Severity** | **Medium** — 2-day SLA |
+| **Owner / routed team** | Procurement |
+| **Default assignee** | Tom Becker |
+| **Jira** | Project **WIQ** · Component **PO Fulfillment** |
+| **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Grain** | **One ticket per PO** (not per line). |
+| **Key settings** | `po_partial_not_closed_days` = **3** (grace days past expected) · `po_partial_not_closed_lookback_days` = **7** (only recently-overdue POs; 0 = full backlog) |
+| **Live status** | 🟢 **Live — runs daily.** With the 7-day window it flagged **1** PO on the 2026-07-06 run (`KAN-1043`). |
+
+> **A note on units.** Ordered vs received is compared in **supplier units**: `received_qty` tracks the
+> `supplier_sku_qty` column (the quantity ordered from the vendor), not the consumable quantity.
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Framework PO-08: a Purchase PO under-received (received > 0 but < ordered) that is still not
+-- closed Y days past expected_date. PO grain; ordered compared in supplier units.
+-- N = po_partial_not_closed_days (default 3).
+SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,
+       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received,
+       SUM(COALESCE(supplier_sku_qty,0)) AS total_ordered
+FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+WHERE order_type = 'Purchase'
+  AND UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')
+GROUP BY po
+HAVING total_received > 0 AND total_received < total_ordered
+   AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- Under-received Purchase PO (received>0 but < ordered) still not closed 3 days past
+-- expected_date (framework PO-08), limited to the last 7 days. One row per PO.
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+
+WITH po_agg AS (
+  SELECT po,
+         ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(supplier_name)    AS supplier_name,
+         ANY_VALUE(po_source_system) AS system,
+         SUM(COALESCE(received_qty, 0))     AS total_received,   -- supplier units, across ALL lines
+         SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered,   -- supplier units, across ALL lines
+         LOGICAL_OR(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS not_closed,
+         STRING_AGG(DISTINCT status, ', ') AS po_status,
+         COUNT(*) AS line_count,
+         MAX(IF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED'), expected_date, NULL)) AS expected_date,
+         COUNTIF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS open_line_count
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
+  GROUP BY po),
+flagged AS (
+  SELECT *,
+         total_ordered - total_received AS shortfall_qty,
+         DATE_ADD(expected_date, INTERVAL 3 DAY) AS breach_date,
+         DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
+  FROM po_agg
+  WHERE total_received > 0                       -- received something
+    AND total_received < total_ordered - 0.001   -- but under-received (short by even 1)
+    AND not_closed                               -- not closed by Supply Chain
+    AND expected_date IS NOT NULL
+    AND expected_date < DATE_SUB(run_date, INTERVAL 3 DAY)
+    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)),   -- recency window
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY expected_date ASC
+```
+
+### Plain-English walkthrough
+
+Like PO-07, this reads only the **PO Table** and rolls each PO up to **one row**, judging the whole
+order together. The difference is *what* it looks for: a **partial** receipt that never got closed.
+
+1. **`run_date` = yesterday.**
+
+2. **`po_agg` — summarise each PO.** For every PO, sum `received_qty` and `supplier_sku_qty` across all
+   its lines (both in supplier units), record whether it's `not_closed` (any line still in a
+   non-terminal status), and take the expected date of the not-yet-closed lines.
+
+3. **`flagged` — keep the stuck partials.** Keep a PO only when **all** are true:
+   - `total_received > 0` — **something** was received (this is what separates it from PO-07).
+   - `total_received < total_ordered − 0.001` — but it's **short of what was ordered** (by even 1; the
+     tiny `0.001` just absorbs floating-point noise).
+   - `not_closed` — Supply Chain hasn't closed or cancelled it, so the shortfall is still outstanding.
+   - `expected_date < run_date − 3 days` — more than the 3-day grace past due.
+   - `expected_date >= run_date − 7 days` — the same **recency window** as PO-07 (set the lookback
+     setting to 0 to sweep the full backlog).
+   - `shortfall_qty` (ordered − received) and `days_overdue` are stamped on the ticket for triage;
+     `breach_date` (expected + 3 days) is the age/SLA anchor.
+
+4. **`ranked` + final line — cap.** Same as the other rules: count, order oldest-expected first, keep
+   the first 500.
+
+**Auto-close:** each day the rule re-checks every open PO-08 ticket and closes it once the PO is fully
+received (received ≥ ordered) or Supply Chain closes/cancels it.
+
+### Tables & columns used
+
+**Table:** PO Table — `int_ledger_purchase_orders`. **Joins:** none (single-table, grouped by PO).
+
+| Column | Plain meaning | Role in this rule |
+|---|---|---|
+| `received_qty` | How much has been received (supplier units). | **The check** — summed per PO; must be > 0 but < ordered. |
+| `supplier_sku_qty` | How much was ordered from the vendor (supplier units). | **The check** — the ordered total to compare against. |
+| `status` | The PO line's lifecycle status. | **The check** — at least one line must be non-terminal (not closed/cancelled). |
+| `expected_date` | When the line was due to be received. | **The check** — must be >3 days (and ≤7 days) before yesterday. |
+| `order_type` | Purchase vs Transfer. | **Filter** — purchases only. |
+| `po`, `destination_name`, `supplier_name` | PO number, facility, vendor. | Triage context on the ticket. |
+
+### Example of a flagged record (from the dashboard)
+
+A live exception opened by the 2026-07-06 run — **Jira KAN-1043**, routed to Procurement:
+
+| Field | Value |
+|---|---|
+| `po` | `s-20260629-1` |
+| `supplier_name` | `Ed Don` |
+| `po_status` | `PENDING` ← not closed |
+| `expected_date` | `2026-06-30` |
+| `days_overdue` | `6` |
+| `ordered_qty` | `200` |
+| `received_qty` | `198` |
+| `shortfall_qty` | `2` ← **the problem** |
+
+**Why it's flagged:** 198 of 200 were received, leaving 2 outstanding, and 6 days past the expected
+date the PO still hasn't been closed — Procurement needs to receive the balance or close it short.
+
+---
+
 ## PO-09 · PO Missing Price
 
 > **In one sentence:** find **closed** purchase-order lines (dated yesterday) that have **no vendor
@@ -1004,6 +1285,8 @@ finds nothing · ⚪ **Paused** = query exists but the rule is toggled off.
 | PO-01 | Inventory Log Missing PO Number | 🟢 Live | ✅ |
 | PO-02 | PO Record Missing | 🟡 Catalog-only (orphan-PO check; PO-14 covers the live case) | — (catalog) |
 | PO-03 | PO Over Receipt | 🟢 Live | ✅ |
+| PO-07 | PO Overdue — No Receipt | 🟢 Live | ✅ |
+| PO-08 | PO Partially Received — Not Closed | 🟢 Live | ✅ |
 | PO-09 | PO Missing Price | 🟢 Live | ✅ |
 | PO-13 | PO Table Missing PO Number | 🟢 Live | ✅ |
 | PO-14 | SKU Not on PO | 🟢 Live | ✅ |
