@@ -771,6 +771,120 @@ $0 — understating inventory and COGS until Procurement sets the real vendor pr
 
 ---
 
+## PO-11 · Correction Missing Ref ID
+
+> **In one sentence:** find inventory-ledger **correction** transactions that don't say **which
+> original transaction they're correcting** (a blank `correction_ref_id`), so the fix can't be traced.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | PO-11 |
+| **Rule type** | `NOT_NULL` (a "this field must not be blank" check, with an action filter) |
+| **Severity** | **High** — 1-day SLA |
+| **Owner / routed team** | SC Product (IMS) |
+| **Default assignee** | Sarah Chen |
+| **Jira** | Project **WIQ** · Component **Corrections** |
+| **Source table** | The Inventory Ledger (`consolidated_inventory_ledger`) |
+| **Grain** | **One ticket per ledger row** (each correction event). |
+| **Key setting** | `po_correction_missing_ref_lookback_days` = **7** (only scan the last 7 days of ledger events; keeps the initial run small) |
+| **Live status** | 🟢 **Live — runs daily.** Flagged **29** correction rows on the 2026-07-06 run (`KAN-1044`–`KAN-1072`). |
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Framework PO-11: a ledger 'Correction' transaction (l1_action LIKE '%correct%') with a
+-- NULL/blank correction_ref_id — the correcting entry doesn't reference what it fixes.
+SELECT id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,
+       consumable_sku, item_name, correction_ref_id
+FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+WHERE LOWER(l1_action) LIKE '%correct%'
+  AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- Ledger 'Correction' transaction (l1_action LIKE '%correct%') with no correction_ref_id
+-- (framework PO-11), last 7 days. One row per ledger event.
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+
+WITH flagged AS (
+  SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
+         ANY_VALUE(facility_type) AS facility_type, ANY_VALUE(system_of_origin) AS system,
+         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(l1_action) AS l1_action, ANY_VALUE(l2_action) AS l2_action,
+         ANY_VALUE(ref_order_type) AS ref_order_type, ANY_VALUE(ref_order_id) AS ref_order_id,
+         MIN(datetime_utc) AS datetime_utc
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE LOWER(l1_action) LIKE '%correct%'
+    AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')
+    AND DATE(datetime_utc) <= run_date
+    AND DATE(datetime_utc) > DATE_SUB(run_date, INTERVAL 7 DAY)   -- last 7 days incl. run_date
+  GROUP BY id),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY datetime_utc DESC
+```
+
+### Plain-English walkthrough
+
+This rule reads a single table — the **Inventory Ledger** — and checks one field on correction
+transactions. No join: we're validating the correcting row against itself.
+
+1. **`run_date` = yesterday.**
+
+2. **`flagged` — find unreferenced corrections.** Keep a ledger row only when **all** are true:
+   - `LOWER(l1_action) LIKE '%correct%'` — **the action filter**: the transaction's top-level action
+     mentions "correct" (today that's `Correction`, e.g. *Correct Input Error*). `LOWER(…)` makes it
+     case-insensitive, and the `%…%` wildcards catch "Correction", "Corrected", etc.
+   - `correction_ref_id IS NULL OR TRIM(...) = ''` — **the check**: the correction carries no reference
+     to the original transaction it's fixing.
+   - `DATE(datetime_utc)` is within the **last 7 days** (up to and including `run_date`) — the recency
+     window that keeps the first rollout small; the ledger is date-partitioned, so this also makes the
+     query cheap. Widen `po_correction_missing_ref_lookback_days` to sweep more history.
+   - `GROUP BY id` — one row per ledger transaction (`id` is the row's unique key); `ANY_VALUE`/`MIN`
+     just pull the display fields out after grouping.
+
+3. **`ranked` + final line — cap.** Stamp the total match count on every row, number them newest-first,
+   keep the newest 500, drop the helper column.
+
+**Auto-close:** each day the rule re-checks every open PO-11 ticket and closes it once that ledger
+row's `correction_ref_id` has been populated.
+
+### Tables & columns used
+
+**Table:** The Inventory Ledger — `consolidated_inventory_ledger`. **Joins:** none (single-table check).
+
+| Column | Plain meaning | Role in this rule |
+|---|---|---|
+| `l1_action` | The transaction's top-level action (Receipt, Adjust, Correction, …). | **Filter** — must contain "correct". |
+| `correction_ref_id` | The id of the original transaction this entry corrects. | **The check** — flag when null/blank. |
+| `datetime_utc` | When the transaction posted. | **Filter** — last 7 days; also sorts newest-first. |
+| `id` | The ledger row's unique key. | Identity — one ticket per row; used to auto-close. |
+| `l2_action`, `consumable_sku`, `item_name`, `facility_name`, `system_of_origin` | Sub-action, item, facility, source system. | Triage context on the ticket. |
+
+### Example of a flagged record (from the dashboard)
+
+A live exception opened by the 2026-07-06 run — **Jira KAN-1044**, routed to SC Product (IMS):
+
+| Field | Value |
+|---|---|
+| `l1_action` / `l2_action` | `Correction` / `Correct Input Error` |
+| `correction_ref_id` | *(blank)* ← **the problem** |
+| `facility` | `DISH` |
+| `consumable_sku` | `4000550` |
+| `occurred_at` | `2026-07-06` |
+
+**Why it's flagged:** the ledger records a correction to an input error, but it doesn't reference the
+original transaction it corrects — so the fix can't be traced back or reconciled against what went
+wrong.
+
+---
+
 ## PO-13 · PO Table Missing PO Number
 
 > **In one sentence:** find rows in the purchase-order **master table** that have **no PO number at
@@ -1288,6 +1402,7 @@ finds nothing · ⚪ **Paused** = query exists but the rule is toggled off.
 | PO-07 | PO Overdue — No Receipt | 🟢 Live | ✅ |
 | PO-08 | PO Partially Received — Not Closed | 🟢 Live | ✅ |
 | PO-09 | PO Missing Price | 🟢 Live | ✅ |
+| PO-11 | Correction Missing Ref ID | 🟢 Live | ✅ |
 | PO-13 | PO Table Missing PO Number | 🟢 Live | ✅ |
 | PO-14 | SKU Not on PO | 🟢 Live | ✅ |
 | TWH-01 | Transfer Warehouse Imbalance (WIP) | 🟡 Catalog-only (needs transfer-order pairing) | — (catalog) |

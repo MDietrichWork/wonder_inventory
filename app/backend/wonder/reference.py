@@ -330,6 +330,8 @@ ERROR_TYPES = [
      "owner": "Procurement", "desc": "An OPEN Purchase PO has nothing received against any of its lines and is more than X days past its expected receipt date, yet Supply Chain hasn't cancelled or closed it (framework PO-07). The PO is in limbo — either the goods are late and need chasing, or the order is dead and should be cancelled. One ticket per PO; the X-day grace is configurable (default 2). Auto-closes once a receipt is booked or the PO is cancelled/closed."},
     {"type": "PO_PARTIAL_NOT_CLOSED", "rule": "Partially-received PO closed within Y days of expected", "ruleType": "AGING",
      "owner": "Procurement", "desc": "A Purchase PO received SOME but not all of what was ordered (received > 0 and short by even 1) and, more than Y days past its expected receipt date, still hasn't been closed by Supply Chain (framework PO-08). The outstanding balance is in limbo — either the rest is still coming or the PO should be closed short. One ticket per PO; the Y-day grace is configurable (default 3). Auto-closes once the PO is fully received or closed. Ordered qty compared in supplier units (received_qty vs supplier_sku_qty)."},
+    {"type": "CORRECTION_MISSING_REF", "rule": "Correction transaction references what it corrects", "ruleType": "NOT_NULL",
+     "owner": "SC Product (IMS)", "desc": "A ledger 'Correction' transaction (l1_action containing 'correct') has a NULL/blank correction_ref_id — the correcting entry doesn't point at the original transaction it's fixing, so the correction can't be traced or reconciled (framework PO-11). One ticket per ledger row. Auto-closes once the correction_ref_id is populated."},
     {"type": "PO_MISSING_NUMBER", "rule": "PO number present (master table)", "ruleType": "NOT_NULL",
      "owner": "SC Product (IMS)", "desc": "A row in the PO master table has a NULL/blank PO number — a broken master record with nothing to receive against. Safety-net rule: currently finds 0 on live data, kept to catch upstream degradation."},
     {"type": "PO_SKU_NOT_ON_PO", "rule": "Received SKU listed on the PO", "ruleType": "REFERENTIAL",
@@ -360,6 +362,7 @@ ERROR_TYPE_LABELS = {
     "PO_MISSING_PRICE": "PO Missing Price",
     "PO_NO_RECEIPT_OVERDUE": "PO Overdue — No Receipt",
     "PO_PARTIAL_NOT_CLOSED": "PO Partially Received — Not Closed",
+    "CORRECTION_MISSING_REF": "Correction Missing Ref ID",
     "PO_MISSING_NUMBER": "PO Table Missing PO Number",
     "PO_SKU_NOT_ON_PO": "SKU Not on PO",
     "TRANSFER_ORDER_MISSING": "Transfer Order Missing (WIP)",
@@ -389,6 +392,7 @@ ERROR_TYPE_PLAIN = {
     "PO_MISSING_PRICE": "A purchase-order line has no vendor price (it's blank or $0), so the receipt can't be costed into the books.",
     "PO_NO_RECEIPT_OVERDUE": "A purchase order is past its expected delivery date, nothing has been received against it, and nobody has cancelled it — so it's sitting in limbo and needs to be chased or cancelled.",
     "PO_PARTIAL_NOT_CLOSED": "A purchase order got some but not all of what was ordered, it's past its expected date, and it hasn't been closed — so the leftover balance is stuck: either the rest still needs to arrive or the order should be closed out.",
+    "CORRECTION_MISSING_REF": "A correction was posted to the inventory ledger but it doesn't say which original transaction it's fixing — so there's no way to trace the correction back to what went wrong.",
     "PO_MISSING_NUMBER": "A row in the purchase-order master table has no PO number at all — a broken record with nothing to receive against.",
     "PO_SKU_NOT_ON_PO": "An item was received against a real purchase order, but that item isn't listed on the PO — a wrong item, an undocumented substitution, or a PO line that was never set up.",
     "TRANSFER_ORDER_MISSING": "Items were picked for a transfer order that doesn't exist in our records.",
@@ -650,6 +654,20 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
         "WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)"
      ), "enabled": True},
+    {"id": "PO-11", "name": "Correction transaction references what it corrects", "primitive": "NOT_NULL",
+     "error_type": "CORRECTION_MISSING_REF", "target_table": "consolidated_inventory_ledger",
+     "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
+     "params": {"column": "correction_ref_id", "where": {"l1_action_like": "correct"}},
+     "expression": (
+        "-- Framework PO-11: a ledger 'Correction' transaction (l1_action LIKE '%correct%') with a\n"
+        "-- NULL/blank correction_ref_id — the correcting entry doesn't reference what it fixes.\n"
+        "-- Live query (last N days): bq_finder.doc_sql.\n"
+        "SELECT id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,\n"
+        "       consumable_sku, item_name, correction_ref_id\n"
+        "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "WHERE LOWER(l1_action) LIKE '%correct%'\n"
+        "  AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')"
+     ), "enabled": True},
 ]
 
 ROUTING = [
@@ -673,6 +691,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
     {"error_type": "PO_PARTIAL_NOT_CLOSED", "team": "Procurement", "assignee": "Tom Becker",
      "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
+    {"error_type": "CORRECTION_MISSING_REF", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
+     "jira_project": "WIQ", "jira_component": "Corrections"},
     {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
      "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
     {"error_type": "PO_SKU_NOT_ON_PO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",

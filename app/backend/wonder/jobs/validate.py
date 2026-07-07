@@ -124,7 +124,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         # BigQuery (scoped rules): re-check each open ticket's specific entity against current data
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
         from ..rules.bq_finder import (recheck, recheck_price, recheck_no_receipt_overdue,
-                                        recheck_partial_not_closed,
+                                        recheck_partial_not_closed, recheck_correction_missing_ref,
                                         recheck_null_po, recheck_null_po_ledger,
                                         recheck_sku_on_po, recheck_to_exists, recheck_daily_waste_facility,
                                         recheck_daily_adjust_facility,
@@ -134,6 +134,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         price_errs = [e for e in open_errs if e.error_type == "PO_MISSING_PRICE"]
         noreceipt_errs = [e for e in open_errs if e.error_type == "PO_NO_RECEIPT_OVERDUE"]
         partial_errs = [e for e in open_errs if e.error_type == "PO_PARTIAL_NOT_CLOSED"]
+        corrref_errs = [e for e in open_errs if e.error_type == "CORRECTION_MISSING_REF"]
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
         nullpo_led_errs = [e for e in open_errs if e.error_type == "NULL_PO_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
@@ -193,6 +194,17 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: PO fully received or closed — auto-closed." % run_date,
                             resolution=res)
+                autoclosed += 1
+
+        # correction missing ref (PO-11): close once the ledger row carries a correction_ref_id
+        crids = list({(e.data_snapshot or {}).get("ledger_id") for e in corrref_errs if (e.data_snapshot or {}).get("ledger_id")})
+        crcur = recheck_correction_missing_ref(ds, crids) if crids else {}
+        for e in corrref_errs:
+            cur = crcur.get(str((e.data_snapshot or {}).get("ledger_id")))
+            if cur and not cur["missing"]:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: correction_ref_id now populated — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Correction now references the transaction it corrects."))
                 autoclosed += 1
 
         # missing PO number (master table): close once a PO number is set

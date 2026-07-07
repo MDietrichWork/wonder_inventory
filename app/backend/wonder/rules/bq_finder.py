@@ -573,6 +573,73 @@ def recheck_null_po_ledger(ds, ids):
     return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
 
 
+def _build_correction_missing_ref_sql(lookback_days: int, cap: int) -> str:
+    """PO-11: a ledger 'Correction' transaction (l1_action LIKE '%correct%') with a NULL/blank
+    correction_ref_id — a correcting entry that doesn't point at what it fixes. Ledger-row grain
+    (entity = ledger id). Scans only the last `lookback_days` days of events (recency window; keeps
+    the initial run small). State-based: dedup prevents re-tickets, the recheck auto-closes once the
+    ref id is populated. Newest-first, capped."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    return f"""WITH flagged AS (
+  SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
+         ANY_VALUE(facility_type) AS facility_type, ANY_VALUE(system_of_origin) AS system,
+         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(l1_action) AS l1_action, ANY_VALUE(l2_action) AS l2_action,
+         ANY_VALUE(ref_order_type) AS ref_order_type, ANY_VALUE(ref_order_id) AS ref_order_id,
+         MIN(datetime_utc) AS datetime_utc
+  FROM `{proj}.{dset}.{led}`
+  WHERE LOWER(l1_action) LIKE '%correct%'
+    AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')
+    AND DATE(datetime_utc) <= @run_date
+    AND DATE(datetime_utc) > DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)   -- last N days incl. run_date
+  GROUP BY id),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY datetime_utc DESC"""
+
+
+def _correction_missing_ref(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """CORRECTION_MISSING_REF (High, SC Product (IMS)) — framework PO-11. A ledger correction with no
+    correction_ref_id. One finding per ledger row (entity_key = ledger id)."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    lookback = settings.po_correction_missing_ref_lookback_days
+    sql = _build_correction_missing_ref_sql(lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "ledger_id": r.id, "l1_action": r.l1_action, "l2_action": r.l2_action,
+            "correction_ref_id": None,
+            "consumable_sku": r.consumable_sku, "item_name": r.item_name,
+            "facility": r.facility or "—", "facility_type": r.facility_type, "system": r.system or "—",
+            "ref_order_type": r.ref_order_type, "ref_order_id": r.ref_order_id,
+            "occurred_at": str(r.datetime_utc) if r.datetime_utc else None,
+            "breached_at": (r.datetime_utc.date().isoformat() if r.datetime_utc else run_date),
+        }
+        findings.append(Finding("PO-11", "CORRECTION_MISSING_REF", "High", src, r.id, snap))
+    return findings, total
+
+
+def recheck_correction_missing_ref(ds, ids):
+    """Whether each open PO-11 ticket's ledger row still lacks a correction_ref_id — close once set."""
+    if not ids:
+        return {}
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    sql = f"""SELECT CAST(id AS STRING) AS id,
+       MAX(IF(correction_ref_id IS NULL OR TRIM(correction_ref_id) = '', 1, 0)) AS still_null
+    FROM `{proj}.{dset}.{led}` WHERE CAST(id AS STRING) IN UNNEST(@ids) GROUP BY id"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", [str(i) for i in ids])])
+    return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
+
+
 def _build_sku_not_on_po_sql(backfill: bool, lookback: int, cap: int) -> str:
     """PO-14 (catalog PO-02): a consumable_sku received against an existing PO that isn't on the
     PO's lines. Ledger-sourced, so it carries the receiving l1/l2 movement."""
@@ -1188,6 +1255,12 @@ def doc_sql(rule_id):
     if rule_id == "PO-09":
         return _standalone("-- CLOSED Purchase PO lines with a $0/NULL vendor price (can't be costed).\n",
                            _build_price_sql(False, lb, cap))
+    if rule_id == "PO-11":
+        return _standalone(
+            "-- Ledger 'Correction' transaction (l1_action LIKE '%%correct%%') with no correction_ref_id\n"
+            "-- (framework PO-11), last %d days. One row per ledger event; auto-closes once the ref is set.\n"
+            % settings.po_correction_missing_ref_lookback_days,
+            _build_correction_missing_ref_sql(settings.po_correction_missing_ref_lookback_days, cap))
     if rule_id == "PO-13":
         return _standalone("-- Purchase rows in the PO master with a NULL/blank PO number (safety-net).\n",
                            _build_null_po_sql(False, lb, cap))
@@ -1215,7 +1288,8 @@ def doc_sql(rule_id):
 
 
 _FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-07": _no_receipt_overdue,
-            "PO-08": _partial_not_closed, "PO-09": _missing_price, "PO-13": _null_po,
+            "PO-08": _partial_not_closed, "PO-09": _missing_price, "PO-11": _correction_missing_ref,
+            "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
             "WASTE-DAILY": _daily_waste_facility, "ADJ-DAILY": _daily_adjust_facility,
             "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}

@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     po_partial_not_closed_days: int = 3
     po_partial_not_closed_lookback_days: int = 7
 
+    # PO-11: a ledger "Correction" transaction (l1_action LIKE '%correct%') with no correction_ref_id.
+    # Only scan the last N days of ledger events (recency window; keeps the initial run small).
+    po_correction_missing_ref_lookback_days: int = 7
+
     # --- Waste thresholds ---
     # Daily facility waste $ thresholds are per-facility-type and live in
     # reference.WASTE_DAILY_THRESHOLDS (banded High/Urgent), not here.
