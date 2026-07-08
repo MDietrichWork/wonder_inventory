@@ -4,12 +4,13 @@ import { getBootstrap, getRunInfo, apiPost } from "./api";
 import { metrics } from "./lib";
 import { Dashboard } from "./Dashboard";
 import { Workbench } from "./Workbench";
+import { Closed } from "./Closed";
 import { Drawer } from "./Drawer";
 import { Sla } from "./Sla";
 import { Admin } from "./Admin";
 
-type View = "dashboard" | "workbench" | "sla" | "admin";
-const VIEWS: View[] = ["dashboard", "workbench", "sla", "admin"];
+type View = "dashboard" | "workbench" | "closed" | "sla" | "admin";
+const VIEWS: View[] = ["dashboard", "workbench", "closed", "sla", "admin"];
 
 // Validation is a single blocking POST /api/run (no server-side progress stream), so we surface
 // staged status text that advances on a timer — enough to show the run is live and touching Jira.
@@ -118,7 +119,7 @@ export function App() {
       if (t && t.matches && t.matches("input,select,textarea")) { if (e.key === "Escape") (t as HTMLInputElement).blur(); return; }
       if (e.key === "Escape") { setOpenPk(null); return; }
       if (e.key === "/") { e.preventDefault(); setView("workbench"); setTimeout(() => document.querySelector<HTMLInputElement>(".toolbar input[type=search]")?.focus(), 0); return; }
-      const idx = ["1", "2", "3", "4"].indexOf(e.key);
+      const idx = ["1", "2", "3", "4", "5"].indexOf(e.key);
       if (idx > -1) setView(VIEWS[idx]);
     };
     document.addEventListener("keydown", h);
@@ -142,7 +143,7 @@ export function App() {
         <span className="run-pill"><span className="dot" /> Validation run <b>{data.meta.runDate}</b> · processed <b>{data.meta.today}</b></span>
         <span className="run-pill">JIRA project <b>{data.meta.jiraProject}</b></span>
         <span className="spacer" />
-        <span className="tip">Press <span className="kbd">1</span>–<span className="kbd">4</span> · <span className="kbd">/</span> search · <span className="kbd">Esc</span> close</span>
+        <span className="tip">Press <span className="kbd">1</span>–<span className="kbd">5</span> · <span className="kbd">/</span> search · <span className="kbd">Esc</span> close</span>
         <button className="btn sm" disabled={!!busy} onClick={runValidation}>{busy === "run" ? <><span className="spinner sm" /> Running…</> : "↻ Run validation"}</button>
         <button className="btn sm" disabled={!!busy} onClick={() => runAction("sync", "/sync")}>{busy === "sync" ? "Syncing…" : "⟲ Sync from Jira"}</button>
         <span className="user"><span className="avatar">MD</span> Mike Dietrich · Accounting</span>
@@ -152,6 +153,7 @@ export function App() {
         <div className="nav-section">Workspace</div>
         <NavItem active={view === "dashboard"} onClick={() => setView("dashboard")} icon="▦" label="Reporting Dashboard" />
         <NavItem active={view === "workbench"} onClick={() => setView("workbench")} icon="▤" label="Exception Workbench" badge={m.open} />
+        <NavItem active={view === "closed"} onClick={() => setView("closed")} icon="✓" label="Closed / Resolved" badge={data.exceptions.length - m.open} />
         <NavItem active={view === "sla"} onClick={() => setView("sla")} icon="◷" label="Turnaround / SLA" />
         <NavItem active={view === "admin"} onClick={() => setView("admin")} icon="⚙" label="Rule & Routing Admin" />
         <div className="grow" />
@@ -167,6 +169,7 @@ export function App() {
       <main className="main">
         {view === "dashboard" && <Dashboard data={data} drillTo={drillTo as any} />}
         {view === "workbench" && <Workbench data={data} drill={drill} clearDrill={() => setDrill(null)} onOpen={(e) => setOpenPk(e.pk)} refresh={load} />}
+        {view === "closed" && <Closed data={data} onOpen={(e) => setOpenPk(e.pk)} />}
         {view === "sla" && <Sla data={data} drillTo={drillTo} ownerQueue={ownerQueue} openExc={openExc} />}
         {view === "admin" && <Admin data={data} refresh={load} />}
       </main>

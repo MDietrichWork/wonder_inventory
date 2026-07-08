@@ -37,6 +37,7 @@ export interface Exception {
 
 export interface Bootstrap {
   meta: { today: string; runDate: string; jiraProject: string; jiraBaseUrl: string | null };
+  settings: { closedRetentionDays: number; closedPastWindow: number };
   facilities: { id: string; type: string }[];
   systems: string[];
   sourceTables: string[];

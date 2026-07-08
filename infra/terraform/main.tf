@@ -14,6 +14,7 @@ locals {
     "artifactregistry.googleapis.com",
     "bigquery.googleapis.com",
     "iam.googleapis.com",
+    "cloudscheduler.googleapis.com",
   ]
 }
 
@@ -53,6 +54,15 @@ resource "google_project_iam_member" "run_roles" {
 # BigQuery data read is granted on the source project (may differ from the deploy project).
 resource "google_project_iam_member" "run_bq_data_viewer" {
   project = var.bq_project
+  role    = "roles/bigquery.dataViewer"
+  member  = "serviceAccount:${google_service_account.run.email}"
+}
+
+# ERP standard-cost data lives in a SECOND project (var.erp_bq_project). The COST rules read it,
+# so the runtime SA needs dataViewer there as well. Skipped only if it's the same project as bq_project.
+resource "google_project_iam_member" "run_erp_bq_data_viewer" {
+  count   = var.erp_bq_project == var.bq_project ? 0 : 1
+  project = var.erp_bq_project
   role    = "roles/bigquery.dataViewer"
   member  = "serviceAccount:${google_service_account.run.email}"
 }
@@ -172,6 +182,10 @@ resource "google_cloud_run_v2_service" "app" {
         value = var.bq_project
       }
       env {
+        name  = "ERP_PROJECT"
+        value = var.erp_bq_project
+      }
+      env {
         name  = "BQ_DATASET"
         value = var.bq_dataset
       }
@@ -238,4 +252,36 @@ resource "google_cloud_run_v2_service_iam_member" "public" {
   name     = google_cloud_run_v2_service.app.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+# --- Daily validation run: Cloud Scheduler -> POST /api/run ---
+# The prod stand-in for the in-app APScheduler (which can't fire reliably while Cloud Run scales to
+# zero). Keep SCHEDULER_ENABLED=false on the service so the run isn't double-triggered.
+resource "google_cloud_scheduler_job" "daily_run" {
+  name        = "${var.service_name}-daily-run"
+  region      = var.region
+  description = "Nightly Wonder DQ validation (prior data day): open/auto-close tickets."
+  schedule    = var.scheduler_schedule
+  time_zone   = var.scheduler_time_zone
+
+  http_target {
+    http_method = "POST"
+    uri         = "${google_cloud_run_v2_service.app.uri}/api/run"
+
+    # No SSO this launch: the service is public (allow_unauthenticated=true), so the call is
+    # unauthenticated. When auth lands, set allow_unauthenticated=false and add an oidc_token
+    # block here (service_account_email = a dedicated invoker SA, audience = the service URL).
+    dynamic "oidc_token" {
+      for_each = var.allow_unauthenticated ? [] : [1]
+      content {
+        service_account_email = google_service_account.run.email
+        audience              = google_cloud_run_v2_service.app.uri
+      }
+    }
+  }
+
+  depends_on = [
+    google_project_service.apis,
+    google_cloud_run_v2_service.app,
+  ]
 }

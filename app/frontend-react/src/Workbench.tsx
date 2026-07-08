@@ -41,6 +41,9 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
 
   const rows = useMemo(() => {
     const out = exc.filter((e) => {
+      // Open-only by default so triage stays clean — closed/auto-closed tickets live on the Closed
+      // screen. A dashboard/SLA drill filters against all exceptions so those drilldowns still work.
+      if (!drill && !e.isOpen) return false;
       if (drill && !drill.test(e)) return false;
       if (f.facility && e.facility !== f.facility) return false;
       if (f.system && e.system !== f.system) return false;
@@ -167,7 +170,7 @@ export function Workbench({ data, drill, clearDrill, onOpen, refresh }: {
   );
 }
 
-function Select({ v, set, opts, all, labelFn }: { v: string; set: (v: string) => void; opts: string[]; all: string; labelFn?: (o: string) => string }) {
+export function Select({ v, set, opts, all, labelFn }: { v: string; set: (v: string) => void; opts: string[]; all: string; labelFn?: (o: string) => string }) {
   return (
     <select value={v} onChange={(e) => set(e.target.value)}>
       <option value="">{all}</option>

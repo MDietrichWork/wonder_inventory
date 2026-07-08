@@ -15,6 +15,11 @@ bq_project      = "wonder-dw-prod-brd"
 bq_dataset      = "inventory"
 bq_ledger_table = "consolidated_inventory_ledger"
 bq_po_table     = "int_ledger_purchase_orders"
+erp_bq_project  = "wonder-raw-prod"        # ERP standard-cost project (COST rules); separate read grant
+
+# Daily validation run (Cloud Scheduler -> POST /api/run)
+scheduler_schedule  = "15 0 * * *"         # 00:15, just after the data day closes
+scheduler_time_zone = "America/Los_Angeles"
 
 # Jira (sandbox values today; company Jira at go-live)
 jira_base_url    = "https://dietrichcoding.atlassian.net"

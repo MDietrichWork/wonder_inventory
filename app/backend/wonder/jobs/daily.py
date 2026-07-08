@@ -30,4 +30,8 @@ def run_daily(db, run_date: Optional[str] = None) -> ValidationRun:
         run_date = max(yesterday_pst(), dates[-1])
     ds = get_datasource([d for d in dates if d != run_date] + [run_date])
     sink = get_ticket_sink()
-    return run_validation(db, run_date, ds, sink)
+    run = run_validation(db, run_date, ds, sink)
+    # Enforce closed-ticket retention on the daily cadence (0 = keep forever). Local-only deletion.
+    from .. import retention
+    retention.purge_closed(db, retention.get_retention_days(db))
+    return run

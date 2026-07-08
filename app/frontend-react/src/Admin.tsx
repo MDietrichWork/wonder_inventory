@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { Bootstrap } from "./types";
 import { sevPill } from "./Workbench";
 import { labelFor } from "./lib";
-import { apiPatch, putThresholds, putWasteCombos } from "./api";
+import { apiPatch, putThresholds, putWasteCombos, putRetention, purgeClosed } from "./api";
 
 // A rule's live status. Two switches decide whether it actually produces tickets: the Enabled
 // toggle (user-controlled) AND whether a detector query is wired into the engine (data.wired).
@@ -101,6 +101,8 @@ export function Admin({ data, refresh }: { data: Bootstrap; refresh: () => Promi
         </div>
 
         <ThresholdEditor data={data} refresh={refresh} />
+
+        <RetentionEditor data={data} refresh={refresh} />
 
         <div className="card" style={{ marginTop: 12 }}>
           <h2>SLA targets per severity</h2>
@@ -378,6 +380,70 @@ function ThresholdEditor({ data, refresh }: { data: Bootstrap; refresh: () => Pr
         {msg && <span className="tip">{msg}</span>}
       </div>
       <div className="muted-note">Urgent should be ≥ High. Changes persist to the database and take effect on the next validation run.</div>
+    </div>
+  );
+}
+
+// Closed-ticket retention: how long resolved / auto-closed tickets are kept before the daily run
+// purges them from the database (Jira stays the system of record). 0 = keep forever. Persists to
+// PUT /api/retention; "Purge now" runs POST /api/retention/purge immediately.
+function RetentionEditor({ data, refresh }: { data: Bootstrap; refresh: () => Promise<void> | void }) {
+  const saved = data.settings?.closedRetentionDays ?? 30;
+  const pastWindow = data.settings?.closedPastWindow ?? 0;
+  const [days, setDays] = useState(saved);
+  const [busy, setBusy] = useState<null | "save" | "purge">(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const dirty = days !== saved;
+
+  const save = async () => {
+    if (!dirty) return;
+    setBusy("save"); setMsg(null);
+    try {
+      const res = await putRetention(days);
+      await refresh();
+      setMsg(res.days === 0 ? "Saved — closed tickets are kept indefinitely." : `Saved — keeping closed tickets for ${res.days} days.`);
+    } catch (e) { setMsg(`Save failed: ${String(e)}`); }
+    finally { setBusy(null); }
+  };
+
+  const purge = async () => {
+    if (pastWindow > 0 && !confirm(`Permanently delete ${pastWindow} closed ticket(s) older than the retention window? This removes them from the local database (Jira is unaffected).`)) return;
+    setBusy("purge"); setMsg(null);
+    try {
+      const res = await purgeClosed();
+      await refresh();
+      setMsg(`Purged ${res.purged} closed ticket${res.purged === 1 ? "" : "s"} older than ${res.olderThanDays} days.`);
+    } catch (e) { setMsg(`Purge failed: ${String(e)}`); }
+    finally { setBusy(null); }
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 12 }}>
+      <h2>Data retention <span className="hint">how long closed tickets are kept — editable &amp; persisted</span></h2>
+      <div className="muted-note" style={{ marginBottom: 10 }}>
+        Auto-closed and resolved tickets are kept for review, then removed from the database once older than the window below.
+        The daily validation run purges them automatically; use <b>Purge now</b> to run it immediately. Jira remains the system of record.
+      </div>
+      <FormRow label="Keep closed tickets for">
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input type="number" min={0} max={3650} step={1} value={days}
+            onChange={(e) => setDays(Math.max(0, Math.floor(Number(e.target.value) || 0)))} style={inp} />
+          <span className="tip">days <b>(0 = keep forever)</b></span>
+        </span>
+      </FormRow>
+      <div className="muted-note" style={{ margin: "4px 0 10px" }}>
+        {days === 0
+          ? "Closed tickets are currently kept indefinitely."
+          : <>Currently <b>{pastWindow}</b> closed ticket{pastWindow === 1 ? " is" : "s are"} past the {saved}-day window.</>}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <button className="btn primary sm" disabled={busy != null || !dirty} onClick={save}>{busy === "save" ? "Saving…" : "Save"}</button>
+        <button className="btn sm" disabled={busy != null || saved === 0 || pastWindow === 0} onClick={purge}
+          title={saved === 0 ? "Retention is off (keep forever)" : pastWindow === 0 ? "Nothing past the window" : "Delete closed tickets older than the window"}>
+          {busy === "purge" ? "Purging…" : "Purge now"}
+        </button>
+        {msg && <span className="tip">{msg}</span>}
+      </div>
     </div>
   );
 }

@@ -58,6 +58,22 @@ export async function putWasteCombos(
   return r.json();
 }
 
+export async function putRetention(days: number): Promise<{ days: number }> {
+  const r = await fetch(`${API}/retention`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ days }),
+  });
+  if (!r.ok) throw new Error(`retention update failed: ${r.status}`);
+  return r.json();
+}
+
+export async function purgeClosed(): Promise<{ purged: number; olderThanDays: number }> {
+  const r = await fetch(`${API}/retention/purge`, { method: "POST" });
+  if (!r.ok) throw new Error(`purge failed: ${r.status}`);
+  return r.json();
+}
+
 export async function getBreakdown(pk: number): Promise<any> {
   const r = await fetch(`${API}/exceptions/${pk}/breakdown`);
   return r.json();

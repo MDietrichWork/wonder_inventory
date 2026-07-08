@@ -99,6 +99,17 @@ class WasteCombosBody(BaseModel):
     combos: List[WasteCombo]
 
 
+class RetentionBody(BaseModel):
+    days: int
+
+    @field_validator("days")
+    @classmethod
+    def _valid_days(cls, v: int) -> int:
+        if v < 0 or v > 3650:
+            raise ValueError("days must be between 0 (keep forever) and 3650")
+        return v
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -238,6 +249,30 @@ def update_waste_combos(body: WasteCombosBody, db=Depends(get_db)):
     enabled_count = sum(1 for v in desired.values() if v)
     return {"total": len(desired), "enabled": enabled_count,
             "added": added, "removed": removed, "updated": updated}
+
+
+@router.put("/retention")
+def update_retention(body: RetentionBody, db=Depends(get_db)):
+    """Set how many days closed / auto-closed tickets are kept before the daily run purges them
+    (0 = keep forever). Persists to app_setting + an audit log."""
+    from .. import retention
+    before = retention.get_retention_days(db)
+    after = retention.set_retention_days(db, body.days)
+    if before != after:
+        db.add(AuditLog(actor="Mike Dietrich", action="edit_retention", entity="app_setting",
+                        entity_id=retention.RETENTION_KEY, before={"days": before},
+                        after={"days": after}, at=_now()))
+    db.commit()
+    return {"days": after}
+
+
+@router.post("/retention/purge")
+def purge_retention(db=Depends(get_db)):
+    """Manually purge closed tickets older than the configured retention window (local-only)."""
+    from .. import retention
+    days = retention.get_retention_days(db)
+    n = retention.purge_closed(db, days)
+    return {"purged": n, "olderThanDays": days}
 
 
 @router.post("/sync")

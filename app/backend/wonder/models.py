@@ -113,6 +113,14 @@ class WasteActionCombo(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
+class AppSetting(Base):
+    """Generic key-value store for small app-wide settings edited in the Admin UI (currently the
+    closed-ticket retention window). Read with a code default when the key is absent."""
+    __tablename__ = "app_setting"
+    key: Mapped[str] = mapped_column(String(48), primary_key=True)
+    value: Mapped[str] = mapped_column(String(64))
+
+
 class AuditLog(Base):
     __tablename__ = "audit_log"
     id: Mapped[int] = mapped_column(primary_key=True)

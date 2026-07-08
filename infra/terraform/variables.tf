@@ -55,6 +55,12 @@ variable "bq_project" {
   type        = string
 }
 
+variable "erp_bq_project" {
+  description = "Project that holds the ERP standard-cost dataset (read by the COST rules; separate from bq_project). The runtime SA is granted bigquery.dataViewer here too."
+  type        = string
+  default     = "wonder-raw-prod"
+}
+
 variable "bq_dataset" {
   type    = string
   default = "inventory"
@@ -93,4 +99,17 @@ variable "jira_api_token" {
   description = "Jira API token. Provide via TF_VAR_jira_api_token (env) — never commit it."
   type        = string
   sensitive   = true
+}
+
+# --- Daily validation run (Cloud Scheduler -> POST /api/run) ---
+variable "scheduler_schedule" {
+  description = "Cron for the daily validation run. Default 00:15 (see scheduler_time_zone) — just after the prior data day closes."
+  type        = string
+  default     = "15 0 * * *"
+}
+
+variable "scheduler_time_zone" {
+  description = "Time zone for scheduler_schedule (IANA name)."
+  type        = string
+  default     = "America/Los_Angeles"
 }

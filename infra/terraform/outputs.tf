@@ -17,3 +17,8 @@ output "runtime_service_account" {
   description = "Cloud Run runtime SA (grant BigQuery read on the source dataset if not project-wide)."
   value       = google_service_account.run.email
 }
+
+output "daily_run_scheduler_job" {
+  description = "Cloud Scheduler job that POSTs the nightly validation run to /api/run."
+  value       = google_cloud_scheduler_job.daily_run.name
+}

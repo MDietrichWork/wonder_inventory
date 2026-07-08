@@ -163,9 +163,16 @@ def build_bootstrap(db) -> Dict:
         # Does this rule have a live detector wired in? (False = catalog-only — defined but inert.)
         _r["wired"] = _r["id"] in _wired
 
+    # Closed-ticket retention (DB-backed, Admin-editable). Also surface how many closed tickets are
+    # currently past the window so the Admin card can show it without a second request.
+    from .. import retention
+    retention_days = retention.get_retention_days(db)
+
     return {
         "meta": {"today": today, "runDate": today, "jiraProject": settings.jira_project_key,
                  "jiraBaseUrl": (settings.jira_base_url if settings.ticket_sink == "jira" else None)},
+        "settings": {"closedRetentionDays": retention_days,
+                     "closedPastWindow": retention.closed_past_window(db, retention_days)},
         "facilities": reference.FACILITIES,
         "systems": reference.SYSTEMS,
         "sourceTables": ["unified_ledger", "po_table"],
