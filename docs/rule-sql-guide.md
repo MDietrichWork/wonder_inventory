@@ -62,7 +62,7 @@ Each rule is documented with the same six parts:
 | **Default assignee** | Sarah Chen |
 | **Jira** | Project **WIQ** · Component **Ledger Ingest** |
 | **Source table** | The Inventory Ledger (`consolidated_inventory_ledger`) |
-| **Live status** | ✅ **Live — runs in the daily validation job.** It is switched on as a safety-net. On today's data it finds **0 rows** (every PO receipt already carries a PO number), so it creates no tickets right now — but it will the moment a blank-PO receipt appears. |
+| **Live status** | ✅ **Live — runs in the daily validation job, and it fires.** Identifying receipts by their movement action surfaces a real, ongoing problem: **Fishbowl / facility CK1** receipts land with both `ref_order_type` and the PO number blank (~13 in the last 30 days; 16–40/month for the past 8 months). The prior version keyed on `ref_order_type = 'Purchase Order'` and matched **0 rows in all of history** — it was watching the wrong column and missed every one of these. The filter covers both receipt actions — `'PO Receipt'` (Fishbowl/Extensiv/Shiphero/RMX) and Pantry's `'Received'` — so every source system's receipts are checked. |
 
 ### The SQL
 
@@ -73,12 +73,22 @@ runs and is what you see in the Admin → Rule editor.
 #### Catalog SQL (the documented definition)
 
 ```sql
--- A PO-order-type receiving row that carries no PO id (ref_order_id NULL/blank).
+-- A PO-receipt row (identified by its movement action) that carries no PO id (ref_order_id NULL/blank).
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
-SELECT id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,
-       consumable_sku, item_name, ref_order_type, ref_order_id
+
+SELECT
+  id,
+  datetime_utc,
+  facility_name,
+  system_of_origin,
+  l1_action,
+  l2_action,
+  consumable_sku,
+  item_name,
+  ref_order_type,
+  ref_order_id
 FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-WHERE ref_order_type = 'Purchase Order'
+WHERE (l2_action = 'PO Receipt' OR (l2_action = 'Received' AND system_of_origin = 'Pantry'))
   AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '')
   AND DATE(datetime_utc) = run_date
 ORDER BY datetime_utc DESC
@@ -88,20 +98,19 @@ ORDER BY datetime_utc DESC
 
 ```sql
 -- A PO-order-type receiving row in the ledger with a NULL/blank PO number (safety-net).
-DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- daily batch target = the just-closed day (yesterday PST in prod)
 
 WITH flagged AS (
   SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
          ANY_VALUE(system_of_origin) AS system, ANY_VALUE(consumable_sku) AS consumable_sku,
          ANY_VALUE(item_name) AS item_name, ANY_VALUE(l1_action) AS l1_action,
-         ANY_VALUE(l2_action) AS l2_action, MIN(datetime_utc) AS datetime_utc
+         ANY_VALUE(l2_action) AS l2_action, ANY_VALUE(ref_order_type) AS ref_order_type,
+         MIN(datetime_utc) AS datetime_utc
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-  WHERE ref_order_type = 'Purchase Order'
-    AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '')
-    AND DATE(datetime_utc) = run_date
+  WHERE (l2_action = 'PO Receipt' OR (l2_action = 'Received' AND system_of_origin = 'Pantry'))
+    AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '') AND DATE(datetime_utc) = run_date
   GROUP BY id),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
-                  ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
 SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY datetime_utc DESC
 ```
 
@@ -124,7 +133,7 @@ job always checks the previous, fully-closed day, because today's data is still 
 
 **Step 1 — `flagged`: find the problem rows.** This step builds the list of offending receipts.
 - `FROM … consolidated_inventory_ledger` — look in the **Inventory Ledger** (one row per inventory movement).
-- `WHERE ref_order_type = 'Purchase Order'` — keep only **purchase-order receipts** (inventory arriving because we bought it).
+- `WHERE (l2_action = 'PO Receipt' OR (l2_action = 'Received' AND system_of_origin = 'Pantry'))` — keep only **purchase-order receipts** (inventory arriving because we bought it), identified by the **movement action**. We deliberately key on the *action* and not on `ref_order_type = 'Purchase Order'`: on exactly the broken rows this rule exists to catch, `ref_order_type` is itself blank, so keying on it would let those receipts slip through. The movement action stays populated even when the reference fields don't. Two action labels are in play across the source systems — `'PO Receipt'` (Fishbowl, Extensiv, Shiphero, RMX) and `'Received'` (Pantry) — so we cover both. The `'Received'` arm is **scoped to Pantry** on purpose: a different source, `system_of_origin = 'System'`, also emits `'Received'` for internal negative-quantity depletion/reversal entries that are almost never PO-linked, and pulling those in would flood this Urgent queue with false positives.
 - `AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '')` — **the heart of the rule**: of those, keep only the ones whose **PO number is missing** — either truly empty (`IS NULL`) or only blank spaces (`TRIM(…) = ''`, where `TRIM` strips spaces so `"   "` counts as empty).
 - `AND DATE(datetime_utc) = run_date` — and only ones that happened **yesterday**.
 - `GROUP BY id` — collapse the result to **one row per ledger record** (`id` is each record's unique number), so a bad receipt is listed once, not repeatedly.
@@ -141,7 +150,8 @@ helper columns:
 datetime_utc DESC` does three things: keep only rows numbered **500 or lower** — a **safety cap** so
 one bad-data day can never create more than 500 tickets and flood the queue; drop the helper `rn`
 column from the output (`EXCEPT(rn)` means "every column except this one"); and present what's left
-**newest-first**. On a normal day there are far fewer than 500 matches — today there are **0**.
+**newest-first**. On a normal day there are far fewer than 500 matches — currently on the order of a
+handful per week (the Fishbowl / CK1 blank-PO receipts).
 
 ### Tables & columns used
 
@@ -149,239 +159,719 @@ column from the output (`EXCEPT(rn)` means "every column except this one"); and 
 
 | Column | Plain meaning | Role in this rule |
 |---|---|---|
-| `ref_order_type` | What kind of order the movement relates to (e.g. *Purchase Order*, *Transfer Order*). | **Filter** — keep only `Purchase Order` rows. |
+| `l2_action` | The movement's sub-action (e.g. *PO Receipt*, *Received*, *Transfer Out*). | **Filter** — keep `PO Receipt` rows, plus `Received` rows from Pantry (identifies a PO receipt by its action). |
+| `system_of_origin` (in filter) | The upstream system the record came from. | **Filter** — scopes the `Received` arm to Pantry, excluding `System`-origin depletion/reversal noise. |
 | `ref_order_id` | The purchase-order number the receipt belongs to. | **The check** — flag when this is null or blank. |
 | `datetime_utc` | Exact UTC timestamp of the movement. | **Filter** — keep only yesterday; also sort newest-first. |
 | `id` | Unique id for the Inventory Ledger row. | Identifies the exact record to fix; used as the ticket fingerprint. |
 | `facility_name` | Which facility recorded the movement. | Triage — tells the owner *where* it happened. |
-| `system_of_origin` | The upstream system the record came from (Pantry / Ship Hero / Fishbowl). | Triage — points to where the data was entered. |
-| `l1_action` / `l2_action` | The movement's action category and sub-action (e.g. *Add* / *Receipt*). | Context — what kind of movement this was. |
+| `system_of_origin` | The upstream system the record came from (Pantry / Ship Hero / Fishbowl / Extensiv / RMX). | Triage — points to where the data was entered. |
+| `ref_order_type` | What kind of order the movement relates to (e.g. *Purchase Order*). | Context/snapshot only — on the flagged rows this is typically **blank**, which is why the rule keys on `l2_action` instead. |
+| `l1_action` | The movement's action category (e.g. *Add*). | Context — what kind of movement this was. |
 | `consumable_sku` | The item identifier (SKU) involved. | Triage — *what* item came in. |
 | `item_name` | Human-readable item name. | Triage — the item in plain words. |
 
-### Example of a flagged record (illustrative)
+### Example of a flagged record (real)
 
-> PO-01 is live but finds **0 rows on today's data** (every PO receipt is currently numbered), so
-> there are no real exceptions to show yet. The row below is a **hand-built illustration** of what a
-> catch will look like the first time a blank-PO receipt lands — not an actual record from the
-> warehouse.
-
-A receipt that arrived yesterday, was tagged as a Purchase Order receipt, but came in with the PO
-number blank:
+> This is a **real** row the rule catches on live data (Fishbowl / CK1, recorded 2026-07-13). It is a
+> PO receipt — the movement action says so — but it arrived with **both** the PO number *and* the
+> `ref_order_type` blank, which is exactly why the rule keys on `l2_action` rather than `ref_order_type`.
 
 | Column | Value |
 |---|---|
-| `id` | `led_8f3a91c4` |
-| `datetime_utc` | `2026-06-28 14:22:07 UTC` |
-| `facility_name` | `Dallas – Lone Star Kitchen` |
-| `system_of_origin` | `Ship Hero` |
-| `l1_action` / `l2_action` | `Add` / `Receipt` |
-| `consumable_sku` | `CSK-104882` |
-| `item_name` | `Shredded Mozzarella, 5 lb` |
-| `ref_order_type` | `Purchase Order` |
+| `id` | `1c13ad9a6689c9b34a567d2936c7a4d9` |
+| `datetime_utc` | `2026-07-13 13:53:39 UTC` |
+| `facility_name` | `CK1` |
+| `system_of_origin` | `Fishbowl` |
+| `l1_action` / `l2_action` | `Add` / `PO Receipt` |
+| `consumable_sku` | `5001001` |
+| `item_name` | `Red Pepper Flakes, Crushed, Bulk` |
+| `ref_order_type` | *(blank)* ← why keying on `ref_order_type = 'Purchase Order'` missed it |
 | `ref_order_id` | *(blank)* ← **the problem** |
 
-**Why it's flagged:** it claims to be a purchase-order receipt, but with no PO number we can't match
-it to what was ordered, can't validate quantity or price, and can't close out the PO — hence the
-**Urgent** severity and same-day SLA.
+**Why it's flagged:** its movement action marks it a purchase-order receipt, but with no PO number we
+can't match it to what was ordered, can't validate quantity or price, and can't close out the PO —
+hence the **Urgent** severity and same-day SLA.
+
+> **Coverage note (for the data team).** Two receipt-action labels are in play across the source
+> systems: `'PO Receipt'` (Fishbowl, Extensiv, Shiphero, RMX) and `'Received'` (Pantry, ≈22k rows in
+> the last 30 days, all currently carrying a PO number). The filter covers both, but scopes the
+> `'Received'` arm to **Pantry** — `system_of_origin = 'Pantry'`. That scope is deliberate: a separate
+> source, `system_of_origin = 'System'`, *also* emits `l2_action = 'Received'`, but for **internal
+> negative-quantity depletion/reversal entries** that are almost never PO-linked (2 of 437 rows over
+> 90 days carried a PO). Those are not purchase-order receipts, so including them would generate ~40
+> false-positive Urgent tickets a month. If `'System'` is ever confirmed to be a real receiving flow
+> that *should* carry PO numbers, drop the Pantry scope to bring it in. There is also a rare Pantry
+> variant, `'Received with Other Quality Issue'`; it's not in the filter — reopen this note if it ever
+> starts arriving with blank PO numbers.
 
 ---
 
 ## PO-03 · PO Over Receipt
 
-> **In one sentence:** find purchase orders that received stock yesterday where the **total received
-> has gone over what was ordered** — or where the receipt came in on a different unit of measure than
-> the order.
+> **In one sentence:** find purchase orders that received stock where **more came in than was
+> ordered** — checked **two independent ways** (the PO's own receipt count *and* the inventory
+> ledger's cumulative receipts) so we catch it whether the discrepancy shows up on the buying side,
+> the warehouse side, or both.
+
+### 📝 Change note — for data-analyst sign-off (Jonny Li)
+
+> **Status: awaiting sign-off.** This documents a July 2026 refinement of PO-03. It reflects Jonny's
+> two directions — (1) re-base off the **IMS SKU** rather than the translated *consumable* SKU, and
+> (2) make it a **two-way match** (the PO's own receipt count *and* the ledger cumulative) — plus one
+> deviation from the literal instruction that the live data forced (see ⚠️ below).
+
+**What changed**
+
+| | Before | After |
+|---|---|---|
+| **Item key / grain** | `consumable_sku` (a downstream translation) | **`ims_sku`** (raw id on both tables); one ticket per `(PO, IMS SKU)` |
+| **Signals** | one — ledger receipts vs ordered | **two** — Layer 1: PO's own `received_qty` vs `ims_sku_qty` (packaging); Layer 2: ledger `SUM(consumable_quantity_change)` vs `consumable_sku_qty` (base) |
+| **Flag condition** | ledger over by >30% (or UoM mismatch) | **either** layer over by >30% (or UoM mismatch) |
+| **Threshold** | 30% High / 100% Urgent | unchanged (30% / 100%) |
+
+**Why — evidence from live prod data**
+
+1. **Consumable was the noise source, not the base unit.** Keeping the same base-unit comparison but
+   re-keying it from `consumable_sku` to `ims_sku` dropped the over-receipt count **≈109 → ≈34** on a
+   recent 45-day window — the translation was fanning one order across rows. This is Jonny's exact
+   point, confirmed.
+2. **The two layers genuinely diverge, in one direction.** Over ~2,281 recently-touched pairs, every
+   PO-books over-receipt is *also* a ledger over-receipt (PO-only = 0), and the ledger catches extra
+   **ledger-only** cases where the PO's own count looks clean — the case the single-signal rule missed
+   (see the `PO 61920` Roncadin example below).
+
+**⚠️ One deviation that needs your confirmation, Jonny**
+
+The instruction was to use IMS quantities on both sides. On the ledger that isn't viable, so **Layer 2
+uses `consumable_quantity_change` (base units), not `ims_quantity_change`:**
+
+- Ledger `ims_quantity_change` is actually stored in the **base** unit — it equals
+  `consumable_quantity_change` ~90% of rows, and for the same IMS SKU the ledger's `ims_uom` matches
+  the PO's `ims_uom` only ~5% of the time. Comparing ledger-IMS-qty to PO `ims_sku_qty` gives
+  base-vs-packaging nonsense (e.g. 50 cases ordered vs 8,400 oz received → a fake 168× overage).
+- Ledger `supplier_quantity_change` *is* in packaging units but is **NULL for 100% of Pantry
+  receipts** (the largest receiving flow), so it can't be used universally.
+- `consumable_quantity_change` is **100% populated** and is the only cross-system-reliable ledger
+  measure — hence Layer 2 runs in base units, while Layer 1 (PO-only) stays in packaging units. Each
+  layer therefore compares like-unit-to-like-unit and never crosses the base↔packaging boundary.
+
+*Please confirm the `consumable_quantity_change` substitution for Layer 2, or tell us the column /
+conversion you'd prefer.*
 
 ### At a glance
 
 | | |
 |---|---|
 | **Rule number** | PO-03 |
-| **Rule type** | `RANGE` (a "the value must stay within an expected range" check — here, received vs ordered) |
-| **Severity** | **Banded by how far over:** 30–99% over → **High** (a supply-chain signal, e.g. an over-shipment); ≥100% over (received ≥ 2× ordered) → **Urgent** (a likely receiving error like a double-scan). A unit-of-measure mismatch is split off as its own error type (`PO_UOM_MISMATCH`). |
+| **Rule type** | `RANGE` (a "the value must stay within an expected range" check — here, received vs ordered), evaluated as a **two-way match** |
+| **Grain** | **One ticket per (PO, IMS SKU)** — was per (PO, consumable SKU). |
+| **Severity** | **Banded by how far over:** 30–99% over → **High** (a supply-chain signal, e.g. an over-shipment); ≥100% over (received ≥ 2× ordered) → **Urgent** (a likely receiving error like a double-scan). A pure unit-of-measure mismatch (neither layer over) is split off as its own error type (`PO_UOM_MISMATCH`). |
 | **Owner / routed team** | Field Ops |
 | **Default assignee** | Diego Alvarez |
 | **Jira** | Project **WIQ** · Component **Receiving** |
-| **Source tables** | Inventory Ledger **⋈** PO Table (joined) |
-| **Live status** | 🟢 **Live — runs daily.** Flagged **0** on yesterday's data (no over-receipts booked yesterday); it fires whenever a PO's cumulative receipts cross the over-receipt threshold. |
+| **Source tables** | Inventory Ledger **⋈** PO Table (joined on `ref_order_id` ⇄ `po` and **`ims_sku`** ⇄ `ims_sku`) |
+| **Live status** | 🟢 **Live — runs daily.** Flagged **0** on 2026-07-13 (no over-receipts booked that day); a 14-day backfill window catches **5**, all confirmed by *both* layers. It fires whenever a PO's own receipts **or** its ledger cumulative cross the over-receipt threshold. |
+
+### Why two layers — and why IMS, not consumable
+
+The two tables record receiving in **different units**, and this is the crux of the refinement:
+
+- The **PO table** books both what was ordered (`ims_sku_qty`) and its own running received count
+  (`received_qty`) in the **vendor packaging unit** — cases, packs, eaches (`cs` / `pk` / `ea`).
+- The **inventory ledger** books each movement in the **base/consumable unit** — ounces, pounds,
+  grams. Confirmed on live data: `ims_quantity_change` on the ledger equals `consumable_quantity_change`
+  ~90% of the time (both base units), and for the *same* IMS SKU the ledger's `ims_uom` matches the
+  PO's `ims_uom` only ~5% of the time. So the ledger's "IMS quantity" is **not** in the PO's IMS
+  packaging unit — comparing them directly would produce nonsense (e.g. 50 cases ordered vs 8,400 oz
+  received → a fake 168× "over-receipt").
+
+So each layer is measured **entirely within its own unit system**, never across the base↔packaging
+boundary:
+
+| Layer | Ordered | Received | Unit |
+|---|---|---|---|
+| **1 · PO's own books** | `ims_sku_qty` | `received_qty` | packaging (`cs`/`pk`/`ea`) — one table, no conversion |
+| **2 · Ledger cumulative** | `consumable_sku_qty` | `SUM(consumable_quantity_change)` | base (`oz`/`lb`/`g`) — the only cross-system-reliable ledger measure |
+
+Layer 2 uses `consumable_quantity_change` (which is **100% populated**) rather than the ledger's
+`supplier_quantity_change`, which *is* in packaging units but is **NULL for every Pantry receipt**
+(the largest receiving flow) and so can't be used universally.
 
 ### The SQL
 
 #### Catalog SQL (the documented definition)
 
 ```sql
--- DAILY BATCH PO over-receipt: flag POs that RECEIVED yesterday, then compare their
--- cumulative received-to-date vs ordered.
+-- DAILY PO over-receipt — TWO-WAY match keyed on ims_sku. For every (po, ims_sku) that RECEIVED
+-- yesterday, compare TWO signals:
+--   LAYER 1 (PO's own books): PO.received_qty vs PO.ims_sku_qty        (packaging units cs/pk/ea)
+--   LAYER 2 (ledger cumulative): SUM(consumable_quantity_change) vs PO.consumable_sku_qty  (base oz/lb/g)
+-- Flag if EITHER layer is over.
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
-WITH touched AS (   -- (po, item) received on run_date
-  SELECT DISTINCT ref_order_id AS po, consumable_sku
+WITH touched AS (   -- (po, ims_sku) received on run_date
+  SELECT DISTINCT ref_order_id AS po, ims_sku
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL AND DATE(datetime_utc)=run_date),
-received AS (       -- cumulative received-to-date for those POs (30-day lookback)
-  SELECT l.ref_order_id AS po, l.consumable_sku, SUM(l.consumable_quantity_change) AS received_qty,
-         ANY_VALUE(l.consumable_uom) AS received_uom
+  WHERE ref_order_type = 'Purchase Order' AND ims_sku IS NOT NULL AND DATE(datetime_utc) = run_date
+),
+
+received AS (   -- LAYER 2: cumulative ledger receipts (base units), 30-day lookback
+  SELECT
+    l.ref_order_id                    AS po,
+    l.ims_sku,
+    SUM(l.consumable_quantity_change) AS led_received,
+    ANY_VALUE(l.consumable_uom)       AS received_uom
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` l
-  JOIN touched t ON l.ref_order_id=t.po AND l.consumable_sku=t.consumable_sku
-  WHERE l.ref_order_type='Purchase Order' AND DATE(l.datetime_utc)<=run_date
+  JOIN touched t ON l.ref_order_id = t.po AND l.ims_sku = t.ims_sku
+  WHERE l.ref_order_type = 'Purchase Order'
+    AND DATE(l.datetime_utc) <= run_date
     AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(run_date), INTERVAL 30 DAY)
-  GROUP BY po, consumable_sku),
-ordered AS (
-  SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty, ANY_VALUE(consumable_uom) AS ordered_uom
+  GROUP BY po, ims_sku
+),
+
+ordered AS (   -- ordered in BOTH units + the PO's own received_qty (LAYER 1)
+  SELECT
+    po,
+    ims_sku,
+    SUM(ims_sku_qty)          AS ordered_pkg,     -- packaging units — Layer 1
+    SUM(consumable_sku_qty)   AS ordered_base,     -- base units      — Layer 2
+    SUM(received_qty)         AS po_received,      -- the PO's own cumulative received (packaging)
+    ANY_VALUE(consumable_uom) AS ordered_uom,
+    ANY_VALUE(ims_uom)        AS ims_uom
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE consumable_sku IS NOT NULL AND order_type = 'Purchase'
-  GROUP BY po, consumable_sku)
-SELECT r.po, r.consumable_sku, o.ordered_qty, r.received_qty,
-       (o.ordered_uom != r.received_uom) AS uom_mismatch,
-       ROUND((SAFE_DIVIDE(r.received_qty,o.ordered_qty)-1)*100,1) AS over_by_pct
-FROM received r JOIN ordered o USING (po, consumable_sku)
-WHERE o.ordered_qty>0 AND ( (o.ordered_uom != r.received_uom) OR r.received_qty > o.ordered_qty*1.05 )
-ORDER BY over_by_pct DESC
+  WHERE ims_sku IS NOT NULL AND order_type = 'Purchase'
+  GROUP BY po, ims_sku
+)
+
+SELECT
+  r.po,
+  r.ims_sku,
+  o.ordered_pkg, o.ims_uom, o.po_received,                            -- Layer 1 (packaging)
+  o.ordered_base, o.ordered_uom, r.led_received, r.received_uom,      -- Layer 2 (base)
+  (o.po_received  > o.ordered_pkg  * 1.30) AS po_over,
+  (r.led_received > o.ordered_base * 1.30) AS led_over,
+  (o.ordered_uom != r.received_uom)        AS uom_mismatch
+FROM received r
+JOIN ordered o USING (po, ims_sku)
+WHERE (o.ordered_pkg > 0 OR o.ordered_base > 0)
+  AND ( (o.ordered_uom != r.received_uom)                                   -- UoM mismatch
+     OR (o.ordered_pkg  > 0 AND o.po_received  > o.ordered_pkg  * 1.30)     -- Layer 1 over
+     OR (o.ordered_base > 0 AND r.led_received > o.ordered_base * 1.30) )   -- Layer 2 over
+ORDER BY led_over DESC, po_over DESC
 ```
 
 #### Live finder SQL (what runs daily)
 
 ```sql
--- PO over-receipt + UoM mismatch (daily: POs that received on run_date, cumulative vs ordered).
--- uom_mismatch=TRUE rows become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT (>=100% over -> Urgent).
-DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+-- PO over-receipt (TWO-WAY match, keyed on ims_sku): flag if the PO's OWN received_qty vs
+-- ims_sku_qty (Layer 1, packaging units) OR the ledger cumulative vs consumable_sku_qty
+-- (Layer 2, base units) is over the threshold. Pure UoM-mismatch rows (neither layer over)
+-- become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT (over_frac >= 1.00 -> Urgent, else High).
+-- daily batch target = the just-closed day (yesterday PST in prod)
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
 
-WITH evt AS (   -- every ledger line for a PO+item touched yesterday, with a RUNNING cumulative received
-  SELECT l.ref_order_id AS po, l.consumable_sku, l.datetime_utc,
-         l.consumable_quantity_change AS q, l.consumable_uom AS ruom,
-         l.facility_name AS facility, l.facility_type AS facility_type,
-         l.system_of_origin AS system, l.item_name AS item_name, l.l1_action, l.l2_action,
-         SUM(l.consumable_quantity_change) OVER (
-           PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
-           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv
-  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` l
-  JOIN (SELECT DISTINCT ref_order_id AS po, consumable_sku
-        FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-        WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL
-          AND DATE(datetime_utc)=run_date) t
-    ON l.ref_order_id=t.po AND l.consumable_sku=t.consumable_sku
-  -- NOTE: capturing EVERY Purchase-Order line (positive AND negative) makes SUM(q) a true NET, so a
-  -- correction booked back against the PO cancels the bad receipt. (See walkthrough.)
-  WHERE l.ref_order_type='Purchase Order' AND l.consumable_sku IS NOT NULL
-    AND DATE(l.datetime_utc)<=run_date
-    AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(run_date), INTERVAL 30 DAY)),
-received AS (   -- net received per PO+item
-  SELECT po, consumable_sku, SUM(q) AS received_qty, ANY_VALUE(ruom) AS received_uom,
-         ANY_VALUE(facility) AS facility, ANY_VALUE(facility_type) AS facility_type,
-         ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name,
-         ANY_VALUE(l1_action HAVING MAX q) AS move_l1, ANY_VALUE(l2_action HAVING MAX q) AS move_l2
-  FROM evt GROUP BY po, consumable_sku),
-ordered AS (   -- ordered qty + unit per PO+item, from the PO table
-  SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty,
-         ANY_VALUE(consumable_uom) AS ordered_uom, ANY_VALUE(supplier_name) AS supplier, ANY_VALUE(status) AS status
+WITH t AS (
+  SELECT DISTINCT
+    ref_order_id AS po,
+    ims_sku
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE
+    ref_order_type = 'Purchase Order' AND ims_sku IS NOT NULL
+    AND DATE(datetime_utc) = run_date
+),
+
+evt AS (
+  SELECT
+    l.ref_order_id AS po,
+    l.ims_sku,
+    l.consumable_sku,
+    l.datetime_utc,
+    l.consumable_quantity_change AS q,
+    l.consumable_uom AS ruom,
+    l.facility_name AS facility,
+    l.facility_type,
+    l.system_of_origin AS system,
+    l.item_name,
+    l.l1_action,
+    l.l2_action,
+    SUM(l.consumable_quantity_change) OVER (
+      PARTITION BY l.ref_order_id, l.ims_sku ORDER BY l.datetime_utc
+      ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS running_recv,
+    -- how many 'Add' receipts share this exact quantity (>=2 = probable double-booking).
+    -- Partition key CAST to STRING — BigQuery can't PARTITION BY a FLOAT64.
+    SUM(IF(l.l1_action = 'Add' AND l.consumable_quantity_change > 0, 1, 0)) OVER (
+      PARTITION BY l.ref_order_id, l.ims_sku, CAST(ROUND(l.consumable_quantity_change, 4) AS STRING)
+    ) AS same_qty_receipts
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` AS l
+  INNER JOIN t
+    ON l.ref_order_id = t.po AND l.ims_sku = t.ims_sku
+  -- ref_order_type='Purchase Order' INTENTIONALLY captures EVERY ledger line tied to the PO,
+  -- positive and negative, so SUM(q) below is a true NET. A receiver may double-log / over-log
+  -- a receipt and then a correction is booked back against the same PO — either an auto negative
+  -- receipt (l1/l2 = Remove/PO Receipt) or a manual fix (Adjust/Update Received Order). Both are
+  -- ref_order_type='Purchase Order', so they net out here. Do NOT narrow this to l1_action='Add'
+  -- or l2_action LIKE '%Receipt%' — that would drop the manual corrections and re-break netting.
+  -- (Corrections booked as generic Adjust/Cycle-Count carry NO PO ref and are deliberately left
+  -- alone: they can't be attributed to a specific PO without a fuzzy SKU+facility+window guess.)
+  WHERE
+    l.ref_order_type = 'Purchase Order' AND l.ims_sku IS NOT NULL
+    AND DATE(l.datetime_utc) <= run_date
+    AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(run_date), INTERVAL 30 DAY)
+),
+
+received AS (   -- LAYER 2 basis: net ledger receipts per (po, ims_sku), BASE units
+  SELECT
+    po,
+    ims_sku,
+    SUM(q) AS led_received,
+    ANY_VALUE(ruom) AS received_uom,
+    ANY_VALUE(consumable_sku) AS consumable_sku,
+    ANY_VALUE(facility) AS facility,
+    ANY_VALUE(facility_type) AS facility_type,
+    ANY_VALUE(system) AS system,
+    ANY_VALUE(item_name) AS item_name,
+    -- movement action of the largest receipt = the dominant receiving event (l1 / l2)
+    ANY_VALUE(l1_action HAVING MAX q) AS move_l1,
+    ANY_VALUE(l2_action HAVING MAX q) AS move_l2,
+    MAX(same_qty_receipts) AS dup_receipts   -- >=2 = ledger booked the same receipt twice
+  FROM evt
+  GROUP BY po, ims_sku
+),
+
+ordered AS (   -- ordered in BOTH units + the PO's OWN received_qty (LAYER 1), per (po, ims_sku)
+  SELECT
+    po,
+    ims_sku,
+    SUM(ims_sku_qty) AS ordered_pkg,    -- packaging units (cs/pk/ea) — Layer 1 basis
+    SUM(consumable_sku_qty) AS ordered_base,    -- base units (oz/lb/g)       — Layer 2 basis
+    SUM(received_qty) AS po_received,     -- the PO's own cumulative received (packaging)
+    ANY_VALUE(consumable_uom) AS ordered_uom,
+    ANY_VALUE(ims_uom) AS ims_uom,
+    ANY_VALUE(supplier_name) AS supplier,
+    ANY_VALUE(status) AS status
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE consumable_sku IS NOT NULL AND order_type='Purchase'
-  GROUP BY po, consumable_sku),
-breach AS (   -- the date each problem first started (when cumulative first crossed the line)
-  SELECT e.po, e.consumable_sku,
-         DATE(MIN(IF(e.running_recv > o.ordered_qty*(1+0.3), e.datetime_utc, NULL))) AS over_breach_date,
-         DATE(MIN(IF(o.ordered_uom IS NOT NULL AND e.ruom IS NOT NULL AND e.ruom!=o.ordered_uom,
-                     e.datetime_utc, NULL))) AS uom_breach_date,
-         DATE(MIN(e.datetime_utc)) AS first_receipt_date, DATE(MAX(e.datetime_utc)) AS last_receipt_date
-  FROM evt e JOIN ordered o USING (po, consumable_sku) GROUP BY po, consumable_sku),
-flagged AS (   -- keep only PO+items that are over by >30% OR have a UoM mismatch
-  SELECT r.po, r.consumable_sku, r.item_name, o.ordered_qty, r.received_qty, o.ordered_uom, r.received_uom,
-         r.facility, r.facility_type, r.system, o.supplier, o.status, r.move_l1, r.move_l2,
-         SAFE_DIVIDE(r.received_qty, o.ordered_qty) - 1 AS over_frac,
-         (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom!=r.received_uom) AS uom_mismatch,
-         b.over_breach_date, b.uom_breach_date, b.first_receipt_date, b.last_receipt_date
-  FROM received r JOIN ordered o USING (po, consumable_sku) JOIN breach b USING (po, consumable_sku)
-  WHERE o.ordered_qty>0 AND ( (o.ordered_uom!=r.received_uom) OR r.received_qty > o.ordered_qty*(1+0.3) )),
-ranked AS (   -- number rows within each severity band so the 500 cap keeps all bands represented
-  SELECT *, COUNT(*) OVER() AS total_matches,
-         ROW_NUMBER() OVER (
-           PARTITION BY (CASE WHEN uom_mismatch THEN 'uom'
-                              WHEN over_frac >= 1.0 THEN 'over_urgent' ELSE 'over_high' END)
-           ORDER BY over_frac DESC) AS rn
-  FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY over_frac DESC
+  WHERE ims_sku IS NOT NULL AND order_type = 'Purchase'   -- PO-side: purchases only (for now)
+  GROUP BY po, ims_sku
+),
+
+breach AS (
+  SELECT
+    e.po,
+    e.ims_sku,
+    -- first receipt where the ledger cumulative (base) crossed the over-receipt threshold
+    DATE(MIN(IF(e.running_recv > o.ordered_base * (1 + 0.3), e.datetime_utc, NULL))) AS over_breach_date,
+    -- first receipt that introduced a unit different from the order's
+    DATE(MIN(IF(
+      o.ordered_uom IS NOT NULL AND e.ruom IS NOT NULL AND e.ruom != o.ordered_uom,
+      e.datetime_utc, NULL
+    ))) AS uom_breach_date,
+    DATE(MIN(e.datetime_utc)) AS first_receipt_date,
+    DATE(MAX(e.datetime_utc)) AS last_receipt_date
+  FROM evt AS e INNER JOIN ordered AS o ON e.po = o.po AND e.ims_sku = o.ims_sku
+  GROUP BY po, ims_sku
+),
+
+flagged AS (   -- TWO-WAY match: keep a row if the PO's own books OR the ledger cumulative are over
+  SELECT
+    r.po,
+    r.ims_sku,
+    r.consumable_sku,
+    r.item_name,
+    o.ordered_pkg,
+    o.ordered_base,
+    o.po_received,
+    r.led_received,
+    o.ordered_uom,
+    r.received_uom,
+    o.ims_uom,
+    r.facility,
+    r.facility_type,
+    r.system,
+    o.supplier,
+    o.status,
+    r.move_l1,
+    r.move_l2,
+    r.dup_receipts,
+    b.over_breach_date,
+    b.uom_breach_date,
+    b.first_receipt_date,
+    b.last_receipt_date,
+    (o.ordered_pkg > 0 AND o.po_received > o.ordered_pkg * (1 + 0.3)) AS po_over,
+    (o.ordered_base > 0 AND r.led_received > o.ordered_base * (1 + 0.3)) AS led_over,
+    SAFE_DIVIDE(o.po_received, NULLIF(o.ordered_pkg, 0)) - 1 AS po_over_frac,
+    SAFE_DIVIDE(r.led_received, NULLIF(o.ordered_base, 0)) - 1 AS led_over_frac,
+    GREATEST(
+      COALESCE(SAFE_DIVIDE(o.po_received, NULLIF(o.ordered_pkg, 0)) - 1, -9),
+      COALESCE(SAFE_DIVIDE(r.led_received, NULLIF(o.ordered_base, 0)) - 1, -9)
+    ) AS over_frac,
+    (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch
+  FROM received AS r INNER JOIN ordered AS o ON r.po = o.po AND r.ims_sku = o.ims_sku
+  INNER JOIN breach AS b ON r.po = b.po AND r.ims_sku = b.ims_sku
+  WHERE (o.ordered_pkg > 0 OR o.ordered_base > 0) AND (
+    (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom)
+    OR (o.ordered_pkg > 0 AND o.po_received > o.ordered_pkg * (1 + 0.3))
+    OR (o.ordered_base > 0 AND r.led_received > o.ordered_base * (1 + 0.3))
+  )
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*) OVER () AS total_matches,
+    ROW_NUMBER() OVER (
+      PARTITION BY (CASE
+        WHEN uom_mismatch AND NOT (po_over OR led_over) THEN 'uom'
+        WHEN over_frac >= 1.0 THEN 'over_urgent'  -- >=100% over (>=2x ordered): likely error (Urgent)
+        ELSE 'over_high'
+      END)                         -- 30-99% over: supply-chain signal (High)
+      ORDER BY over_frac DESC
+    ) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn) FROM ranked
+WHERE rn <= 500
+ORDER BY over_frac DESC
 ```
 
 ### Plain-English walkthrough
 
-This is the most involved rule, because "did we receive too much?" means comparing two different
-things — what the ledger says we **received** against what the PO table says we **ordered** — and
-adding it up over time. The live query builds the answer in named steps (`WITH <name> AS ( … )`);
-read it as a short pipeline. Both SQL blocks do the same job; the catalog version is the simpler
+This is the most involved rule, because "did we receive too much?" is now asked **two ways at once**,
+each in its own unit. The live query builds the answer in named steps (`WITH <name> AS ( … )`); read
+it as a short pipeline. Both SQL blocks do the same job; the catalog version is the simpler
 documented form, and the **live version's thresholds are the ones actually in force** (30% / 100%).
 
 1. **`run_date` = yesterday** — the day we're checking.
 
-2. **`evt` — pull the receipt history for the POs that moved yesterday.** First it finds every
-   (PO, item) that *received something yesterday* (the small `JOIN (… DATE(datetime_utc)=run_date …)`
-   sub-query) — we only re-examine POs that actually had activity, which keeps the query cheap. For
-   each of those, it pulls **every** ledger line tied to that PO over the last **30 days** and adds a
-   **running cumulative total** (`running_recv`) — a column that, row by row in time order, says "how
-   much have we received against this PO+item *so far*." Why include positive **and** negative lines?
-   Because if a receiver over-logs a receipt and a correction is later booked back against the same
-   PO, the two cancel out — so the running total is a **true net**, and we don't flag a mistake that
-   was already fixed.
+2. **`evt` — pull the receipt history for the (PO, IMS SKU) pairs that moved yesterday.** First it
+   finds every `(po, ims_sku)` that *received something yesterday* (the small `JOIN (… DATE(datetime_utc)
+   = run_date …)` sub-query) — we only re-examine orders that actually had activity, which keeps the
+   query cheap. For each, it pulls **every** ledger line tied to that PO+IMS-SKU over the last **30
+   days** and adds a **running cumulative total** (`running_recv`) in **base units** — row by row in
+   time order, "how much have we received against this PO+item *so far*." Why include positive **and**
+   negative lines? Because if a receiver over-logs a receipt and a correction is later booked back
+   against the same PO, the two cancel out — so the running total is a **true net**, and we don't flag
+   a mistake that was already fixed.
 
-3. **`received` — the bottom line per PO+item.** Collapses `evt` to one row per (PO, item) with the
-   **net received quantity** and its unit of measure, plus details for triage (facility, system, the
-   dominant receiving action).
+3. **`received` — Layer 2's bottom line.** Collapses `evt` to one row per `(po, ims_sku)` with the
+   **net ledger received quantity** (base units) and its unit, plus triage details (facility, system,
+   the dominant receiving action).
 
-4. **`ordered` — what the PO actually called for.** From the **PO Table**, the **ordered quantity**
-   and unit per (PO, item), plus supplier and PO status.
+4. **`ordered` — what the PO called for, in *both* units, plus its own count.** From the **PO Table**,
+   per `(po, ims_sku)`: `ordered_pkg` (= `SUM(ims_sku_qty)`, packaging), `ordered_base`
+   (= `SUM(consumable_sku_qty)`, base), and **`po_received`** (= `SUM(received_qty)`, the PO's own
+   running received count in packaging units — this is **Layer 1**), plus supplier and status.
 
-5. **`breach` — when the problem started.** For each (PO, item) it finds the **first** receipt at
-   which the running total crossed the over-receipt line, and the first receipt that introduced a
-   wrong unit. This gives the exception an accurate "as of" date instead of just "today."
+5. **`breach` — when the problem started.** For each pair it finds the **first** receipt at which the
+   ledger running total crossed the over-receipt line, and the first receipt that introduced a wrong
+   unit. This gives the exception an accurate "as of" date instead of just "today."
 
-6. **`flagged` — apply the test.** Joins received ↔ ordered ↔ breach and keeps a row only if
-   **received is more than 30% over ordered**, *or* the **received unit doesn't match the ordered
-   unit**. It also computes `over_frac` = received ÷ ordered − 1 (e.g. 0.5 = 50% over), which decides
-   the severity band.
+6. **`flagged` — apply the two-way test.** Joins received ↔ ordered ↔ breach and computes both layers:
+   - **`po_over`** = `po_received > ordered_pkg × 1.30` (the PO's own books, packaging units).
+   - **`led_over`** = `led_received > ordered_base × 1.30` (the ledger cumulative, base units).
+   A row is kept if **either** layer is over, *or* the received unit doesn't match the ordered unit.
+   `over_frac` is the **worse** of the two layers' overage fractions and decides the severity band.
 
-7. **`ranked` + final line — fair capping.** Rows are numbered *within each band* (UoM mismatch /
-   30–99% over / ≥100% over) so the **500-row daily cap** keeps all three populations represented
-   rather than letting the most extreme rows crowd out the rest. The final line drops the helper
-   number and sorts worst-first.
+7. **`ranked` + final line — fair capping.** Rows are numbered *within each band* (pure UoM mismatch /
+   30–99% over / ≥100% over) so the **500-row daily cap** keeps all populations represented rather than
+   letting the most extreme rows crowd out the rest. The final line drops the helper number and sorts
+   worst-first.
+
+**What the ticket tells you.** Each exception records a plain-English **`match`** verdict — one of:
+*"Confirmed by both the PO's own receipts and the ledger cumulative"*; *"PO receipt appears correct
+(matched the order); the ledger over-counted — likely a duplicate or erroneous ledger entry.
+Investigate the ledger, not the receiving"*; or *"The PO's own received_qty is over-ordered; the
+ledger cumulative is within range"* — plus a cross-check line showing the other layer's numbers.
+
+**Ledger-only case (Check 1 clean, Check 2 over).** When the PO's own receipt count matches the order
+but the ledger cumulative is over, the receiving was almost certainly right and the **ledger** is the
+one that's wrong. Those tickets get the "investigate the ledger" verdict above and a machine flag
+(`likely_ledger_error`) so the dashboard can group them (routing is unchanged — still Field Ops). The
+live query also computes `same_qty_receipts` / `dup_receipts` — a count of identical `'Add'` receipts
+booked against the same PO+item — and when it's **≥ 2** the verdict appends *"N identical receipts
+detected (probable double-booking)"*, the classic signature of the same receipt logged twice.
 
 **How the join works & why it's needed:** the ledger and the PO table are stitched together on
-**`ledger.ref_order_id = PO.po`** (same purchase order) **and** **`consumable_sku = consumable_sku`**
-(same item) — see the `USING (po, consumable_sku)` joins. Without the join we'd only know what we
-*received*; we need the PO table to know what was *ordered* so we can compare the two.
+**`ledger.ref_order_id = PO.po`** (same purchase order) **and** **`ledger.ims_sku = PO.ims_sku`**
+(same item, by the *raw* system id) — see the `USING (po, ims_sku)` joins. Without the join we'd only
+know what we *received*; we need the PO table to know what was *ordered* — and its own receipt count —
+so we can run both layers of the match.
 
 ### Tables & columns used
 
 **Tables:** Inventory Ledger (`consolidated_inventory_ledger`) **⋈** PO Table (`int_ledger_purchase_orders`).
-**Join keys:** `ref_order_id` ⇄ `po` (the purchase order) and `consumable_sku` ⇄ `consumable_sku` (the item).
+**Join keys:** `ref_order_id` ⇄ `po` (the purchase order) and **`ims_sku` ⇄ `ims_sku`** (the item, by raw system id).
 
 | Column (table) | Plain meaning | Role in this rule |
 |---|---|---|
+| `ims_sku` (both) | The raw item id the source systems stamp on both tables. | **Join key & grain** — the item link, replacing the translated `consumable_sku`. |
 | `ref_order_id` (ledger) | The PO a receipt belongs to. | **Join key** to the PO table; identifies the order. |
-| `consumable_quantity_change` (ledger) | How much the item moved on that line (+ in, − out). | **Summed** into the net received quantity. |
-| `consumable_uom` (ledger) | The unit the receipt was booked in. | Compared to the ordered unit (UoM-mismatch check). |
+| `consumable_quantity_change` (ledger) | How much the item moved on that line, in **base units** (+ in, − out). | **Summed** into the Layer-2 net received quantity. |
+| `consumable_uom` (ledger) | The base unit the receipt was booked in. | Compared to the PO's base unit (UoM-mismatch check). |
 | `datetime_utc` (ledger) | When the movement happened. | Picks "touched yesterday", the 30-day window, and the breach date. |
-| `consumable_sku_qty` (PO) | The quantity ordered on the PO line. | **The benchmark** — received is compared against this. |
-| `consumable_uom` (PO) | The unit the item was ordered in. | Compared to the received unit. |
+| `received_qty` (PO) | The PO's **own** running received count, in **packaging units**. | **Layer 1 numerator** — the "PO receipt" signal. |
+| `ims_sku_qty` (PO) | Quantity ordered, in **packaging units** (= `supplier_sku_qty`). | **Layer 1 benchmark** — `received_qty` is compared against this. |
+| `consumable_sku_qty` (PO) | Quantity ordered, in **base units**. | **Layer 2 benchmark** — the ledger cumulative is compared against this. |
+| `ims_uom` / `consumable_uom` (PO) | Packaging unit / base unit the item was ordered in. | Displayed on the ticket; base unit drives the UoM-mismatch check. |
 | `supplier_name`, `status` (PO) | Vendor and PO status. | Triage context on the ticket. |
 | `facility_name` / `facility_type` (ledger) | Where it was received. | Triage + routing (HDR vs CK/Production). |
 
-### Example of a flagged record (from the dashboard)
+### Examples of flagged records (from live data)
 
-A live exception currently open in the Workbench — **ERR-00006** (Jira **KAN-855**), routed to
-Field Ops — ProdCo:
+**Both layers agree — a clear over-receipt.** `VDC 4312` / IMS `4200136-2` (*Pico de Gallo Salsa*,
+Shiphero): ordered **1**, but the PO's own books show **334 received** and the ledger cumulative shows
+**302,604 g against 906 g ordered** — both far past the ≥100% line, so **Urgent**. Verdict: *"Confirmed
+by both the PO's own receipts and the ledger cumulative."*
+
+**Ledger-only — the two-way match earning its keep.** `PO 61920` / IMS `8807623` (*Pizza, Cheese, 10"*,
+Roncadin):
 
 | Field | Value |
 |---|---|
-| `po` | `88 ARCADIA FIX 060226` |
-| `consumable_sku` / `item_name` | `5182551` / `Crust, Square, DiFara (Co-Man V3)` |
-| `ordered_qty` (PO) | `12 ea` |
-| `received_qty` (ledger, net) | `240 ea` |
-| `over_by_pct` | `1,900%` over → **Urgent** |
-| `supplier` / `facility` (type) | `RM Bakery LLC (Leaven Co)` / `DISH` (DISH) |
-| `breached_at` | `2026-06-02` |
+| `po` / `ims_sku` | `PO 61920` / `8807623` |
+| Layer 1 (PO's own books) | received **1,620** of **1,620** ordered — **within range** ✅ |
+| Layer 2 (ledger cumulative) | received **27,540 ea** of **1,620 ea** ordered → **+1,600% over** ❌ |
+| `match` | *Ledger cumulative over-received; the PO's own received_qty is still within range (possible reconciliation gap).* |
 
-**Why it's flagged:** 240 received against an order of 12 is **20× the quantity ordered** — far past
-the ≥100% line, so it lands in the **Urgent** band (a likely double-receive / receiving error, not
-just an over-shipment).
+**Why it matters:** the PO's own receipt count looks perfectly clean (1,620 of 1,620), so the *old*
+single-signal rule would have **missed** it. The ledger, however, booked **17× the quantity** the PO
+acknowledges — a genuine reconciliation gap between the warehouse ledger and the buying system that is
+exactly what the second layer exists to surface.
+
+---
+
+## PO-06 · Missing Unit Conversion (Consumable ↔ Vendor SKU)
+
+> **In one sentence:** find an item we're **buying** for which the product catalog has **no way to
+> convert the vendor's unit** (e.g. a *case*) into **the unit we actually use** (e.g. *each* or
+> *grams*) — either the item isn't in the catalog at all, or the vendor we bought it from isn't
+> linked to it — so a receipt can't be turned into the right on-hand quantity.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | PO-06 |
+| **Rule type** | `REFERENTIAL` (a "this must resolve against a reference table" check) |
+| **Severity** | **Urgent** — same-day SLA |
+| **Owner / routed team** | Procurement |
+| **Default assignee** | Tom Becker |
+| **Jira** | Project **WIQ** · Component **UoM / Conversions** |
+| **Source tables** | PO Table (`int_ledger_purchase_orders`) **⋈** Supply-chain product catalog (`supply_chain_catalog.wonder_products`) |
+| **Grain** | **One ticket per (Consumable SKU, Vendor SKU)** — the vendor-item that can't be converted, not per PO line. |
+| **Key settings** | `po_missing_uom_conversion_lookback_days` = **30** (backfill window; daily flags items purchased that day) |
+| **Live status** | 🟢 **Live — runs daily.** Over a 30-day backfill it finds **134** unconvertible (consumable, vendor) pairs; the daily run flags the ones purchased that day. |
+
+### The new table: the supply-chain product catalog
+
+This is the first rule to read `wonder-dw-prod-brd.**supply_chain_catalog.wonder_products**` — a
+**view** (~765 rows / ~534 products) that is the master **unit-of-measure / packaging catalog** for
+**Wonder-family products**. Each row is one *(product × packaging level)* and carries the conversion
+factors (`level_1..4_conversion_factor`, `cumulative_conversion_factor`, `base_uom` /
+`base_uom_quantity`) that translate a vendor pack → the consumable base unit, plus three SKU
+identities that let us tie the PO's SKUs to it:
+
+| Catalog column | Is the… | Ties to PO column |
+|---|---|---|
+| `hdr_product_sku` (e.g. `4000315`) | Consumable / HDR SKU | **`consumable_sku`** ✅ the join key |
+| `vendor_product_skus[]` / `priority_vendor_product_sku` | Vendor SKU(s) | **`supplier_sku`** ✅ the link check |
+| `wonder_product_sku` (e.g. `W4200042`) | internal Wonder SKU | *(not `wonder_sku` — different ID namespace, not used)* |
+
+**Important:** the catalog's conversion factors are **100% populated** (there are *no* rows with a
+null/zero factor). So "missing unit conversion" is **not** a blank-field problem inside the catalog —
+it is a **coverage / linkage gap**: an item is being *purchased* but the catalog can't resolve its
+*(Consumable SKU, Vendor SKU)* to a conversion at all. That happens two ways, both flagged:
+1. **No catalog record** — the consumable has no row in `wonder_products`.
+2. **Vendor not linked** — the consumable *is* in the catalog, but the PO's vendor SKU isn't among
+   that product's linked vendor SKUs, so we don't know which packaging conversion applies to it.
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Framework PO-06: a purchased Wonder-family item whose Consumable SKU <> Vendor SKU can't be
+-- resolved to a unit conversion in the supply-chain catalog (no record, or vendor SKU not linked).
+WITH cat AS (
+  SELECT
+    hdr_product_sku AS hdr,
+    ARRAY_CONCAT_AGG(vendor_product_skus) AS vendors,
+    ARRAY_AGG(DISTINCT priority_vendor_product_sku IGNORE NULLS) AS pvendors
+  FROM `wonder-dw-prod-brd.supply_chain_catalog.wonder_products`
+  WHERE status = 'ACTIVE'
+    AND hdr_product_sku IS NOT NULL
+  GROUP BY hdr_product_sku
+)
+
+SELECT
+  p.consumable_sku,
+  p.supplier_sku,
+  p.supplier_name,
+  p.consumable_uom,
+  p.supplier_uom
+FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` p
+LEFT JOIN cat c ON p.consumable_sku = c.hdr
+WHERE p.order_type = 'Purchase'
+  AND p.consumable_sku IS NOT NULL
+  AND p.supplier_sku IS NOT NULL
+  AND (p.ims_sku_type IN ('WSKU','Pack SKU') OR REGEXP_CONTAINS(p.consumable_sku, r'^40[0-9]{5}$'))
+  AND NOT REGEXP_CONTAINS(p.consumable_sku, r'^9[0-9]{6}$')   -- exclude smallwares/packaging
+  AND p.consumable_uom != p.supplier_uom
+  AND (c.hdr IS NULL OR NOT (p.supplier_sku IN UNNEST(c.vendors) OR p.supplier_sku IN UNNEST(c.pvendors)))
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- Purchased Wonder-family item whose Consumable SKU <> Vendor SKU has no unit conversion in the
+-- catalog (framework PO-06). One row per (consumable_sku, supplier_sku). Daily flags items
+-- purchased on the run-date; backfill sweeps the lookback window.
+DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
+
+WITH cat AS (   -- one row per Wonder product; join key hdr_product_sku = PO consumable_sku
+  SELECT
+    hdr_product_sku AS hdr,
+    ARRAY_CONCAT_AGG(vendor_product_skus) AS vendors,          -- all linked vendor SKUs
+    ARRAY_AGG(DISTINCT priority_vendor_product_sku IGNORE NULLS) AS pvendors,
+    ANY_VALUE(wonder_product_name) AS product_name
+  FROM `wonder-dw-prod-brd.supply_chain_catalog.wonder_products`
+  WHERE status = 'ACTIVE'
+    AND hdr_product_sku IS NOT NULL
+  GROUP BY hdr_product_sku
+),
+
+po AS (   -- Wonder-family purchase lines in scope, collapsed to one row per (consumable, vendor)
+  SELECT
+    consumable_sku,
+    supplier_sku,
+    ANY_VALUE(consumable_uom)   AS consumable_uom,
+    ANY_VALUE(supplier_uom)     AS supplier_uom,
+    ANY_VALUE(supplier_name)    AS supplier_name,
+    ANY_VALUE(destination_name) AS facility,
+    ANY_VALUE(po_source_system) AS system,
+    ANY_VALUE(ims_sku_type)     AS sku_type,
+    ANY_VALUE(wonder_sku)       AS wonder_sku,
+    ANY_VALUE(po)               AS sample_po,
+    COUNT(DISTINCT po)          AS po_count,
+    MIN(po_date_utc)            AS first_po_date,
+    MAX(po_date_utc)            AS last_po_date
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase'
+    AND consumable_sku IS NOT NULL
+    AND supplier_sku IS NOT NULL
+    AND (ims_sku_type IN ('WSKU','Pack SKU') OR REGEXP_CONTAINS(consumable_sku, r'^40[0-9]{5}$'))
+    AND NOT REGEXP_CONTAINS(consumable_sku, r'^9[0-9]{6}$')  -- exclude 9xxxxxx smallwares/packaging (never in the food catalog)
+    AND consumable_uom != supplier_uom            -- a conversion is genuinely required
+    AND DATE(po_date_utc) = run_date
+  GROUP BY consumable_sku, supplier_sku
+),
+
+flagged AS (
+  SELECT
+    p.*,
+    c.product_name,
+    (c.hdr IS NULL) AS missing_record
+  FROM po p
+  LEFT JOIN cat c ON p.consumable_sku = c.hdr
+  WHERE c.hdr IS NULL                                                     -- no catalog record at all
+     OR NOT (p.supplier_sku IN UNNEST(c.vendors)                         -- or vendor SKU not linked
+             OR p.supplier_sku IN UNNEST(c.pvendors))
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                           AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_po_date DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY last_po_date DESC
+```
+
+### Plain-English walkthrough
+
+The rule stitches the **PO Table** (what we bought, from whom, in what unit) to the **product
+catalog** (the master unit conversions) and keeps the purchases the catalog can't resolve.
+
+1. **`run_date` = yesterday** — the day we're checking (the daily job always checks the last fully-closed day).
+
+2. **`cat` — boil the catalog down to one row per product.** Group the catalog by `hdr_product_sku`
+   (the consumable/HDR SKU) and collect, for each product, **all** of its linked vendor SKUs (the
+   `vendor_product_skus` arrays concatenated, plus the `priority_vendor_product_sku`). This is the
+   reference list: *"for this consumable, here are the vendor SKUs we know how to convert."*
+
+3. **`po` — the purchases worth checking, de-duplicated.** From the PO Table keep only:
+   - `order_type = 'Purchase'` — actual purchases.
+   - **Wonder-family items only** — `ims_sku_type` is `WSKU` or `Pack SKU`, *or* the consumable SKU is
+     in the `40xxxxx` family. This deliberately **excludes raw vendor goods** that were never meant to
+     have a Wonder conversion, so the rule doesn't flag the entire purchasing universe. It also
+     **excludes the `9xxxxxx` smallwares/packaging family** (cups, containers, box liners from Uline /
+     Ed Don) — those are operational supplies that never live in the food product catalog, so flagging
+     them would only create permanent, un-closeable tickets.
+   - `consumable_uom != supplier_uom` — **a conversion is only *needed* when the units differ** (bought
+     by the case, used by the each/gram). If the units already match, there's nothing to convert.
+   - Then collapse to **one row per (consumable_sku, supplier_sku)** so the same vendor-item isn't
+     re-flagged for every PO line, keeping a sample PO and count for triage.
+
+4. **`flagged` — apply the test.** `LEFT JOIN` each purchase to the catalog on
+   **`consumable_sku = hdr_product_sku`** and keep it only if **either**: there's **no catalog row**
+   (`c.hdr IS NULL`), **or** there is one but the **PO's vendor SKU isn't in that product's linked
+   vendor SKUs**. Both mean the same thing operationally — we can't convert this vendor's pack into the
+   consumable unit. `missing_record` records which of the two it was, for the ticket.
+
+5. **`ranked` + final line — cap.** Stamp the total match count on every row, order most-recently-
+   purchased first, keep the first 500, drop the helper column.
+
+**How the join works & why it's needed:** the two tables meet on **`PO.consumable_sku =
+catalog.hdr_product_sku`** (the same item) and then the **vendor** side is checked with
+`supplier_sku IN UNNEST(vendor_product_skus)` (is this vendor linked?). We need *both* tables because
+the PO knows *what we bought and from whom* but not *how to convert it*; the catalog knows the
+conversion but only for the SKUs it has on file. (Note: `PO.wonder_sku` is an `8xxxxxx`-series number
+in a **different ID namespace** than the catalog's `W42xxxxx` `wonder_product_sku`, so it is *not* a
+valid join key and isn't used.)
+
+**Auto-close:** each day the rule re-checks every open PO-06 ticket and closes it once the catalog
+resolves that pair — a record now exists **and** the vendor SKU is linked.
+
+### Tables & columns used
+
+**Tables:** PO Table (`int_ledger_purchase_orders`) **⋈** Product catalog (`supply_chain_catalog.wonder_products`).
+**Join keys:** `consumable_sku` ⇄ `hdr_product_sku` (the item); `supplier_sku` ∈ `vendor_product_skus` / `priority_vendor_product_sku` (the vendor link).
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `consumable_sku` (PO) | The consumable/HDR item number. | **Join key** to the catalog; part of the ticket identity. |
+| `supplier_sku` (PO) | The vendor's item number we bought. | **The link check** — must be a linked vendor SKU for this product. |
+| `consumable_uom` / `supplier_uom` (PO) | The consumable unit vs the vendor's unit. | **Scope** — only checked when they differ (a conversion is needed). |
+| `ims_sku_type` (PO) | Whether the line is a WSKU / Pack SKU / Vendor SKU. | **Scope** — limits the rule to Wonder-family items. |
+| `order_type` (PO) | Purchase vs Transfer. | **Filter** — purchases only. |
+| `po_date_utc` (PO) | The PO's date. | **Filter** — yesterday (daily) / lookback window (backfill); age anchor. |
+| `hdr_product_sku` (catalog) | The product's consumable/HDR SKU. | **Join key** — matched to `consumable_sku`. |
+| `vendor_product_skus[]`, `priority_vendor_product_sku` (catalog) | The vendor SKUs linked to the product. | **The reference** — the set the PO's `supplier_sku` must be in. |
+| `cumulative_conversion_factor`, `base_uom` (catalog) | The actual unit conversion. | The value that becomes unusable when the linkage is missing. |
+| `wonder_product_name` (catalog) | Human-readable product name. | Triage — shown when the item is in the catalog. |
+
+### Example of a flagged record (from live data)
+
+A pair caught by the 30-day backfill, routed to Procurement:
+
+| Field | Value |
+|---|---|
+| `consumable_sku` / `item_name` | `4001221F` / `Chicken Sandwich Filet FZN (15 ea)` |
+| `supplier_sku` | `1142589-EA` |
+| `supplier_name` | `US Foods Inc` |
+| `consumable_uom` ← `supplier_uom` | `ea` ← `cs` (bought by the case, used by the each) |
+| `gap` | **Vendor SKU not linked to this consumable in the catalog** |
+
+**Why it's flagged:** the product *is* in the catalog, but the vendor SKU we actually bought
+(`1142589-EA`, US Foods) isn't linked to it — so there's no conversion telling us how many *eaches* a
+*case* of `1142589-EA` yields. Every receipt against it lands in the wrong on-hand quantity until
+Procurement links the vendor SKU (or adds the catalog record), hence the **Urgent** severity.
 
 ---
 
@@ -414,12 +904,18 @@ just an over-shipment).
 -- Framework PO-07: an OPEN Purchase PO past expected_date + N days with nothing received and
 -- not cancelled. Aggregated to PO grain — a PO is 'nothing received' only when NO line has any
 -- received_qty. N = po_no_receipt_overdue_days (default 2).
-SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,
-       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received
+SELECT
+  po,
+  ANY_VALUE(destination_name)    AS facility,
+  ANY_VALUE(supplier_name)       AS supplier_name,
+  MAX(expected_date)             AS expected_date,
+  SUM(COALESCE(received_qty, 0)) AS total_received
 FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-WHERE order_type = 'Purchase' AND UPPER(status) = 'OPEN'
+WHERE order_type = 'Purchase'
+  AND UPPER(status) = 'OPEN'
 GROUP BY po
-HAVING total_received = 0 AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+HAVING total_received = 0
+   AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
 ```
 
 #### Live finder SQL (what runs daily)
@@ -430,33 +926,50 @@ HAVING total_received = 0 AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTE
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH po_agg AS (
-  SELECT po,
-         ANY_VALUE(destination_name) AS facility,
-         ANY_VALUE(supplier_name)    AS supplier_name,
-         ANY_VALUE(po_source_system) AS system,
-         SUM(COALESCE(received_qty, 0)) AS total_received,          -- across ALL lines of the PO
-         LOGICAL_OR(UPPER(status) = 'OPEN') AS has_open_line,       -- still awaiting receipt somewhere
-         STRING_AGG(DISTINCT status, ', ') AS po_status,
-         COUNT(*) AS line_count,
-         MAX(IF(UPPER(status) = 'OPEN', expected_date, NULL)) AS expected_date,
-         SUM(IF(UPPER(status) = 'OPEN', COALESCE(consumable_sku_qty, 0), 0)) AS total_ordered,
-         COUNTIF(UPPER(status) = 'OPEN') AS open_line_count
+  SELECT
+    po,
+    ANY_VALUE(destination_name)    AS facility,
+    ANY_VALUE(supplier_name)       AS supplier_name,
+    ANY_VALUE(po_source_system)    AS system,
+    SUM(COALESCE(received_qty, 0)) AS total_received,          -- across ALL lines of the PO
+    LOGICAL_OR(UPPER(status) = 'OPEN') AS has_open_line,       -- still awaiting receipt somewhere
+    STRING_AGG(DISTINCT status, ', ') AS po_status,
+    COUNT(*)                       AS line_count,
+    MAX(IF(UPPER(status) = 'OPEN', expected_date, NULL)) AS expected_date,
+    SUM(IF(UPPER(status) = 'OPEN', COALESCE(consumable_sku_qty, 0), 0)) AS total_ordered,
+    COUNTIF(UPPER(status) = 'OPEN') AS open_line_count
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
-  GROUP BY po),
+  WHERE order_type = 'Purchase'
+    AND po IS NOT NULL
+    AND TRIM(po) <> ''
+  GROUP BY po
+),
+
 flagged AS (
-  SELECT *,
-         DATE_ADD(expected_date, INTERVAL 2 DAY) AS breach_date,
-         DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
+  SELECT
+    *,
+    DATE_ADD(expected_date, INTERVAL 2 DAY) AS breach_date,
+    DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
   FROM po_agg
   WHERE total_received = 0              -- nothing received on the whole PO
     AND has_open_line                  -- still open / not cancelled or closed out
     AND expected_date IS NOT NULL
     AND expected_date < DATE_SUB(run_date, INTERVAL 2 DAY)
-    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)),   -- recency window
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
-                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY expected_date ASC
+    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)   -- recency window
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                           AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY expected_date ASC
 ```
 
 ### Plain-English walkthrough
@@ -555,14 +1068,19 @@ cancelled) 7 days later — Procurement needs to chase the delivery or cancel th
 -- Framework PO-08: a Purchase PO under-received (received > 0 but < ordered) that is still not
 -- closed Y days past expected_date. PO grain; ordered compared in supplier units.
 -- N = po_partial_not_closed_days (default 3).
-SELECT po, ANY_VALUE(destination_name) AS facility, ANY_VALUE(supplier_name) AS supplier_name,
-       MAX(expected_date) AS expected_date, SUM(COALESCE(received_qty,0)) AS total_received,
-       SUM(COALESCE(supplier_sku_qty,0)) AS total_ordered
+SELECT
+  po,
+  ANY_VALUE(destination_name)        AS facility,
+  ANY_VALUE(supplier_name)           AS supplier_name,
+  MAX(expected_date)                 AS expected_date,
+  SUM(COALESCE(received_qty, 0))     AS total_received,
+  SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered
 FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
 WHERE order_type = 'Purchase'
   AND UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')
 GROUP BY po
-HAVING total_received > 0 AND total_received < total_ordered
+HAVING total_received > 0
+   AND total_received < total_ordered
    AND MAX(expected_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
 ```
 
@@ -574,35 +1092,52 @@ HAVING total_received > 0 AND total_received < total_ordered
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH po_agg AS (
-  SELECT po,
-         ANY_VALUE(destination_name) AS facility,
-         ANY_VALUE(supplier_name)    AS supplier_name,
-         ANY_VALUE(po_source_system) AS system,
-         SUM(COALESCE(received_qty, 0))     AS total_received,   -- supplier units, across ALL lines
-         SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered,   -- supplier units, across ALL lines
-         LOGICAL_OR(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS not_closed,
-         STRING_AGG(DISTINCT status, ', ') AS po_status,
-         COUNT(*) AS line_count,
-         MAX(IF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED'), expected_date, NULL)) AS expected_date,
-         COUNTIF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS open_line_count
+  SELECT
+    po,
+    ANY_VALUE(destination_name)        AS facility,
+    ANY_VALUE(supplier_name)           AS supplier_name,
+    ANY_VALUE(po_source_system)        AS system,
+    SUM(COALESCE(received_qty, 0))     AS total_received,   -- supplier units, across ALL lines
+    SUM(COALESCE(supplier_sku_qty, 0)) AS total_ordered,    -- supplier units, across ALL lines
+    LOGICAL_OR(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS not_closed,
+    STRING_AGG(DISTINCT status, ', ')  AS po_status,
+    COUNT(*)                           AS line_count,
+    MAX(IF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED'), expected_date, NULL)) AS expected_date,
+    COUNTIF(UPPER(status) NOT IN ('CLOSED','COMPLETED','CANCELLED','CANCELED','VOIDED')) AS open_line_count
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type = 'Purchase' AND po IS NOT NULL AND TRIM(po) <> ''
-  GROUP BY po),
+  WHERE order_type = 'Purchase'
+    AND po IS NOT NULL
+    AND TRIM(po) <> ''
+  GROUP BY po
+),
+
 flagged AS (
-  SELECT *,
-         total_ordered - total_received AS shortfall_qty,
-         DATE_ADD(expected_date, INTERVAL 3 DAY) AS breach_date,
-         DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
+  SELECT
+    *,
+    total_ordered - total_received          AS shortfall_qty,
+    DATE_ADD(expected_date, INTERVAL 3 DAY) AS breach_date,
+    DATE_DIFF(run_date, expected_date, DAY) AS days_overdue
   FROM po_agg
   WHERE total_received > 0                       -- received something
     AND total_received < total_ordered - 0.001   -- but under-received (short by even 1)
     AND not_closed                               -- not closed by Supply Chain
     AND expected_date IS NOT NULL
     AND expected_date < DATE_SUB(run_date, INTERVAL 3 DAY)
-    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)),   -- recency window
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
-                  ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY expected_date ASC
+    AND expected_date >= DATE_SUB(run_date, INTERVAL 7 DAY)   -- recency window
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                           AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY expected_date ASC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY expected_date ASC
 ```
 
 ### Plain-English walkthrough
@@ -690,9 +1225,17 @@ date the PO still hasn't been closed — Procurement needs to receive the balanc
 
 ```sql
 -- Purchase PO lines with no usable vendor (supplier) price — receipts can't be costed.
-SELECT po, supplier_sku, consumable_sku, supplier_name, status, supplier_price, po_date_utc
+SELECT
+  po,
+  supplier_sku,
+  consumable_sku,
+  supplier_name,
+  status,
+  supplier_price,
+  po_date_utc
 FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)
+WHERE order_type = 'Purchase'
+  AND (supplier_price IS NULL OR supplier_price = 0)
 ```
 
 #### Live finder SQL (what runs daily)
@@ -702,18 +1245,37 @@ WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH flagged AS (
-  SELECT po, supplier_sku,
-         ANY_VALUE(po_source_system) AS system, ANY_VALUE(destination_name) AS facility,
-         ANY_VALUE(supplier_name) AS supplier_name, ANY_VALUE(supplier_sku_name) AS supplier_sku_name,
-         ANY_VALUE(status) AS status, MIN(supplier_price) AS supplier_price, MIN(po_date_utc) AS po_date_utc
+  SELECT
+    po,
+    supplier_sku,
+    ANY_VALUE(po_source_system)  AS system,
+    ANY_VALUE(destination_name)  AS facility,
+    ANY_VALUE(supplier_name)     AS supplier_name,
+    ANY_VALUE(supplier_sku_name) AS supplier_sku_name,
+    ANY_VALUE(status)            AS status,
+    MIN(supplier_price)          AS supplier_price,
+    MIN(po_date_utc)             AS po_date_utc
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type='Purchase' AND (supplier_price IS NULL OR supplier_price = 0)
-        AND supplier_sku IS NOT NULL AND UPPER(status)='CLOSED' AND DATE(po_date_utc)=run_date
-  GROUP BY po, supplier_sku),
+  WHERE order_type = 'Purchase'
+    AND (supplier_price IS NULL OR supplier_price = 0)
+    AND supplier_sku IS NOT NULL
+    AND UPPER(status) = 'CLOSED'
+    AND DATE(po_date_utc) = run_date
+  GROUP BY po, supplier_sku
+),
+
 ranked AS (
-  SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY po_date_utc DESC) AS rn
-  FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY po_date_utc DESC
+  SELECT
+    *,
+    COUNT(*)     OVER ()                          AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY po_date_utc DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY po_date_utc DESC
 ```
 
 ### Plain-English walkthrough
@@ -798,8 +1360,16 @@ $0 — understating inventory and COGS until Procurement sets the real vendor pr
 ```sql
 -- Framework PO-11: a ledger 'Correction' transaction (l1_action LIKE '%correct%') with a
 -- NULL/blank correction_ref_id — the correcting entry doesn't reference what it fixes.
-SELECT id, datetime_utc, facility_name, system_of_origin, l1_action, l2_action,
-       consumable_sku, item_name, correction_ref_id
+SELECT
+  id,
+  datetime_utc,
+  facility_name,
+  system_of_origin,
+  l1_action,
+  l2_action,
+  consumable_sku,
+  item_name,
+  correction_ref_id
 FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
 WHERE LOWER(l1_action) LIKE '%correct%'
   AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')
@@ -813,21 +1383,38 @@ WHERE LOWER(l1_action) LIKE '%correct%'
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH flagged AS (
-  SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
-         ANY_VALUE(facility_type) AS facility_type, ANY_VALUE(system_of_origin) AS system,
-         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
-         ANY_VALUE(l1_action) AS l1_action, ANY_VALUE(l2_action) AS l2_action,
-         ANY_VALUE(ref_order_type) AS ref_order_type, ANY_VALUE(ref_order_id) AS ref_order_id,
-         MIN(datetime_utc) AS datetime_utc
+  SELECT
+    CAST(id AS STRING)          AS id,
+    ANY_VALUE(facility_name)    AS facility,
+    ANY_VALUE(facility_type)    AS facility_type,
+    ANY_VALUE(system_of_origin) AS system,
+    ANY_VALUE(consumable_sku)   AS consumable_sku,
+    ANY_VALUE(item_name)        AS item_name,
+    ANY_VALUE(l1_action)        AS l1_action,
+    ANY_VALUE(l2_action)        AS l2_action,
+    ANY_VALUE(ref_order_type)   AS ref_order_type,
+    ANY_VALUE(ref_order_id)     AS ref_order_id,
+    MIN(datetime_utc)           AS datetime_utc
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
   WHERE LOWER(l1_action) LIKE '%correct%'
     AND (correction_ref_id IS NULL OR TRIM(correction_ref_id) = '')
     AND DATE(datetime_utc) <= run_date
     AND DATE(datetime_utc) > DATE_SUB(run_date, INTERVAL 7 DAY)   -- last 7 days incl. run_date
-  GROUP BY id),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
-                  ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY datetime_utc DESC
+  GROUP BY id
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                           AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY datetime_utc DESC
 ```
 
 ### Plain-English walkthrough
@@ -909,9 +1496,15 @@ wrong.
 
 ```sql
 -- Master PO table integrity: a Purchase row with no PO number (safety-net; 0 on current data).
-SELECT _id, supplier_name, supplier_sku, consumable_sku, po_date_utc
+SELECT
+  _id,
+  supplier_name,
+  supplier_sku,
+  consumable_sku,
+  po_date_utc
 FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-WHERE order_type = 'Purchase' AND (po IS NULL OR TRIM(po) = '')
+WHERE order_type = 'Purchase'
+  AND (po IS NULL OR TRIM(po) = '')
 ```
 
 #### Live finder SQL (what runs daily)
@@ -921,14 +1514,30 @@ WHERE order_type = 'Purchase' AND (po IS NULL OR TRIM(po) = '')
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH flagged AS (
-  SELECT CAST(_id AS STRING) AS id, ANY_VALUE(supplier_name) AS supplier_name,
-         ANY_VALUE(supplier_sku) AS supplier_sku, ANY_VALUE(consumable_sku) AS consumable_sku,
-         MIN(po_date_utc) AS po_date_utc
+  SELECT
+    CAST(_id AS STRING)       AS id,
+    ANY_VALUE(supplier_name)  AS supplier_name,
+    ANY_VALUE(supplier_sku)   AS supplier_sku,
+    ANY_VALUE(consumable_sku) AS consumable_sku,
+    MIN(po_date_utc)          AS po_date_utc
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type='Purchase' AND (po IS NULL OR TRIM(po) = '') AND DATE(po_date_utc)=run_date
-  GROUP BY id),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY po_date_utc DESC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500
+  WHERE order_type = 'Purchase'
+    AND (po IS NULL OR TRIM(po) = '')
+    AND DATE(po_date_utc) = run_date
+  GROUP BY id
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                          AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY po_date_utc DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
 ```
 
 ### Plain-English walkthrough
@@ -977,9 +1586,10 @@ matched to anything — it's a broken record that points to an upstream ingestio
 
 ## PO-14 · SKU Not on PO
 
-> **In one sentence:** find items received yesterday against a **real** purchase order where that
-> item **isn't actually listed on the PO** — a three-way-match break (wrong item, undocumented
-> substitution, or a PO line that was never set up).
+> **In one sentence:** find items received yesterday against a **real** purchase order where the PO
+> **orders none of that item** — either it isn't on the PO's lines at all, or it's on a line ordered
+> for **zero** — a three-way-match break (wrong item, undocumented substitution, a line never set up,
+> or a Ship Hero zero-order receive-line we might never invoice the vendor for).
 
 ### At a glance
 
@@ -992,7 +1602,7 @@ matched to anything — it's a broken record that points to an upstream ingestio
 | **Default assignee** | Marcus Webb |
 | **Jira** | Project **WIQ** · Component **3-Way Match** |
 | **Source tables** | Inventory Ledger **⋈** PO Table (joined) |
-| **Live status** | 🟢 **Live — runs daily.** Flagged **0** on yesterday's data; it fires whenever a SKU is received against a PO it isn't listed on. (This is the live version of framework catalog rule PO-02.) |
+| **Live status** | 🟢 **Live — runs daily.** Fires whenever a SKU is received against a PO that orders none of it (not on the PO, or on a zero-order line). The zero-order-line case is a safety-net per Jonny Li: **0 such lines exist in the PO master today** (checked over 90 days, all source systems), so it adds no tickets right now, but catches the Ship Hero zero-order receive-line the moment one syncs in. (Live version of framework catalog rule PO-02.) |
 
 ### The SQL
 
@@ -1000,49 +1610,115 @@ matched to anything — it's a broken record that points to an upstream ingestio
 
 ```sql
 -- 3-way match: a consumable_sku received against an existing PO (order_type='Purchase')
--- that is NOT on the PO's lines.
+-- that the PO orders NONE of — not on its lines, OR on a line ordered for 0.
 WITH led AS (
-  SELECT DISTINCT ref_order_id AS po, consumable_sku
+  SELECT DISTINCT
+    ref_order_id AS po,
+    consumable_sku
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL),
-po_keys AS (SELECT DISTINCT po, consumable_sku FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase'),
-po_exists AS (SELECT DISTINCT po FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase')
-SELECT l.po, l.consumable_sku FROM led l JOIN po_exists pe USING (po)
-LEFT JOIN po_keys pk ON l.po=pk.po AND l.consumable_sku=pk.consumable_sku
-WHERE pk.po IS NULL  -- PO exists, but this received SKU isn't on it
+  WHERE ref_order_type = 'Purchase Order'
+    AND consumable_sku IS NOT NULL
+),
+
+po_lines AS (
+  SELECT
+    po,
+    consumable_sku,
+    SUM(consumable_sku_qty) AS ordered_qty
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase'
+    AND consumable_sku IS NOT NULL
+  GROUP BY po, consumable_sku
+),
+
+po_exists AS (
+  SELECT DISTINCT po
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase'
+)
+
+SELECT l.po, l.consumable_sku
+FROM led l
+JOIN po_exists pe USING (po)
+LEFT JOIN po_lines pl
+  ON l.po = pl.po AND l.consumable_sku = pl.consumable_sku
+WHERE COALESCE(pl.ordered_qty, 0) <= 0  -- PO exists, but orders none of this received SKU
 ```
 
 #### Live finder SQL (what runs daily)
 
 ```sql
--- 3-way match: a consumable_sku received against an existing PO but not on its lines.
+-- 3-way match: a consumable_sku received against an existing PO that orders none of it
+-- (not on its lines, OR on a line ordered for 0 — a Ship Hero zero-order receive-line).
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH led AS (   -- items received against POs yesterday
-  SELECT ref_order_id AS po, consumable_sku,
-         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system,
-         ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS ruom,
-         SUM(consumable_quantity_change) AS received_qty,
-         DATE(MIN(datetime_utc)) AS first_receipt_date, DATE(MAX(datetime_utc)) AS last_receipt_date,
-         ANY_VALUE(l1_action HAVING MAX consumable_quantity_change) AS move_l1,
-         ANY_VALUE(l2_action HAVING MAX consumable_quantity_change) AS move_l2
+  SELECT
+    ref_order_id                                        AS po,
+    consumable_sku,
+    ANY_VALUE(facility_name)                            AS facility,
+    ANY_VALUE(system_of_origin)                         AS system,
+    ANY_VALUE(item_name)                                AS item_name,
+    ANY_VALUE(consumable_uom)                           AS ruom,
+    SUM(consumable_quantity_change)                     AS received_qty,
+    DATE(MIN(datetime_utc))                             AS first_receipt_date,
+    DATE(MAX(datetime_utc))                             AS last_receipt_date,
+    ANY_VALUE(l1_action HAVING MAX consumable_quantity_change) AS move_l1,
+    ANY_VALUE(l2_action HAVING MAX consumable_quantity_change) AS move_l2
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL AND DATE(datetime_utc)=run_date
-  GROUP BY po, consumable_sku),
-po_keys AS (   -- every (PO, item) that IS on a purchase order's lines
-  SELECT DISTINCT po, consumable_sku FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type='Purchase' AND consumable_sku IS NOT NULL),
+  WHERE ref_order_type = 'Purchase Order'
+    AND consumable_sku IS NOT NULL
+    AND DATE(datetime_utc) = run_date
+  GROUP BY po, consumable_sku
+),
+
+po_lines AS (   -- how much each (PO, item) actually ORDERS (summed across the PO's lines)
+  SELECT
+    po,
+    consumable_sku,
+    SUM(consumable_sku_qty)   AS ordered_qty,
+    ANY_VALUE(consumable_uom) AS ordered_uom
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase'
+    AND consumable_sku IS NOT NULL
+  GROUP BY po, consumable_sku
+),
+
 po_exists AS (   -- POs that actually exist
-  SELECT po, ANY_VALUE(supplier_name) AS supplier FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
-  WHERE order_type='Purchase' GROUP BY po),
+  SELECT
+    po,
+    ANY_VALUE(supplier_name) AS supplier
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Purchase'
+  GROUP BY po
+),
+
 flagged AS (
-  SELECT l.*, pe.supplier
-  FROM led l JOIN po_exists pe USING (po)                 -- the PO is real …
-  LEFT JOIN po_keys pk ON l.po=pk.po AND l.consumable_sku=pk.consumable_sku
-  WHERE pk.po IS NULL),                                   -- … but this item isn't on it
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
-                  ROW_NUMBER() OVER (ORDER BY last_receipt_date DESC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 500 ORDER BY last_receipt_date DESC
+  SELECT
+    l.*,
+    pe.supplier,
+    pl.ordered_qty,
+    pl.ordered_uom,
+    (pl.consumable_sku IS NOT NULL) AS on_po
+  FROM led l
+  JOIN po_exists pe USING (po)                              -- the PO is real …
+  LEFT JOIN po_lines pl
+    ON l.po = pl.po AND l.consumable_sku = pl.consumable_sku
+  WHERE COALESCE(pl.ordered_qty, 0) <= 0                    -- … but it orders none of this item
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                               AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_receipt_date DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY last_receipt_date DESC
 ```
 
 ### Plain-English walkthrough
@@ -1057,8 +1733,9 @@ table** (what was ordered). It's built in named steps.
    received yesterday, with the net quantity and triage details (facility, system, item name, the
    dominant receiving action, first/last receipt dates).
 
-3. **`po_keys` — the "allowed" list.** Every (PO, item) combination that **is** on a purchase order's
-   lines. Think of this as the guest list: which items each PO actually ordered.
+3. **`po_lines` — how much each (PO, item) actually orders.** For every (PO, item) on a purchase
+   order's lines, sum `consumable_sku_qty` to get the **ordered quantity**. Think of this as the guest
+   list *with a headcount*: not just "is this item invited," but "how many were ordered."
 
 4. **`po_exists` — which POs are real.** The set of PO numbers that exist at all (plus the supplier).
 
@@ -1066,12 +1743,14 @@ table** (what was ordered). It's built in named steps.
    - `JOIN po_exists … USING (po)` — first confirm the **PO is real**. (If the PO itself didn't
      exist, that's a *different* problem — a missing PO, not a wrong item — so we require it to exist
      here.)
-   - `LEFT JOIN po_keys … ON po AND consumable_sku` then **`WHERE pk.po IS NULL`** — this is the key
-     trick, called an *anti-join*. A `LEFT JOIN` tries to find a matching row in the guest list
-     (`po_keys`) for this received item; if it finds one, the `pk.*` columns are filled in; if it
-     finds **none**, they come back empty (`NULL`). So `WHERE pk.po IS NULL` keeps exactly the
-     receipts **where the item was *not* found on the PO** — i.e. the three-way-match breaks. In plain
-     terms: "the PO is real, but this item isn't on its guest list."
+   - `LEFT JOIN po_lines … ON po AND consumable_sku` then **`WHERE COALESCE(pl.ordered_qty,0) <= 0`** —
+     the `LEFT JOIN` looks the received item up on the PO's lines; if it isn't there, `pl.ordered_qty`
+     comes back empty (`NULL`), and `COALESCE(…,0)` turns that into `0`. So the filter keeps receipts
+     where the PO orders **zero or none** of the item — covering **both** breaks at once: the item is
+     *not on the PO at all* (NULL → 0), **or** it's *on a line ordered for 0*. In plain terms: "the PO
+     is real, but it orders none of this item — yet we received it." The zero-order case matters
+     because Ship Hero can auto-create a receive-line with order qty 0 for an unexpected item, and if
+     nothing was ordered we may never invoice the vendor.
 
 6. **`ranked` + final line — count, cap at 500, newest-first.**
 
@@ -1083,10 +1762,11 @@ table** (what was ordered). It's built in named steps.
 | Column (table) | Plain meaning | Role in this rule |
 |---|---|---|
 | `ref_order_id` (ledger) | The PO the receipt was booked against. | **Join key** — must exist in the PO table. |
-| `consumable_sku` (ledger) | The item that was received. | **The check** — must appear on that PO's lines. |
+| `consumable_sku` (ledger) | The item that was received. | **The check** — the PO must order a positive quantity of it. |
 | `datetime_utc` (ledger) | When it was received. | **Filter** — yesterday; sets the receipt dates. |
 | `consumable_quantity_change` (ledger) | Quantity received. | Net received qty shown on the ticket. |
 | `po`, `consumable_sku` (PO) | The order's lines (what was ordered). | The "guest list" the received item is matched against. |
+| `consumable_sku_qty` (PO) | Quantity ordered on the PO line. | **The check** — summed per (PO, item); `<= 0` (or no line) is a break. |
 | `supplier_name` (PO) | Vendor on the PO. | Triage context. |
 
 ### Example of a flagged record (from the dashboard)
@@ -1160,7 +1840,8 @@ explained once here and not repeated in each walkthrough.
 ```sql
 -- A consumable_sku with waste/adjust activity that has NO row in the ERP standard-cost table
 -- (ITEMID), so its waste can't be valued. LEFT JOIN waste-active SKUs -> cost; flag the misses.
-SELECT w.consumable_sku FROM (waste-active consumable_sku) w
+SELECT w.consumable_sku
+FROM (waste-active consumable_sku) w
 LEFT JOIN (erp standard cost, ITEMID) c ON CAST(w.consumable_sku AS STRING) = c.ITEMID
 WHERE c.ITEMID IS NULL
 ```
@@ -1174,37 +1855,72 @@ WHERE c.ITEMID IS NULL
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH cost AS (   -- latest-activated ERP standard cost per item (see "Where the standard cost comes from")
-  SELECT ITEMID, AVG(UnitPrice) AS unit_cost, ANY_VALUE(UNITID) AS cost_uom FROM (
-    SELECT p.ITEMID, SAFE_DIVIDE(p.PRICE, p.PRICEUNIT) AS UnitPrice, p.UNITID
+  SELECT
+    ITEMID,
+    AVG(UnitPrice)    AS unit_cost,
+    ANY_VALUE(UNITID) AS cost_uom
+  FROM (
+    SELECT
+      p.ITEMID,
+      SAFE_DIVIDE(p.PRICE, p.PRICEUNIT) AS UnitPrice,
+      p.UNITID
     FROM `wonder-raw-prod.erp_prod_batch.inventitempriceftistaging` AS p
     INNER JOIN (
-      SELECT MAX(price.ActivationDate) AS ActivationDate, MAX(price.CREATEDTIME) AS CREATEDTIME,
-             price.ITEMID, price.INVENTDIMID, price.DATAAREAID
+      SELECT
+        MAX(price.ActivationDate) AS ActivationDate,
+        MAX(price.CREATEDTIME)    AS CREATEDTIME,
+        price.ITEMID,
+        price.INVENTDIMID,
+        price.DATAAREAID
       FROM `wonder-raw-prod.erp_prod_batch.inventitempriceftistaging` AS price
       INNER JOIN `wonder-raw-prod.erp_prod_batch.inventdimftistaging` AS dim
         ON dim.INVENTDIMID = price.INVENTDIMID AND LOWER(dim.INVENTDIMDATAAREAID) = LOWER(price.DATAAREAID)
         AND LOWER(dim.INVENTSITEID) = 'control'
       GROUP BY price.ITEMID, price.DATAAREAID, price.INVENTDIMID
-    ) m ON m.ITEMID = p.ITEMID AND m.ActivationDate = p.ActivationDate AND m.CREATEDTIME = p.CREATEDTIME
-       AND LOWER(m.INVENTDIMID) = LOWER(p.INVENTDIMID) AND LOWER(m.DATAAREAID) = LOWER(p.DATAAREAID))
-  GROUP BY ITEMID),
+    ) m
+      ON m.ITEMID = p.ITEMID AND m.ActivationDate = p.ActivationDate AND m.CREATEDTIME = p.CREATEDTIME
+      AND LOWER(m.INVENTDIMID) = LOWER(p.INVENTDIMID) AND LOWER(m.DATAAREAID) = LOWER(p.DATAAREAID)
+  )
+  GROUP BY ITEMID
+),
+
 waste AS (   -- items with waste/adjustment activity yesterday, and how much was lost
-  SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
-         ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
-         ANY_VALUE(system_of_origin) AS system,
-         SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
-         DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen
+  SELECT
+    consumable_sku,
+    ANY_VALUE(item_name)        AS item_name,
+    ANY_VALUE(consumable_uom)   AS consumable_uom,
+    ANY_VALUE(facility_name)    AS facility,
+    ANY_VALUE(facility_type)    AS facility_type,
+    ANY_VALUE(system_of_origin) AS system,
+    SUM(IF(consumable_quantity_change < 0, -consumable_quantity_change, 0)) AS waste_qty,
+    DATE(MIN(datetime_utc))     AS first_seen,
+    DATE(MAX(datetime_utc))     AS last_seen
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
   WHERE l1_action = 'Adjust'
     AND l2_action NOT IN ('Move From','Move To','Update Received Order','Shelf Life Extension')
-    AND consumable_sku IS NOT NULL AND DATE(datetime_utc) = run_date
-  GROUP BY consumable_sku),
+    AND consumable_sku IS NOT NULL
+    AND DATE(datetime_utc) = run_date
+  GROUP BY consumable_sku
+),
+
 flagged AS (   -- keep the wasted items with NO cost record
-  SELECT w.* FROM waste w
+  SELECT w.*
+  FROM waste w
   LEFT JOIN cost c ON CAST(w.consumable_sku AS STRING) = c.ITEMID
-  WHERE c.ITEMID IS NULL),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY waste_qty DESC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked ORDER BY waste_qty DESC
+  WHERE c.ITEMID IS NULL
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY waste_qty DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+ORDER BY waste_qty DESC
 ```
 
 ### Plain-English walkthrough
@@ -1288,7 +2004,10 @@ Accounting needs to set up a standard cost for the item in Dynamics.
 ```sql
 -- Framework #66: a consumable_sku active in the ledger whose ERP standard cost (PRICE/PRICEUNIT)
 -- is 0 or NULL — can't be costed. JOIN ledger SKUs -> cost; flag unit_cost IS NULL OR = 0.
-SELECT l.consumable_sku, c.unit_cost FROM (ledger consumable_sku) l
+SELECT
+  l.consumable_sku,
+  c.unit_cost
+FROM (ledger consumable_sku) l
 JOIN (erp standard cost) c ON CAST(l.consumable_sku AS STRING) = c.ITEMID
 WHERE c.unit_cost IS NULL OR c.unit_cost = 0
 ```
@@ -1300,33 +2019,72 @@ WHERE c.unit_cost IS NULL OR c.unit_cost = 0
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 
 WITH cost AS (   -- latest-activated ERP standard cost per item (identical to COST-01's `cost` step)
-  SELECT ITEMID, AVG(UnitPrice) AS unit_cost, ANY_VALUE(UNITID) AS cost_uom FROM (
-    SELECT p.ITEMID, SAFE_DIVIDE(p.PRICE, p.PRICEUNIT) AS UnitPrice, p.UNITID
+  SELECT
+    ITEMID,
+    AVG(UnitPrice)    AS unit_cost,
+    ANY_VALUE(UNITID) AS cost_uom
+  FROM (
+    SELECT
+      p.ITEMID,
+      SAFE_DIVIDE(p.PRICE, p.PRICEUNIT) AS UnitPrice,
+      p.UNITID
     FROM `wonder-raw-prod.erp_prod_batch.inventitempriceftistaging` AS p
     INNER JOIN (
-      SELECT MAX(price.ActivationDate) AS ActivationDate, MAX(price.CREATEDTIME) AS CREATEDTIME,
-             price.ITEMID, price.INVENTDIMID, price.DATAAREAID
+      SELECT
+        MAX(price.ActivationDate) AS ActivationDate,
+        MAX(price.CREATEDTIME)    AS CREATEDTIME,
+        price.ITEMID,
+        price.INVENTDIMID,
+        price.DATAAREAID
       FROM `wonder-raw-prod.erp_prod_batch.inventitempriceftistaging` AS price
       INNER JOIN `wonder-raw-prod.erp_prod_batch.inventdimftistaging` AS dim
         ON dim.INVENTDIMID = price.INVENTDIMID AND LOWER(dim.INVENTDIMDATAAREAID) = LOWER(price.DATAAREAID)
         AND LOWER(dim.INVENTSITEID) = 'control'
       GROUP BY price.ITEMID, price.DATAAREAID, price.INVENTDIMID
-    ) m ON m.ITEMID = p.ITEMID AND m.ActivationDate = p.ActivationDate AND m.CREATEDTIME = p.CREATEDTIME
-       AND LOWER(m.INVENTDIMID) = LOWER(p.INVENTDIMID) AND LOWER(m.DATAAREAID) = LOWER(p.DATAAREAID))
-  GROUP BY ITEMID),
+    ) m
+      ON m.ITEMID = p.ITEMID AND m.ActivationDate = p.ActivationDate AND m.CREATEDTIME = p.CREATEDTIME
+      AND LOWER(m.INVENTDIMID) = LOWER(p.INVENTDIMID) AND LOWER(m.DATAAREAID) = LOWER(p.DATAAREAID)
+  )
+  GROUP BY ITEMID
+),
+
 led AS (   -- every item active in the ledger yesterday
-  SELECT consumable_sku, ANY_VALUE(item_name) AS item_name, ANY_VALUE(consumable_uom) AS consumable_uom,
-         ANY_VALUE(facility_name) AS facility, ANY_VALUE(facility_type) AS facility_type,
-         ANY_VALUE(system_of_origin) AS system, DATE(MAX(datetime_utc)) AS last_seen
+  SELECT
+    consumable_sku,
+    ANY_VALUE(item_name)        AS item_name,
+    ANY_VALUE(consumable_uom)   AS consumable_uom,
+    ANY_VALUE(facility_name)    AS facility,
+    ANY_VALUE(facility_type)    AS facility_type,
+    ANY_VALUE(system_of_origin) AS system,
+    DATE(MAX(datetime_utc))     AS last_seen
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
-  WHERE consumable_sku IS NOT NULL AND DATE(datetime_utc) = run_date
-  GROUP BY consumable_sku),
+  WHERE consumable_sku IS NOT NULL
+    AND DATE(datetime_utc) = run_date
+  GROUP BY consumable_sku
+),
+
 flagged AS (   -- items that HAVE a cost record, but the cost is 0/NULL
-  SELECT l.*, c.unit_cost, c.cost_uom
-  FROM led l JOIN cost c ON CAST(l.consumable_sku AS STRING) = c.ITEMID
-  WHERE c.unit_cost IS NULL OR c.unit_cost = 0),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= 5 ORDER BY last_seen DESC
+  SELECT
+    l.*,
+    c.unit_cost,
+    c.cost_uom
+  FROM led l
+  JOIN cost c ON CAST(l.consumable_sku AS STRING) = c.ITEMID
+  WHERE c.unit_cost IS NULL OR c.unit_cost = 0
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 5
+ORDER BY last_seen DESC
 ```
 
 ### Plain-English walkthrough

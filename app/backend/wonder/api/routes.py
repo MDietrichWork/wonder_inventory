@@ -299,7 +299,10 @@ def breakdown(pk: int, db=Depends(get_db)):
         return _BREAKDOWN_CACHE[pk]
     e = _get_error(db, pk)
     snap = e.data_snapshot or {}
-    po, sku, sysn = snap.get("po"), snap.get("consumable_sku"), snap.get("system")
+    # Drill-down is keyed on ims_sku (the finder's grain); fall back to consumable_sku for any
+    # legacy ticket saved before the two-way-match refinement.
+    po, sysn = snap.get("po"), snap.get("system")
+    sku = snap.get("ims_sku") or snap.get("consumable_sku")
     if settings.data_source != "bigquery" or not po or not sku:
         return {"available": False, "rows": []}
     from ..rules.bq_finder import breakdown as bq_breakdown

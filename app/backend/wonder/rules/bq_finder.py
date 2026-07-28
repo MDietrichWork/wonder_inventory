@@ -4,9 +4,9 @@ At 187M-row ledger / 18.8M-row PO scale we can't fetch tables into Python, so th
 bigquery data path uses these SQL finders instead of the in-Python engine. Every query
 is capped via maximum_bytes_billed so a misfire can never run up a large bill.
 
-Currently implemented: PO-03 over-receipt (the rule that actually fires on real data).
-PO-01/PO-02 are kept in the catalog but find nothing on current data; transfer/on-hand
-rules need cross-partition cumulative logic (later).
+Currently implemented: PO-03 over-receipt and PO-01 null-PO-on-receipt both fire on real
+data (PO-01 catches Fishbowl/CK1 blank-PO receipts). PO-02 is kept in the catalog but finds
+nothing on current data; transfer/on-hand rules need cross-partition cumulative logic (later).
 """
 from typing import List, Tuple
 
@@ -20,11 +20,20 @@ BACKFILL_CAP = 10         # per-band cap (genuine / implausible / UoM-mismatch) 
 RECEIPT_LOOKBACK_DAYS = 30   # daily: how far back to sum cumulative received for a touched PO
 BACKFILL_LOOKBACK_DAYS = 14   # initial run: history to sweep for the existing backlog (2 weeks)
 
-# Over-receipt, per Pavel:
+# Over-receipt — refined per Jonny Li (data analyst, final SQL sign-off): a TWO-WAY match keyed on
+# ims_sku (the raw system id sent to BOTH tables), not the translated consumable_sku.
 #   order join : ledger.ref_order_id  ->  PO `po`
-#   item link  : consumable_sku (both tables)
-#   received   : SUM(ledger.consumable_quantity_change), ref_order_type='Purchase Order', up to run_date
-#   ordered    : PO consumable_sku_qty
+#   item link  : ims_sku (both tables)   [was consumable_sku — a translation that fanned one order
+#                                          across rows and ~2.5x'd the false-positive count: 109 -> ~34]
+#   LAYER 1 (PO's own books): PO.received_qty vs PO.ims_sku_qty — packaging units (cs/pk/ea), one
+#            table, fully populated, no conversion. This is the "PO receipt" primary signal.
+#   LAYER 2 (ledger cumulative): SUM(ledger.consumable_quantity_change) vs PO.consumable_sku_qty —
+#            BASE units (oz/lb/g). Base is the only reliable cross-system ledger measure:
+#            consumable_quantity_change is 100% populated, ledger.ims_quantity_change is ALSO stored
+#            in the base unit (so it does NOT line up with PO.ims_sku_qty's packaging unit), and
+#            ledger.supplier_quantity_change is NULL for Pantry (the biggest receiving flow).
+#   Flag if EITHER layer is over the threshold (a two-way match): the PO's books may look clean while
+#   the ledger over-books, or vice-versa. Each layer compares like-unit-to-like-unit within itself.
 # Two run modes:
 #   daily    — flag only POs that RECEIVED on the run-date partition, cumulative received vs ordered
 #   backfill — flag ALL over-received POs across history (the one-time initial catch-up)
@@ -34,23 +43,27 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: flo
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
     # Per-receipt event stream (the same rows the daily/backfill modes already scan) carrying a
-    # running cumulative received qty per (po, sku) — so we can pinpoint the BREACH date: the
-    # receipt at which cumulative received first crossed the ordered threshold = when the error
+    # running cumulative received qty per (po, ims_sku) — so we can pinpoint the BREACH date: the
+    # receipt at which the ledger cumulative first crossed the ordered threshold = when the error
     # truly began. (daily restricts to POs touched on the run-date; backfill sweeps the window.)
     join = (f"""
-  JOIN (SELECT DISTINCT ref_order_id AS po, consumable_sku FROM `{proj}.{dset}.{led}`
-        WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL
+  JOIN (SELECT DISTINCT ref_order_id AS po, ims_sku FROM `{proj}.{dset}.{led}`
+        WHERE ref_order_type = 'Purchase Order' AND ims_sku IS NOT NULL
           AND DATE(datetime_utc) = @run_date) t
-    ON l.ref_order_id = t.po AND l.consumable_sku = t.consumable_sku""" if not backfill else "")
+    ON l.ref_order_id = t.po AND l.ims_sku = t.ims_sku""" if not backfill else "")
     evt = f"""evt AS (
-  SELECT l.ref_order_id AS po, l.consumable_sku, l.datetime_utc,
-         l.consumable_quantity_change AS q, l.consumable_uom AS ruom,
+  SELECT l.ref_order_id AS po, l.ims_sku, l.consumable_sku, l.datetime_utc,
+         l.ims_quantity_change AS q, l.consumable_uom AS ruom,   -- Layer 2 received = IMS qty (per Jonny: consumable qty over-flagged)
          l.facility_name AS facility, l.facility_type AS facility_type,
          l.system_of_origin AS system, l.item_name AS item_name,
          l.l1_action AS l1_action, l.l2_action AS l2_action,
          SUM(l.consumable_quantity_change) OVER (
-           PARTITION BY l.ref_order_id, l.consumable_sku ORDER BY l.datetime_utc
-           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv
+           PARTITION BY l.ref_order_id, l.ims_sku ORDER BY l.datetime_utc
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_recv,
+         -- how many 'Add' receipts share this exact quantity (>=2 = probable double-booking).
+         -- Partition key CAST to STRING — BigQuery can't PARTITION BY a FLOAT64.
+         SUM(IF(l.l1_action = 'Add' AND l.consumable_quantity_change > 0, 1, 0)) OVER (
+           PARTITION BY l.ref_order_id, l.ims_sku, CAST(ROUND(l.consumable_quantity_change, 4) AS STRING)) AS same_qty_receipts
   FROM `{proj}.{dset}.{led}` l{join}
   -- ref_order_type='Purchase Order' INTENTIONALLY captures EVERY ledger line tied to the PO,
   -- positive and negative, so SUM(q) below is a true NET. A receiver may double-log / over-log
@@ -60,57 +73,70 @@ def _build_sql(backfill: bool, lookback: int, high: float, cap: int, urgent: flo
   -- or l2_action LIKE '%Receipt%' — that would drop the manual corrections and re-break netting.
   -- (Corrections booked as generic Adjust/Cycle-Count carry NO PO ref and are deliberately left
   -- alone: they can't be attributed to a specific PO without a fuzzy SKU+facility+window guess.)
-  WHERE l.ref_order_type = 'Purchase Order' AND l.consumable_sku IS NOT NULL
+  WHERE l.ref_order_type = 'Purchase Order' AND l.ims_sku IS NOT NULL
     AND DATE(l.datetime_utc) <= @run_date
     AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY))"""
     # Rank within each band (genuine over_frac<=1 vs implausible >1) so the cap keeps BOTH
     # populations represented instead of the most-extreme corrupt rows crowding out genuine ones.
     return "WITH " + evt + f""",
-received AS (
-  SELECT po, consumable_sku, SUM(q) AS received_qty, ANY_VALUE(ruom) AS received_uom,
+received AS (   -- LAYER 2 basis: net ledger receipts per (po, ims_sku), BASE units
+  SELECT po, ims_sku, SUM(q) AS led_received, ANY_VALUE(ruom) AS received_uom,
+         ANY_VALUE(consumable_sku) AS consumable_sku,
          ANY_VALUE(facility) AS facility, ANY_VALUE(facility_type) AS facility_type,
          ANY_VALUE(system) AS system, ANY_VALUE(item_name) AS item_name,
          -- movement action of the largest receipt = the dominant receiving event (l1 / l2)
-         ANY_VALUE(l1_action HAVING MAX q) AS move_l1, ANY_VALUE(l2_action HAVING MAX q) AS move_l2
-  FROM evt GROUP BY po, consumable_sku),
-ordered AS (
-  SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty,
-         ANY_VALUE(consumable_uom) AS ordered_uom,
-         ANY_VALUE(supplier_name) AS supplier, ANY_VALUE(status) AS status
+         ANY_VALUE(l1_action HAVING MAX q) AS move_l1, ANY_VALUE(l2_action HAVING MAX q) AS move_l2,
+         MAX(same_qty_receipts) AS dup_receipts   -- >=2 = ledger booked the same receipt twice
+  FROM evt GROUP BY po, ims_sku),
+ordered AS (   -- ordered in BOTH units + the PO's OWN received_qty (LAYER 1), per (po, ims_sku)
+  SELECT po, ims_sku,
+         SUM(ims_sku_qty)          AS ordered_pkg,    -- packaging units (cs/pk/ea) — Layer 1 basis
+         SUM(consumable_sku_qty)   AS ordered_base,    -- base units (oz/lb/g)       — Layer 2 basis
+         SUM(received_qty)         AS po_received,     -- the PO's own cumulative received (packaging)
+         ANY_VALUE(consumable_uom) AS ordered_uom, ANY_VALUE(ims_uom) AS ims_uom,
+         ANY_VALUE(supplier_name)  AS supplier, ANY_VALUE(status) AS status
   FROM `{proj}.{dset}.{po}`
-  WHERE consumable_sku IS NOT NULL AND order_type = 'Purchase'   -- PO-side: purchases only (for now)
-  GROUP BY po, consumable_sku),
+  WHERE ims_sku IS NOT NULL AND order_type = 'Purchase'   -- PO-side: purchases only (for now)
+  GROUP BY po, ims_sku),
 breach AS (
-  SELECT e.po, e.consumable_sku,
-         -- first receipt where cumulative crossed the over-receipt threshold
-         DATE(MIN(IF(e.running_recv > o.ordered_qty * (1 + {high}), e.datetime_utc, NULL))) AS over_breach_date,
+  SELECT e.po, e.ims_sku,
+         -- first receipt where the ledger cumulative (base) crossed the over-receipt threshold
+         DATE(MIN(IF(e.running_recv > o.ordered_base * (1 + {high}), e.datetime_utc, NULL))) AS over_breach_date,
          -- first receipt that introduced a unit different from the order's
          DATE(MIN(IF(o.ordered_uom IS NOT NULL AND e.ruom IS NOT NULL AND e.ruom != o.ordered_uom,
                      e.datetime_utc, NULL))) AS uom_breach_date,
          DATE(MIN(e.datetime_utc)) AS first_receipt_date,
          DATE(MAX(e.datetime_utc)) AS last_receipt_date
-  FROM evt e JOIN ordered o USING (po, consumable_sku)
-  GROUP BY po, consumable_sku),
-flagged AS (
-  SELECT r.po, r.consumable_sku, r.item_name, o.ordered_qty, r.received_qty,
-         o.ordered_uom, r.received_uom, r.facility, r.facility_type, r.system, o.supplier, o.status,
-         r.move_l1, r.move_l2,
-         SAFE_DIVIDE(r.received_qty, o.ordered_qty) - 1 AS over_frac,
+  FROM evt e JOIN ordered o USING (po, ims_sku)
+  GROUP BY po, ims_sku),
+flagged AS (   -- TWO-WAY match: keep a row if the PO's own books OR the ledger cumulative are over
+  SELECT r.po, r.ims_sku, r.consumable_sku, r.item_name,
+         o.ordered_pkg, o.ordered_base, o.po_received, r.led_received,
+         o.ordered_uom, r.received_uom, o.ims_uom,
+         r.facility, r.facility_type, r.system, o.supplier, o.status, r.move_l1, r.move_l2, r.dup_receipts,
+         (o.ordered_pkg  > 0 AND o.po_received  > o.ordered_pkg  * (1 + {high})) AS po_over,
+         (o.ordered_base > 0 AND r.led_received > o.ordered_base * (1 + {high})) AS led_over,
+         SAFE_DIVIDE(o.po_received,  NULLIF(o.ordered_pkg, 0))  - 1 AS po_over_frac,
+         SAFE_DIVIDE(r.led_received, NULLIF(o.ordered_base, 0)) - 1 AS led_over_frac,
+         GREATEST(IFNULL(SAFE_DIVIDE(o.po_received,  NULLIF(o.ordered_pkg, 0))  - 1, -9),
+                  IFNULL(SAFE_DIVIDE(r.led_received, NULLIF(o.ordered_base, 0)) - 1, -9)) AS over_frac,
          (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom) AS uom_mismatch,
          b.over_breach_date, b.uom_breach_date, b.first_receipt_date, b.last_receipt_date
-  FROM received r JOIN ordered o USING (po, consumable_sku)
-                  JOIN breach b USING (po, consumable_sku)
-  WHERE o.ordered_qty > 0 AND (
+  FROM received r JOIN ordered o USING (po, ims_sku)
+                  JOIN breach b USING (po, ims_sku)
+  WHERE (o.ordered_pkg > 0 OR o.ordered_base > 0) AND (
         (o.ordered_uom IS NOT NULL AND r.received_uom IS NOT NULL AND o.ordered_uom != r.received_uom)
-        OR r.received_qty > o.ordered_qty * (1 + {high})
+        OR (o.ordered_pkg  > 0 AND o.po_received  > o.ordered_pkg  * (1 + {high}))
+        OR (o.ordered_base > 0 AND r.led_received > o.ordered_base * (1 + {high}))
   )
 ),
 -- Rank within each band (High 30-99% vs Urgent >=100%) so the per-band cap keeps BOTH
--- populations represented instead of the most-extreme rows crowding out the mid-band ones.
+-- populations represented instead of the most-extreme rows crowding out the mid-band ones. A pure
+-- UoM mismatch (neither layer over — the over% isn't comparable) gets its own band.
 ranked AS (
   SELECT *, COUNT(*) OVER() AS total_matches,
          ROW_NUMBER() OVER (
-           PARTITION BY (CASE WHEN uom_mismatch THEN 'uom'
+           PARTITION BY (CASE WHEN uom_mismatch AND NOT (po_over OR led_over) THEN 'uom'
                               WHEN over_frac >= {urgent} THEN 'over_urgent'  -- >=100% over (>=2x ordered): likely error (Urgent)
                               ELSE 'over_high' END)                         -- 30-99% over: supply-chain signal (High)
            ORDER BY over_frac DESC) AS rn
@@ -124,13 +150,53 @@ def _d(v):
     return str(v) if v else None
 
 
+def _pct(frac):
+    return round(frac * 100, 1) if frac is not None else None
+
+
+def _layer_str(recv, ordered, uom, pct):
+    """One-line human summary of a layer: 'received 27540 of 1620 ea (+1600.0% over)'."""
+    if recv is None or ordered is None:
+        return None
+    u = (" " + uom) if uom else ""
+    tail = "" if pct is None else ("  (%+.1f%% over)" % pct)
+    return "received %s of %s%s ordered%s" % (recv, ordered, u, tail)
+
+
 def _snap(r, high):
-    return {
-        "po": r.po, "consumable_sku": r.consumable_sku, "item_name": r.item_name,
-        "ordered_qty": r.ordered_qty, "ordered_uom": r.ordered_uom,
-        "received_qty": r.received_qty, "received_uom": r.received_uom,
+    po_pct, led_pct = _pct(r.po_over_frac), _pct(r.led_over_frac)
+    po_over, led_over = bool(r.po_over), bool(r.led_over)
+    dup = int(getattr(r, "dup_receipts", 0) or 0)
+    ledger_error = led_over and not po_over   # PO receipt looks right; the ledger is the one over
+    # Two-way-match verdict (which signal(s) tripped) — the headline of a refined PO-03 ticket.
+    if po_over and led_over:
+        match = "Confirmed by both the PO's own receipts and the ledger cumulative."
+    elif led_over:
+        match = ("PO receipt appears correct (matched the order); the ledger over-counted — likely a "
+                 "duplicate or erroneous ledger entry. Investigate the ledger, not the receiving.")
+        if dup >= 2:
+            match += " %d identical receipts detected (probable double-booking)." % dup
+    elif po_over:
+        match = "The PO's own received_qty is over-ordered; the ledger cumulative is within range."
+    else:
+        match = "Unit-of-measure mismatch — the received unit differs from the ordered unit."
+    # Headline = the tripped layer (prefer the ledger cumulative — it's the fuller, cross-system
+    # signal and always carries a base unit). Ledger side is base units; PO-books side is packaging.
+    if led_over or not po_over:
+        ordered_qty, received_qty, ouom, ruom, over_pct = (
+            r.ordered_base, r.led_received, r.ordered_uom, r.received_uom, led_pct)
+        cross = {"po_receipts_check": _layer_str(r.po_received, r.ordered_pkg, r.ims_uom, po_pct)}
+    else:
+        ordered_qty, received_qty, ouom, ruom, over_pct = (
+            r.ordered_pkg, r.po_received, r.ims_uom, r.ims_uom, po_pct)
+        cross = {"ledger_check": _layer_str(r.led_received, r.ordered_base, r.ordered_uom, led_pct)}
+    s = {
+        "po": r.po, "consumable_sku": r.consumable_sku, "ims_sku": r.ims_sku, "item_name": r.item_name,
+        "match": match,
+        "ordered_qty": ordered_qty, "ordered_uom": ouom,
+        "received_qty": received_qty, "received_uom": ruom,
         "uom_match": (r.ordered_uom == r.received_uom),
-        "over_by_pct": round((r.over_frac or 0.0) * 100, 1), "tolerance_pct": round(high * 100, 1),
+        "over_by_pct": over_pct, "tolerance_pct": round(high * 100, 1),
         "status": r.status, "supplier": r.supplier,
         "facility": r.facility or "—", "facility_type": r.facility_type, "system": r.system or "—",
         # inventory movement (ledger l1 / l2 of the receiving event) — drives the dashboard breakout
@@ -138,12 +204,17 @@ def _snap(r, high):
         # data-derived timeline: when the error actually began vs. last activity
         "first_receipt": _d(r.first_receipt_date), "last_receipt": _d(r.last_receipt_date),
     }
+    s.update(cross)
+    if ledger_error:   # machine flag for dashboard grouping (routing unchanged — stays Field Ops)
+        s["likely_ledger_error"] = True
+    return s
 
 
 def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """PO_OVER_RECEIPT — 30-99% over → High, >=100% over (>=2× ordered) → Urgent. Routed by
-    facility_type at assignment time (HDR → Field Ops/IKC, CK/DISH/PRODUCTION → Field Ops/ProdCo).
-    UoM mismatches split off as PO_UOM_MISMATCH (not comparable as an overage %)."""
+    """PO_OVER_RECEIPT — TWO-WAY match (PO's own received_qty AND the ledger cumulative), keyed on
+    ims_sku. 30-99% over → High, >=100% over (>=2× ordered) → Urgent. Routed by facility_type at
+    assignment time (HDR → Field Ops/IKC, CK/DISH/PRODUCTION → Field Ops/ProdCo). A pure UoM mismatch
+    (neither layer over — the overage % isn't comparable) splits off as PO_UOM_MISMATCH."""
     bq = ds._bq
     high = settings.over_receipt_high_pct
     urgent = settings.over_receipt_urgent_pct
@@ -158,9 +229,10 @@ def _over_receipt(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     rows = list(ds.client.query(sql, job_config=cfg).result())
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
-        ek = f"{r.po}:{r.consumable_sku}"
+        ek = f"{r.po}:{r.ims_sku}"
         s = _snap(r, high)
-        if r.uom_mismatch:  # ordered/received in different UoM → over-receipt % is not comparable
+        po_over, led_over = bool(r.po_over), bool(r.led_over)
+        if not (po_over or led_over):  # pure UoM mismatch → over-receipt % is not comparable
             # the error began at the first receipt in the conflicting unit
             s["breached_at"] = _d(r.uom_breach_date) or s["first_receipt"] or s["last_receipt"]
             findings.append(Finding("PO-03", "PO_UOM_MISMATCH", "High", src, ek, s))
@@ -513,10 +585,16 @@ def recheck_null_po(ds, ids):
 
 
 def _build_null_po_ledger_sql(backfill: bool, lookback: int, cap: int) -> str:
-    """PO-01: a PO-order-type receiving row in the LEDGER carrying no PO number (ref_order_id is
-    NULL/blank) — so the receipt can't be matched to what was ordered. Safety-net: finds 0 on
-    current data (every PO receipt is numbered today), wired so it tickets + auto-closes the moment
-    upstream ever degrades. Ledger sibling of PO-13 (which checks the PO master table)."""
+    """PO-01: a PO-receipt ledger row carrying no PO number (ref_order_id is NULL/blank) — so the
+    receipt can't be matched to what was ordered. Identify the receipt by its movement ACTION, not by
+    ref_order_type: on exactly these degraded rows ref_order_type is itself blank (Fishbowl/CK1
+    receipts land with both ref_order_type and ref_order_id NULL), so keying on
+    ref_order_type='Purchase Order' misses every one of them. Two receipt actions exist across
+    systems: 'PO Receipt' (Fishbowl/Extensiv/Shiphero/RMX) and 'Received' (Pantry). We match all
+    'PO Receipt' rows, but scope 'Received' to system_of_origin='Pantry' — a *different* source
+    ('System') also emits 'Received' for negative-qty depletion/reversal entries that are ~never
+    PO-linked (2/437 over 90d), so an unscoped 'Received' would flood the Urgent queue with noise.
+    Ledger sibling of PO-13 (PO master table)."""
     proj, dset = settings.gcp_project, settings.bq_dataset
     led = settings.bq_ledger_table
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
@@ -526,9 +604,11 @@ def _build_null_po_ledger_sql(backfill: bool, lookback: int, cap: int) -> str:
   SELECT CAST(id AS STRING) AS id, ANY_VALUE(facility_name) AS facility,
          ANY_VALUE(system_of_origin) AS system, ANY_VALUE(consumable_sku) AS consumable_sku,
          ANY_VALUE(item_name) AS item_name, ANY_VALUE(l1_action) AS l1_action,
-         ANY_VALUE(l2_action) AS l2_action, MIN(datetime_utc) AS datetime_utc
+         ANY_VALUE(l2_action) AS l2_action, ANY_VALUE(ref_order_type) AS ref_order_type,
+         MIN(datetime_utc) AS datetime_utc
   FROM `{proj}.{dset}.{led}`
-  WHERE ref_order_type = 'Purchase Order' AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '') {date_filter}
+  WHERE (l2_action = 'PO Receipt' OR (l2_action = 'Received' AND system_of_origin = 'Pantry'))
+    AND (ref_order_id IS NULL OR TRIM(ref_order_id) = '') {date_filter}
   GROUP BY id),
 ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY datetime_utc DESC) AS rn FROM flagged)
 SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY datetime_utc DESC"""
@@ -547,7 +627,7 @@ def _null_po_ledger(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     findings, total = [], (rows[0].total_matches if rows else 0)
     for r in rows:
         snap = {
-            "ledger_id": r.id, "ref_order_type": "Purchase Order", "ref_order_id": None,
+            "ledger_id": r.id, "ref_order_type": r.ref_order_type, "ref_order_id": None,
             "consumable_sku": r.consumable_sku, "item_name": r.item_name,
             "facility": r.facility or "—", "system": r.system or "—",
             "movement": ("%s / %s" % (r.l1_action, r.l2_action)) if r.l1_action else None,
@@ -640,9 +720,126 @@ def recheck_correction_missing_ref(ds, ids):
     return {r.id: {"missing": bool(r.still_null)} for r in ds.client.query(sql, job_config=cfg).result()}
 
 
+def _build_missing_uom_conversion_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """PO-06: a purchased Wonder-family item whose Consumable SKU <> Vendor SKU can't be resolved to a
+    unit conversion in the supply-chain catalog (wonder_products). Two failure modes, both surfaced:
+      - no catalog record for the consumable at all (missing_record=TRUE), or
+      - the consumable IS in the catalog but the PO's vendor SKU isn't among its linked vendor SKUs
+        (missing_record=FALSE) — so there's no packaging/conversion path from that vendor's pack to the
+        consumable base unit.
+    Join key: PO.consumable_sku = catalog.hdr_product_sku; the catalog's conversion factors are keyed to
+    its vendor_product_skus / priority_vendor_product_sku. (PO.wonder_sku is a different ID namespace
+    than catalog.wonder_product_sku, so it is NOT a join key.) Scoped to Wonder-family items
+    (ims_sku_type WSKU/Pack SKU, or a 40xxxxx consumable) where supplier_uom != consumable_uom — a
+    conversion is only needed when the units differ. One row per (consumable_sku, supplier_sku). Daily
+    flags items purchased on the run-date; backfill sweeps the lookback window. Age anchors to the first
+    in-scope PO date."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    cat = f"{proj}.{settings.bq_catalog_dataset}.{settings.bq_products_table}"
+    date_filter = ("AND DATE(po_date_utc) = @run_date" if not backfill else
+                   f"AND DATE(po_date_utc) <= @run_date "
+                   f"AND po_date_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH cat AS (   -- one row per Wonder product; join key hdr_product_sku = PO consumable_sku
+  SELECT hdr_product_sku AS hdr,
+         ARRAY_CONCAT_AGG(vendor_product_skus) AS vendors,          -- all linked vendor SKUs
+         ARRAY_AGG(DISTINCT priority_vendor_product_sku IGNORE NULLS) AS pvendors,
+         ANY_VALUE(wonder_product_name) AS product_name
+  FROM `{cat}`
+  WHERE status = 'ACTIVE' AND hdr_product_sku IS NOT NULL
+  GROUP BY hdr_product_sku),
+po AS (   -- Wonder-family purchase lines in scope, collapsed to one row per (consumable, vendor)
+  SELECT consumable_sku, supplier_sku,
+         ANY_VALUE(consumable_uom) AS consumable_uom, ANY_VALUE(supplier_uom) AS supplier_uom,
+         ANY_VALUE(supplier_name) AS supplier_name, ANY_VALUE(destination_name) AS facility,
+         ANY_VALUE(po_source_system) AS system, ANY_VALUE(ims_sku_type) AS sku_type,
+         ANY_VALUE(wonder_sku) AS wonder_sku, ANY_VALUE(po) AS sample_po, COUNT(DISTINCT po) AS po_count,
+         MIN(po_date_utc) AS first_po_date, MAX(po_date_utc) AS last_po_date
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL AND supplier_sku IS NOT NULL
+    AND (ims_sku_type IN ('WSKU','Pack SKU') OR REGEXP_CONTAINS(consumable_sku, r'^40[0-9]{{5}}$'))
+    AND NOT REGEXP_CONTAINS(consumable_sku, r'^9[0-9]{{6}}$')  -- exclude 9xxxxxx smallwares/packaging (Uline/Ed Don) — never in the food catalog
+    AND consumable_uom != supplier_uom            -- a conversion is genuinely required
+    {date_filter}
+  GROUP BY consumable_sku, supplier_sku),
+flagged AS (
+  SELECT p.*, c.product_name, (c.hdr IS NULL) AS missing_record
+  FROM po p LEFT JOIN cat c ON p.consumable_sku = c.hdr
+  WHERE c.hdr IS NULL                                                     -- no catalog record at all
+     OR NOT (p.supplier_sku IN UNNEST(c.vendors)                         -- or vendor SKU not linked
+             OR p.supplier_sku IN UNNEST(c.pvendors))),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
+                  ROW_NUMBER() OVER (ORDER BY last_po_date DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_po_date DESC"""
+
+
+def _missing_uom_conversion(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """PO_MISSING_UOM_CONVERSION (Urgent, Procurement) — framework PO-06. A purchased Wonder-family item
+    whose Consumable SKU <> Vendor SKU has no unit conversion in the supply-chain catalog. One finding
+    per (consumable_sku, supplier_sku); entity_key = 'consumable_sku:supplier_sku'."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    lookback = settings.po_missing_uom_conversion_lookback_days if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_missing_uom_conversion_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        ek = f"{r.consumable_sku}:{r.supplier_sku}"
+        gap = ("No catalog record for this consumable SKU" if r.missing_record
+               else "Vendor SKU not linked to this consumable in the catalog")
+        snap = {
+            "consumable_sku": r.consumable_sku, "wonder_sku": r.wonder_sku, "supplier_sku": r.supplier_sku,
+            "item_name": r.product_name, "sku_type": r.sku_type,
+            "consumable_uom": r.consumable_uom, "supplier_uom": r.supplier_uom,
+            "supplier_name": r.supplier_name, "facility": r.facility or "—", "system": r.system or "—",
+            "missing_record": bool(r.missing_record), "gap": gap,
+            "po_count": r.po_count, "sample_po": r.sample_po,
+            "first_po_date": str(r.first_po_date) if r.first_po_date else None,
+            "breached_at": (r.first_po_date.date().isoformat() if r.first_po_date else run_date),
+        }
+        findings.append(Finding("PO-06", "PO_MISSING_UOM_CONVERSION", "Urgent", src, ek, snap))
+    return findings, total
+
+
+def recheck_missing_uom_conversion(ds, pairs):
+    """For each open PO-06 ticket's (consumable_sku, supplier_sku), whether the catalog NOW resolves it
+    (a record exists AND the vendor SKU is linked) — those can be auto-closed. Returns
+    {(consumable_sku, supplier_sku): {"resolved": bool}}."""
+    if not pairs:
+        return {}
+    bq = ds._bq
+    proj = settings.gcp_project
+    cat = f"{proj}.{settings.bq_catalog_dataset}.{settings.bq_products_table}"
+    keys = ["%s~~%s" % (c, s) for (c, s) in pairs if c is not None and s is not None]
+    if not keys:
+        return {}
+    sql = f"""WITH cat AS (
+      SELECT hdr_product_sku AS hdr,
+             ARRAY_CONCAT_AGG(vendor_product_skus) AS vendors,
+             ARRAY_AGG(DISTINCT priority_vendor_product_sku IGNORE NULLS) AS pvendors
+      FROM `{cat}` WHERE status='ACTIVE' AND hdr_product_sku IS NOT NULL GROUP BY hdr_product_sku),
+    keys AS (SELECT SPLIT(k, '~~')[OFFSET(0)] AS consumable_sku, SPLIT(k, '~~')[SAFE_OFFSET(1)] AS supplier_sku
+             FROM UNNEST(@keys) k)
+    SELECT k.consumable_sku, k.supplier_sku,
+           (c.hdr IS NOT NULL AND (k.supplier_sku IN UNNEST(c.vendors)
+                                   OR k.supplier_sku IN UNNEST(c.pvendors))) AS resolved
+    FROM keys k LEFT JOIN cat c ON k.consumable_sku = c.hdr"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
+    return {(r.consumable_sku, r.supplier_sku): {"resolved": bool(r.resolved)}
+            for r in ds.client.query(sql, job_config=cfg).result()}
+
+
 def _build_sku_not_on_po_sql(backfill: bool, lookback: int, cap: int) -> str:
-    """PO-14 (catalog PO-02): a consumable_sku received against an existing PO that isn't on the
-    PO's lines. Ledger-sourced, so it carries the receiving l1/l2 movement."""
+    """PO-14 (catalog PO-02): a consumable_sku received against an existing PO with NO ordered
+    quantity for that SKU — either the SKU isn't on the PO's lines at all, or it IS on a line but
+    the ordered qty is 0 (COALESCE(SUM(consumable_sku_qty),0) <= 0). Per Jonny Li: Ship Hero can
+    auto-create a zero-order receive-line when an unexpected item arrives, so we may never invoice
+    the vendor — so 'received against a zero-order line' must flag alongside 'not on the PO'.
+    Ledger-sourced, so it carries the receiving l1/l2 movement."""
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
@@ -659,22 +856,27 @@ def _build_sku_not_on_po_sql(backfill: bool, lookback: int, cap: int) -> str:
   FROM `{proj}.{dset}.{led}`
   WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL {date_filter}
   GROUP BY po, consumable_sku),
-po_keys AS (SELECT DISTINCT po, consumable_sku FROM `{proj}.{dset}.{po}`
-            WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL),
+po_lines AS (SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty,
+                    ANY_VALUE(consumable_uom) AS ordered_uom
+             FROM `{proj}.{dset}.{po}`
+             WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL
+             GROUP BY po, consumable_sku),
 po_exists AS (SELECT po, ANY_VALUE(supplier_name) AS supplier FROM `{proj}.{dset}.{po}`
               WHERE order_type = 'Purchase' GROUP BY po),
 flagged AS (
-  SELECT l.*, pe.supplier
+  SELECT l.*, pe.supplier, pl.ordered_qty, pl.ordered_uom,
+         (pl.consumable_sku IS NOT NULL) AS on_po
   FROM led l JOIN po_exists pe USING (po)
-  LEFT JOIN po_keys pk ON l.po = pk.po AND l.consumable_sku = pk.consumable_sku
-  WHERE pk.po IS NULL),
+  LEFT JOIN po_lines pl ON l.po = pl.po AND l.consumable_sku = pl.consumable_sku
+  WHERE COALESCE(pl.ordered_qty, 0) <= 0),
 ranked AS (SELECT *, COUNT(*) OVER() AS total_matches,
                   ROW_NUMBER() OVER (ORDER BY last_receipt_date DESC) AS rn FROM flagged)
 SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_receipt_date DESC"""
 
 
 def _sku_not_on_po(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
-    """PO_SKU_NOT_ON_PO (High, SC Product (IMS)) — received SKU not on the matching PO."""
+    """PO_SKU_NOT_ON_PO (High, SC Product (IMS)) — received SKU with no ordered qty on the matching
+    PO: either not on the PO's lines, or on a line ordered for 0 (Ship Hero zero-order receive-line)."""
     bq = ds._bq
     src = settings.bq_ledger_table
     lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
@@ -688,19 +890,26 @@ def _sku_not_on_po(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
         ek = f"{r.po}:{r.consumable_sku}"
         snap = {
             "po": r.po, "consumable_sku": r.consumable_sku, "item_name": r.item_name,
-            "supplier_name": r.supplier, "on_po": False,
+            "supplier_name": r.supplier, "on_po": bool(r.on_po),
             "received_qty": r.received_qty, "received_uom": r.ruom,
             "facility": r.facility or "—", "system": r.system or "—",
             "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if r.move_l1 else None,
             "first_receipt": _d(r.first_receipt_date), "last_receipt": _d(r.last_receipt_date),
-            "breached_at": _d(r.first_receipt_date),  # first received against the PO without being on it
+            "breached_at": _d(r.first_receipt_date),  # first received against the PO with nothing ordered
         }
+        # When the SKU IS on the PO but ordered for 0, surface the ordered qty so the ticket makes the
+        # "received against a zero-order line" case explicit (drives the vendor-invoice check).
+        if r.on_po:
+            snap["ordered_qty"] = r.ordered_qty if r.ordered_qty is not None else 0
+            snap["ordered_uom"] = r.ordered_uom
         findings.append(Finding("PO-14", "PO_SKU_NOT_ON_PO", "High", src, ek, snap))
     return findings, total
 
 
 def recheck_sku_on_po(ds, pairs):
-    """Which (po, consumable_sku) tickets are NOW on the PO — those can be auto-closed."""
+    """Which (po, consumable_sku) tickets are NOW genuinely ordered on the PO (ordered qty > 0) —
+    those can be auto-closed. Requires a POSITIVE ordered qty, not just a line: a zero-order line is
+    the very thing PO-14 flags, so its mere presence must not close the ticket."""
     if not pairs:
         return set()
     bq = ds._bq
@@ -709,9 +918,11 @@ def recheck_sku_on_po(ds, pairs):
     keys = ["%s~~%s" % (p, s) for (p, s) in pairs if p is not None and s is not None]
     if not keys:
         return set()
-    sql = f"""SELECT DISTINCT CONCAT(po, '~~', consumable_sku) AS key
+    sql = f"""SELECT CONCAT(po, '~~', consumable_sku) AS key
     FROM `{proj}.{dset}.{po}`
-    WHERE order_type = 'Purchase' AND CONCAT(po, '~~', consumable_sku) IN UNNEST(@keys)"""
+    WHERE order_type = 'Purchase' AND CONCAT(po, '~~', consumable_sku) IN UNNEST(@keys)
+    GROUP BY po, consumable_sku
+    HAVING SUM(consumable_sku_qty) > 0"""
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
     return {r.key for r in ds.client.query(sql, job_config=cfg).result()}
@@ -1232,9 +1443,11 @@ def doc_sql(rule_id):
                            _build_null_po_ledger_sql(False, lb, cap))
     if rule_id == "PO-03":
         return _standalone(
-            "-- PO over-receipt + UoM mismatch (daily: POs that received on run_date, cumulative vs\n"
-            "-- ordered). uom_mismatch=TRUE rows become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT\n"
-            "-- (over_frac >= %.2f -> Urgent, else High).\n" % settings.over_receipt_urgent_pct,
+            "-- PO over-receipt (TWO-WAY match, keyed on ims_sku): flag if the PO's OWN received_qty vs\n"
+            "-- ims_sku_qty (Layer 1, packaging units) OR the ledger cumulative vs consumable_sku_qty\n"
+            "-- (Layer 2, base units) is over the threshold. Pure UoM-mismatch rows (neither layer over)\n"
+            "-- become PO_UOM_MISMATCH; the rest PO_OVER_RECEIPT (over_frac >= %.2f -> Urgent, else High).\n"
+            % settings.over_receipt_urgent_pct,
             _build_sql(False, lb, settings.over_receipt_high_pct, cap, settings.over_receipt_urgent_pct))
     if rule_id == "PO-07":
         lbk = settings.po_no_receipt_overdue_lookback_days
@@ -1252,6 +1465,13 @@ def doc_sql(rule_id):
             % (settings.po_partial_not_closed_days,
                (", limited to the last %d days" % lbk) if lbk and lbk > 0 else ""),
             _build_partial_not_closed_sql(cap, settings.po_partial_not_closed_days, lbk))
+    if rule_id == "PO-06":
+        return _standalone(
+            "-- Purchased Wonder-family item whose Consumable SKU <> Vendor SKU has no unit conversion\n"
+            "-- in the supply-chain catalog (framework PO-06): no catalog record, or the PO's vendor SKU\n"
+            "-- isn't linked. Scoped to items where supplier_uom != consumable_uom (a conversion is\n"
+            "-- actually needed). One row per (consumable_sku, supplier_sku); auto-closes once resolved.\n",
+            _build_missing_uom_conversion_sql(False, lb, cap))
     if rule_id == "PO-09":
         return _standalone("-- CLOSED Purchase PO lines with a $0/NULL vendor price (can't be costed).\n",
                            _build_price_sql(False, lb, cap))
@@ -1265,7 +1485,8 @@ def doc_sql(rule_id):
         return _standalone("-- Purchase rows in the PO master with a NULL/blank PO number (safety-net).\n",
                            _build_null_po_sql(False, lb, cap))
     if rule_id == "PO-14":
-        return _standalone("-- 3-way match: a consumable_sku received against an existing PO but not on its lines.\n",
+        return _standalone("-- 3-way match: a consumable_sku received against an existing PO with no ordered qty\n"
+                           "-- (not on the PO's lines, OR on a line ordered for 0 — a Ship Hero zero-order receive-line).\n",
                            _build_sku_not_on_po_sql(False, lb, cap))
     if rule_id == "XFER-01":
         return _standalone("-- A Transfer Out pick against a Transfer Order id absent from the transfer population.\n",
@@ -1287,7 +1508,8 @@ def doc_sql(rule_id):
     return None
 
 
-_FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-07": _no_receipt_overdue,
+_FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-06": _missing_uom_conversion,
+            "PO-07": _no_receipt_overdue,
             "PO-08": _partial_not_closed, "PO-09": _missing_price, "PO-11": _correction_missing_ref,
             "PO-13": _null_po,
             "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
@@ -1314,10 +1536,11 @@ def find_bigquery(ds, run_date, rules, backfill=False) -> Tuple[List[Finding], i
     return all_findings, considered
 
 
-def breakdown(ds, po: str, consumable_sku: str, system: str = None):
-    """The PO line vs the ledger receipt events for one (po, consumable_sku) — the 'why it
-    flagged' detail shown in the drawer. Cluster-pruned by system_of_origin + a date window
-    so it stays cheap per click."""
+def breakdown(ds, po: str, ims_sku: str, system: str = None):
+    """The PO line vs the ledger receipt events for one (po, ims_sku) — the 'why it flagged' detail
+    shown in the drawer. Keyed on ims_sku to match the finder's grain; quantities shown in the base
+    (consumable) unit, so the running balance ties out to the flagged ledger cumulative (Layer 2).
+    Cluster-pruned by system_of_origin + a date window so it stays cheap per click."""
     bq = ds._bq
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, potbl = settings.bq_ledger_table, settings.bq_po_table
@@ -1326,7 +1549,7 @@ def breakdown(ds, po: str, consumable_sku: str, system: str = None):
     SELECT 'PO' AS source, consumable_sku_qty AS qty, consumable_uom AS uom, order_type,
            CAST(NULL AS STRING) AS l1_action, CAST(NULL AS STRING) AS l2_action, status,
            CAST(NULL AS STRING) AS facility, po_date_utc AS ts
-    FROM `{proj}.{dset}.{potbl}` WHERE po = @po AND consumable_sku = @sku AND order_type = 'Purchase'
+    FROM `{proj}.{dset}.{potbl}` WHERE po = @po AND ims_sku = @sku AND order_type = 'Purchase'
     UNION ALL
     SELECT 'LEDGER', consumable_quantity_change, consumable_uom, CAST(NULL AS STRING),
            l1_action, l2_action, CAST(NULL AS STRING), facility_name, datetime_utc
@@ -1334,11 +1557,11 @@ def breakdown(ds, po: str, consumable_sku: str, system: str = None):
     -- ref_order_type='Purchase Order' = the exact rows the finder nets, so the movement shown here
     -- (positive receipts + negative corrections) sums to the flagged net received_qty. Don't drop it,
     -- or the drawer's running balance won't tie out to the flagged total.
-    WHERE ref_order_id = @po AND consumable_sku = @sku AND ref_order_type = 'Purchase Order' {sys_filter}
+    WHERE ref_order_id = @po AND ims_sku = @sku AND ref_order_type = 'Purchase Order' {sys_filter}
       AND datetime_utc >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {BACKFILL_LOOKBACK_DAYS + 35} DAY)
     ORDER BY (source = 'LEDGER'), ts
     """
-    params = [bq.ScalarQueryParameter("po", "STRING", po), bq.ScalarQueryParameter("sku", "STRING", consumable_sku)]
+    params = [bq.ScalarQueryParameter("po", "STRING", po), bq.ScalarQueryParameter("sku", "STRING", ims_sku)]
     if sys_filter:
         params.append(bq.ScalarQueryParameter("sys", "STRING", system))
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3), query_parameters=params)
@@ -1349,10 +1572,12 @@ def breakdown(ds, po: str, consumable_sku: str, system: str = None):
 
 
 def recheck(ds, pairs):
-    """Current received-vs-ordered + UoM for a set of (po, consumable_sku) OPEN tickets, so the
-    job can auto-close the ones that no longer fail. Returns {(po, sku): {recv, ruom, ord, ouom}}.
-    Receipts summed over the lookback window (recent fixes show up; very old POs may read as
-    'no recent receipts' and are left open rather than risk a false close)."""
+    """Current two-way over-receipt state for a set of (po, ims_sku) OPEN tickets, so the job can
+    auto-close the ones that no longer fail on EITHER layer. Returns
+    {(po, ims_sku): {po_recv, ordered_pkg, led_recv, ordered_base, ruom, ouom}} — Layer 1 (the PO's
+    own received_qty vs ims_sku_qty, packaging) and Layer 2 (ledger cumulative vs consumable_sku_qty,
+    base). Ledger receipts summed over the lookback window (recent fixes show up; very old POs may
+    read as 'no recent receipts' and are left open rather than risk a false close)."""
     if not pairs:
         return {}
     bq = ds._bq
@@ -1362,26 +1587,30 @@ def recheck(ds, pairs):
     if not keys:
         return {}
     sql = f"""
-    WITH received AS (
-      SELECT ref_order_id AS po, consumable_sku AS sku, SUM(consumable_quantity_change) AS recv,
+    WITH received AS (   -- LAYER 2: net ledger cumulative in base units
+      SELECT ref_order_id AS po, ims_sku AS sku, SUM(consumable_quantity_change) AS led_recv,
              ANY_VALUE(consumable_uom) AS ruom
       FROM `{proj}.{dset}.{led}`
-      WHERE ref_order_type = 'Purchase Order' AND consumable_sku IS NOT NULL
-        AND CONCAT(ref_order_id, '~~', consumable_sku) IN UNNEST(@keys)
+      WHERE ref_order_type = 'Purchase Order' AND ims_sku IS NOT NULL
+        AND CONCAT(ref_order_id, '~~', ims_sku) IN UNNEST(@keys)
         AND datetime_utc >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {BACKFILL_LOOKBACK_DAYS} DAY)
       GROUP BY po, sku),
-    ordered AS (
-      SELECT po, consumable_sku AS sku, SUM(consumable_sku_qty) AS ord, ANY_VALUE(consumable_uom) AS ouom
+    ordered AS (   -- LAYER 1 basis (po_recv vs ordered_pkg) + Layer 2 denominator (ordered_base)
+      SELECT po, ims_sku AS sku, SUM(ims_sku_qty) AS ordered_pkg, SUM(consumable_sku_qty) AS ordered_base,
+             SUM(received_qty) AS po_recv, ANY_VALUE(consumable_uom) AS ouom
       FROM `{proj}.{dset}.{potbl}`
-      WHERE order_type = 'Purchase' AND consumable_sku IS NOT NULL
-        AND CONCAT(po, '~~', consumable_sku) IN UNNEST(@keys)
+      WHERE order_type = 'Purchase' AND ims_sku IS NOT NULL
+        AND CONCAT(po, '~~', ims_sku) IN UNNEST(@keys)
       GROUP BY po, sku)
-    SELECT po, sku, r.recv AS recv, r.ruom AS ruom, o.ord AS ord, o.ouom AS ouom
+    SELECT po, sku, r.led_recv AS led_recv, r.ruom AS ruom,
+           o.ordered_pkg AS ordered_pkg, o.ordered_base AS ordered_base, o.po_recv AS po_recv, o.ouom AS ouom
     FROM received r FULL OUTER JOIN ordered o USING (po, sku)
     """
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
     out = {}
     for row in ds.client.query(sql, job_config=cfg).result():
-        out[(row.po, row.sku)] = {"recv": row.recv, "ruom": row.ruom, "ord": row.ord, "ouom": row.ouom}
+        out[(row.po, row.sku)] = {"po_recv": row.po_recv, "ordered_pkg": row.ordered_pkg,
+                                  "led_recv": row.led_recv, "ordered_base": row.ordered_base,
+                                  "ruom": row.ruom, "ouom": row.ouom}
     return out

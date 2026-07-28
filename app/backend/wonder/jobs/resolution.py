@@ -29,17 +29,28 @@ def _field(label, was, now, unit=None):
 
 
 def over_receipt(run_date, snap, cur):
-    """PO_OVER_RECEIPT family — received now within tolerance and UoMs agree."""
-    if not cur or cur.get("recv") is None or not cur.get("ord"):
+    """PO_OVER_RECEIPT family — close only when NEITHER layer of the two-way match is still over and
+    the UoMs agree. Layer 1 = the PO's own received_qty vs ims_sku_qty (packaging); Layer 2 = the
+    ledger cumulative vs consumable_sku_qty (base)."""
+    if not cur:
         return None
-    over = (cur["recv"] / cur["ord"]) - 1
+    high = settings.over_receipt_high_pct
+    po_over = bool(cur.get("ordered_pkg") and cur["ordered_pkg"] > 0
+                   and (cur.get("po_recv") or 0) > cur["ordered_pkg"] * (1 + high))
+    led_over = bool(cur.get("ordered_base") and cur["ordered_base"] > 0
+                    and (cur.get("led_recv") or 0) > cur["ordered_base"] * (1 + high))
     uom_mismatch = bool(cur.get("ouom") and cur.get("ruom") and cur["ouom"] != cur["ruom"])
-    if over > settings.over_receipt_high_pct or uom_mismatch:
+    # Need at least one ordered side present to judge; if we can't read the current state, stay open.
+    if cur.get("ordered_pkg") is None and cur.get("ordered_base") is None:
+        return None
+    if po_over or led_over or uom_mismatch:
         return None
     ruom = cur.get("ruom") or snap.get("received_uom")
-    return _res(run_date, "Received quantity now within tolerance / UoM reconciled.", [
-        _field("received_qty", snap.get("received_qty"), cur["recv"], ruom),
-        _field("over_by_pct", snap.get("over_by_pct"), round(over * 100, 1), "%"),
+    led_over_pct = (round(((cur.get("led_recv") or 0) / cur["ordered_base"] - 1) * 100, 1)
+                    if cur.get("ordered_base") else None)
+    return _res(run_date, "Both the PO's own receipts and the ledger cumulative are now within tolerance / UoM reconciled.", [
+        _field("received_qty", snap.get("received_qty"), cur.get("led_recv"), ruom),
+        _field("over_by_pct", snap.get("over_by_pct"), led_over_pct, "%"),
     ])
 
 

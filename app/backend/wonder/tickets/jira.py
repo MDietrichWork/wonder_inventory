@@ -76,7 +76,8 @@ class JiraTicketSink(TicketSink):
             para("Routed to %s / %s." % (error.routed_team, error.routed_assignee)),
             {"type": "heading", "attrs": {"level": 4}, "content": [{"type": "text", "text": "What was flagged"}]},
         ]
-        HIDE = {"tolerance_pct", "uom_match", "ordered_uom", "received_uom", "implausible_quantity"}
+        HIDE = {"tolerance_pct", "uom_match", "ordered_uom", "received_uom", "implausible_quantity",
+                "likely_ledger_error"}
         shown, rows = set(), []
 
         def add(label, val, *keys):

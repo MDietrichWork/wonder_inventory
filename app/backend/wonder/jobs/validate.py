@@ -125,6 +125,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         # and close only the ones that genuinely pass now (cap-independent, no false closes).
         from ..rules.bq_finder import (recheck, recheck_price, recheck_no_receipt_overdue,
                                         recheck_partial_not_closed, recheck_correction_missing_ref,
+                                        recheck_missing_uom_conversion,
                                         recheck_null_po, recheck_null_po_ledger,
                                         recheck_sku_on_po, recheck_to_exists, recheck_daily_waste_facility,
                                         recheck_daily_adjust_facility,
@@ -135,6 +136,7 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         noreceipt_errs = [e for e in open_errs if e.error_type == "PO_NO_RECEIPT_OVERDUE"]
         partial_errs = [e for e in open_errs if e.error_type == "PO_PARTIAL_NOT_CLOSED"]
         corrref_errs = [e for e in open_errs if e.error_type == "CORRECTION_MISSING_REF"]
+        uomconv_errs = [e for e in open_errs if e.error_type == "PO_MISSING_UOM_CONVERSION"]
         nullpo_errs = [e for e in open_errs if e.error_type == "PO_MISSING_NUMBER"]
         nullpo_led_errs = [e for e in open_errs if e.error_type == "NULL_PO_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
@@ -144,13 +146,13 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         nocost_errs = [e for e in open_errs if e.error_type == "WASTE_SKU_NO_COST"]
         zerocost_errs = [e for e in open_errs if e.error_type == "CONSUMABLE_ZERO_COST"]
 
-        # over-receipt family: received-vs-ordered + UoM
-        pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("consumable_sku"))
+        # over-receipt family: two-way match (PO's own received_qty + ledger cumulative), keyed on ims_sku
+        pairs = list({((e.data_snapshot or {}).get("po"), (e.data_snapshot or {}).get("ims_sku"))
                       for e in over_errs if (e.data_snapshot or {}).get("po")})
         current = recheck(ds, pairs) if pairs else {}
         for e in over_errs:
             snap = e.data_snapshot or {}
-            cur = current.get((snap.get("po"), snap.get("consumable_sku")))
+            cur = current.get((snap.get("po"), snap.get("ims_sku")))
             res = resolution.over_receipt(run_date, snap, cur)
             if res:  # received now within tolerance AND UoMs agree
                 _auto_close(db, e, as_of, sink,
@@ -207,6 +209,19 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                             resolution=resolution.populated(run_date, "Correction now references the transaction it corrects."))
                 autoclosed += 1
 
+        # missing UoM conversion (PO-06): close once the catalog links the (consumable, vendor) pair
+        ucpairs = list({((e.data_snapshot or {}).get("consumable_sku"), (e.data_snapshot or {}).get("supplier_sku"))
+                        for e in uomconv_errs if (e.data_snapshot or {}).get("consumable_sku")})
+        uccur = recheck_missing_uom_conversion(ds, ucpairs) if ucpairs else {}
+        for e in uomconv_errs:
+            snap = e.data_snapshot or {}
+            cur = uccur.get((snap.get("consumable_sku"), snap.get("supplier_sku")))
+            if cur and cur["resolved"]:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: catalog now links the Consumable & Vendor SKUs — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Supply-chain catalog now provides a unit conversion for this Consumable ↔ Vendor SKU."))
+                autoclosed += 1
+
         # missing PO number (master table): close once a PO number is set
         nids = list({(e.data_snapshot or {}).get("po_id") for e in nullpo_errs if (e.data_snapshot or {}).get("po_id")})
         ncurrent = recheck_null_po(ds, nids) if nids else {}
@@ -237,8 +252,8 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
             snap = e.data_snapshot or {}
             if "%s~~%s" % (snap.get("po"), snap.get("consumable_sku")) in now_on_po:
                 _auto_close(db, e, as_of, sink,
-                            "Re-check on run %s: SKU now listed on the PO — auto-closed." % run_date,
-                            resolution=resolution.populated(run_date, "SKU now listed on the PO's lines."))
+                            "Re-check on run %s: SKU now ordered on the PO (qty > 0) — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "SKU now ordered on the PO's lines (order qty > 0)."))
                 autoclosed += 1
 
         # transfer order missing: close once the transfer order exists in the population

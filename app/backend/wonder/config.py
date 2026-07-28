@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # Only scan the last N days of ledger events (recency window; keeps the initial run small).
     po_correction_missing_ref_lookback_days: int = 7
 
+    # PO-06: a purchased Wonder-family item whose Consumable SKU <> Vendor SKU can't be resolved to a
+    # unit conversion in the supply-chain catalog (no catalog record, or the PO's vendor SKU isn't
+    # linked). Daily flags items purchased on the run-date; only meaningful when units differ (a
+    # conversion is genuinely needed). Backfill sweeps this many days of purchases; keeps the run small.
+    po_missing_uom_conversion_lookback_days: int = 30
+
     # --- Waste thresholds ---
     # Daily facility waste $ thresholds are per-facility-type and live in
     # reference.WASTE_DAILY_THRESHOLDS (banded High/Urgent), not here.
@@ -54,6 +60,10 @@ class Settings(BaseSettings):
     bq_dataset: Optional[str] = None
     bq_ledger_table: Optional[str] = None   # e.g. "unified_inventory_ledger"
     bq_po_table: Optional[str] = None        # e.g. "purchase_order_table"
+    # Supply-chain product/UoM catalog (same project, different dataset) — the master unit-conversion
+    # source used by PO-06. hdr_product_sku = PO consumable_sku; vendor_product_skus = PO supplier_sku.
+    bq_catalog_dataset: str = "supply_chain_catalog"
+    bq_products_table: str = "wonder_products"
     google_application_credentials: Optional[str] = None  # path to read-only SA key
     # ERP standard-cost source (Dynamics), cross-project; ITEMID = consumable_sku. See SCHEMA_NOTES.md.
     erp_project: str = "wonder-raw-prod"

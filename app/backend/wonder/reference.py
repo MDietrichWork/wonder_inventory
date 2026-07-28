@@ -332,10 +332,12 @@ ERROR_TYPES = [
      "owner": "Procurement", "desc": "A Purchase PO received SOME but not all of what was ordered (received > 0 and short by even 1) and, more than Y days past its expected receipt date, still hasn't been closed by Supply Chain (framework PO-08). The outstanding balance is in limbo — either the rest is still coming or the PO should be closed short. One ticket per PO; the Y-day grace is configurable (default 3). Auto-closes once the PO is fully received or closed. Ordered qty compared in supplier units (received_qty vs supplier_sku_qty)."},
     {"type": "CORRECTION_MISSING_REF", "rule": "Correction transaction references what it corrects", "ruleType": "NOT_NULL",
      "owner": "SC Product (IMS)", "desc": "A ledger 'Correction' transaction (l1_action containing 'correct') has a NULL/blank correction_ref_id — the correcting entry doesn't point at the original transaction it's fixing, so the correction can't be traced or reconciled (framework PO-11). One ticket per ledger row. Auto-closes once the correction_ref_id is populated."},
+    {"type": "PO_MISSING_UOM_CONVERSION", "rule": "Purchased item has a Consumable<>Vendor unit conversion", "ruleType": "REFERENTIAL",
+     "owner": "Procurement", "desc": "A purchased Wonder-family item (WSKU / Pack SKU, or a 40xxxxx consumable) can't be resolved to a unit conversion in the supply-chain product catalog (wonder_products), so a receipt in the vendor's unit (e.g. a case) can't be converted into the consumable base unit. Two failure modes: the consumable has NO catalog record at all, or it IS in the catalog but the PO's vendor SKU isn't among its linked vendor SKUs. Scoped to lines where the supplier UoM differs from the consumable UoM (a conversion is actually required). Join key: PO consumable_sku = catalog hdr_product_sku (framework PO-06). One ticket per (consumable SKU, vendor SKU). Auto-closes once the catalog links the pair."},
     {"type": "PO_MISSING_NUMBER", "rule": "PO number present (master table)", "ruleType": "NOT_NULL",
      "owner": "SC Product (IMS)", "desc": "A row in the PO master table has a NULL/blank PO number — a broken master record with nothing to receive against. Safety-net rule: currently finds 0 on live data, kept to catch upstream degradation."},
     {"type": "PO_SKU_NOT_ON_PO", "rule": "Received SKU listed on the PO", "ruleType": "REFERENTIAL",
-     "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but that SKU isn't on the PO's lines — a 3-way-match break: wrong item received, an undocumented substitution, or a PO line never set up. (Framework catalog PO-02.)"},
+     "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but the PO orders none of it — the SKU isn't on the PO's lines, OR it's on a line ordered for 0 (Ship Hero can auto-create a zero-order receive-line for an unexpected item, which risks never invoicing the vendor). A 3-way-match break: wrong item received, an undocumented substitution, or a line never properly ordered. (Framework catalog PO-02.)"},
     {"type": "TRANSFER_ORDER_MISSING", "rule": "Picked Transfer Order exists", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
     {"type": "WASTE_DAILY_FACILITY", "rule": "Daily facility waste within threshold", "ruleType": "RANGE",
@@ -363,6 +365,7 @@ ERROR_TYPE_LABELS = {
     "PO_NO_RECEIPT_OVERDUE": "PO Overdue — No Receipt",
     "PO_PARTIAL_NOT_CLOSED": "PO Partially Received — Not Closed",
     "CORRECTION_MISSING_REF": "Correction Missing Ref ID",
+    "PO_MISSING_UOM_CONVERSION": "Missing Unit Conversion (Consumable ↔ Vendor SKU)",
     "PO_MISSING_NUMBER": "PO Table Missing PO Number",
     "PO_SKU_NOT_ON_PO": "SKU Not on PO",
     "TRANSFER_ORDER_MISSING": "Transfer Order Missing (WIP)",
@@ -393,8 +396,9 @@ ERROR_TYPE_PLAIN = {
     "PO_NO_RECEIPT_OVERDUE": "A purchase order is past its expected delivery date, nothing has been received against it, and nobody has cancelled it — so it's sitting in limbo and needs to be chased or cancelled.",
     "PO_PARTIAL_NOT_CLOSED": "A purchase order got some but not all of what was ordered, it's past its expected date, and it hasn't been closed — so the leftover balance is stuck: either the rest still needs to arrive or the order should be closed out.",
     "CORRECTION_MISSING_REF": "A correction was posted to the inventory ledger but it doesn't say which original transaction it's fixing — so there's no way to trace the correction back to what went wrong.",
+    "PO_MISSING_UOM_CONVERSION": "We're buying an item, but the product catalog has no way to convert the vendor's unit (like a case) into the unit we actually use (like each or grams) — either the item isn't in the catalog, or the vendor we bought it from isn't linked to it. Without that conversion, a receipt can't be turned into the right on-hand quantity.",
     "PO_MISSING_NUMBER": "A row in the purchase-order master table has no PO number at all — a broken record with nothing to receive against.",
-    "PO_SKU_NOT_ON_PO": "An item was received against a real purchase order, but that item isn't listed on the PO — a wrong item, an undocumented substitution, or a PO line that was never set up.",
+    "PO_SKU_NOT_ON_PO": "An item was received against a real purchase order, but the PO orders none of it — the item isn't on the PO, or it's on a line ordered for zero. Either way it may never get invoiced to the vendor: a wrong item, an undocumented substitution, or a line never properly ordered.",
     "TRANSFER_ORDER_MISSING": "Items were picked for a transfer order that doesn't exist in our records.",
     "WASTE_DAILY_FACILITY": "One facility's net waste in dollars for a single day is unusually high — above what's normal for that type of facility.",
     "ADJ_DAILY_FACILITY": "A facility made an unusually large dollar amount of inventory adjustments in one day (even ones that cancel out) — a sign of abnormal counting or correction activity.",
@@ -459,34 +463,44 @@ RULES = [
      "severity": "High", "fail_type": "Soft", "owner_group": "Field Ops",
      "params": {},  # thresholds come from settings (over_receipt_high_pct / over_receipt_urgent_pct)
      "expression": (
-        "-- DAILY BATCH PO over-receipt: flag POs that RECEIVED yesterday, then compare their\n"
-        "-- cumulative received-to-date vs ordered. Join ledger.ref_order_id -> PO `po`; item link =\n"
-        "-- consumable_sku (both); received = SUM(ledger.consumable_quantity_change), only ref_order_type='Purchase Order'.\n"
+        "-- DAILY PO over-receipt — TWO-WAY match keyed on ims_sku (the raw system id sent to BOTH\n"
+        "-- tables; keying on the translated consumable_sku fanned one order across rows and ~2.5x'd\n"
+        "-- false positives). For every (po, ims_sku) that RECEIVED yesterday, compare TWO signals:\n"
+        "--   LAYER 1 (PO's own books): PO.received_qty vs PO.ims_sku_qty  (packaging units cs/pk/ea)\n"
+        "--   LAYER 2 (ledger cumulative): SUM(ledger.consumable_quantity_change) vs PO.consumable_sku_qty\n"
+        "--                                (base units oz/lb/g — the only reliable cross-system measure:\n"
+        "--                                 ims_quantity_change is also base, supplier_quantity_change is\n"
+        "--                                 NULL for Pantry). Flag if EITHER layer is over.\n"
         "DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday\n"
-        "WITH touched AS (   -- (po, item) received on run_date\n"
-        "  SELECT DISTINCT ref_order_id AS po, consumable_sku\n"
+        "WITH touched AS (   -- (po, ims_sku) received on run_date\n"
+        "  SELECT DISTINCT ref_order_id AS po, ims_sku\n"
         "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
-        "  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL AND DATE(datetime_utc)=run_date),\n"
-        "received AS (       -- cumulative received-to-date for those POs (30d lookback)\n"
-        "  SELECT l.ref_order_id AS po, l.consumable_sku, SUM(l.consumable_quantity_change) AS received_qty,\n"
+        "  WHERE ref_order_type='Purchase Order' AND ims_sku IS NOT NULL AND DATE(datetime_utc)=run_date),\n"
+        "received AS (       -- LAYER 2: cumulative ledger receipts (base units), 30d lookback\n"
+        "  SELECT l.ref_order_id AS po, l.ims_sku, SUM(l.consumable_quantity_change) AS led_received,\n"
         "         ANY_VALUE(l.consumable_uom) AS received_uom\n"
         "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` l\n"
-        "  JOIN touched t ON l.ref_order_id=t.po AND l.consumable_sku=t.consumable_sku\n"
+        "  JOIN touched t ON l.ref_order_id=t.po AND l.ims_sku=t.ims_sku\n"
         "  WHERE l.ref_order_type='Purchase Order' AND DATE(l.datetime_utc)<=run_date\n"
         "    AND l.datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(run_date), INTERVAL 30 DAY)\n"
-        "  GROUP BY po, consumable_sku),\n"
-        "ordered AS (\n"
-        "  SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty, ANY_VALUE(consumable_uom) AS ordered_uom\n"
+        "  GROUP BY po, ims_sku),\n"
+        "ordered AS (        -- ordered in BOTH units + the PO's own received_qty (LAYER 1)\n"
+        "  SELECT po, ims_sku, SUM(ims_sku_qty) AS ordered_pkg, SUM(consumable_sku_qty) AS ordered_base,\n"
+        "         SUM(received_qty) AS po_received, ANY_VALUE(consumable_uom) AS ordered_uom, ANY_VALUE(ims_uom) AS ims_uom\n"
         "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
-        "  WHERE consumable_sku IS NOT NULL AND order_type = 'Purchase'  -- PO-side: purchases only\n"
-        "  GROUP BY po, consumable_sku)\n"
-        "SELECT r.po, r.consumable_sku, o.ordered_qty, o.ordered_uom, r.received_qty, r.received_uom,\n"
-        "       (o.ordered_uom != r.received_uom) AS uom_mismatch,\n"
-        "       ROUND((SAFE_DIVIDE(r.received_qty,o.ordered_qty)-1)*100,1) AS over_by_pct\n"
-        "FROM received r JOIN ordered o USING (po, consumable_sku)\n"
-        "WHERE o.ordered_qty>0 AND ( (o.ordered_uom != r.received_uom)        -- UoM mismatch -> PO_UOM_MISMATCH\n"
-        "   OR r.received_qty > o.ordered_qty*1.05 )  -- else over-receipt: <=2x genuine, >2x implausible\n"
-        "ORDER BY over_by_pct DESC"
+        "  WHERE ims_sku IS NOT NULL AND order_type = 'Purchase'  -- PO-side: purchases only\n"
+        "  GROUP BY po, ims_sku)\n"
+        "SELECT r.po, r.ims_sku, o.ordered_pkg, o.ims_uom, o.po_received,          -- Layer 1 (packaging)\n"
+        "       o.ordered_base, o.ordered_uom, r.led_received, r.received_uom,      -- Layer 2 (base)\n"
+        "       (o.po_received  > o.ordered_pkg  * 1.30) AS po_over,\n"
+        "       (r.led_received > o.ordered_base * 1.30) AS led_over,\n"
+        "       (o.ordered_uom != r.received_uom) AS uom_mismatch\n"
+        "FROM received r JOIN ordered o USING (po, ims_sku)\n"
+        "WHERE (o.ordered_pkg>0 OR o.ordered_base>0) AND (   -- flag if EITHER layer is >30% over, or UoM mismatch\n"
+        "        (o.ordered_uom != r.received_uom)\n"
+        "     OR (o.ordered_pkg  > 0 AND o.po_received  > o.ordered_pkg  * 1.30)\n"
+        "     OR (o.ordered_base > 0 AND r.led_received > o.ordered_base * 1.30) )\n"
+        "ORDER BY led_over DESC, po_over DESC"
      ), "enabled": True},
     {"id": "TWH-01", "name": "Transfer Warehouse balances", "primitive": "RECON_TRANSFER",
      "error_type": "TRANSFER_WAREHOUSE_IMBALANCE", "target_table": "unified_ledger", "severity": "High",
@@ -592,16 +606,19 @@ RULES = [
      "params": {},  # BigQuery 3-way-match join; runs via the SQL finder, skipped by the fixtures engine
      "expression": (
         "-- 3-way match (catalog PO-02): a consumable_sku received against an existing PO\n"
-        "-- (ledger.ref_order_id = PO.po, order_type='Purchase') that is NOT on the PO's lines.\n"
+        "-- (ledger.ref_order_id = PO.po, order_type='Purchase') that the PO orders NONE of --\n"
+        "-- not on the PO's lines, OR on a line ordered for 0 (Ship Hero zero-order receive-line).\n"
         "WITH led AS (\n"
         "  SELECT DISTINCT ref_order_id AS po, consumable_sku\n"
         "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
         "  WHERE ref_order_type='Purchase Order' AND consumable_sku IS NOT NULL),\n"
-        "po_keys AS (SELECT DISTINCT po, consumable_sku FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase'),\n"
+        "po_lines AS (SELECT po, consumable_sku, SUM(consumable_sku_qty) AS ordered_qty\n"
+        "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase' AND consumable_sku IS NOT NULL\n"
+        "  GROUP BY po, consumable_sku),\n"
         "po_exists AS (SELECT DISTINCT po FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Purchase')\n"
         "SELECT l.po, l.consumable_sku FROM led l JOIN po_exists pe USING (po)\n"
-        "LEFT JOIN po_keys pk ON l.po=pk.po AND l.consumable_sku=pk.consumable_sku\n"
-        "WHERE pk.po IS NULL  -- PO exists, but this received SKU isn't on it"
+        "LEFT JOIN po_lines pl ON l.po=pl.po AND l.consumable_sku=pl.consumable_sku\n"
+        "WHERE COALESCE(pl.ordered_qty,0) <= 0  -- PO exists, but orders none of this received SKU"
      ), "enabled": True},
     {"id": "PO-13", "name": "PO number present (master table)", "primitive": "NOT_NULL", "error_type": "PO_MISSING_NUMBER",
      "target_table": "int_ledger_purchase_orders", "severity": "Urgent", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
@@ -654,6 +671,33 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
         "WHERE order_type = 'Purchase' AND (supplier_price IS NULL OR supplier_price = 0)"
      ), "enabled": True},
+    {"id": "PO-06", "name": "Purchased item has a Consumable <> Vendor SKU unit conversion", "primitive": "REFERENTIAL",
+     "error_type": "PO_MISSING_UOM_CONVERSION", "target_table": "int_ledger_purchase_orders",
+     "severity": "Urgent", "fail_type": "Hard", "owner_group": "Procurement",
+     "params": {"join": {"catalog": "supply_chain_catalog.wonder_products",
+                         "on": "consumable_sku = hdr_product_sku",
+                         "vendor_link": "supplier_sku IN vendor_product_skus"},
+                "where": {"order_type": ["Purchase"], "scope": "WSKU/Pack SKU or 40xxxxx consumable",
+                          "units_differ": True}},
+     "expression": (
+        "-- Framework PO-06: a purchased Wonder-family item whose Consumable SKU <> Vendor SKU can't be\n"
+        "-- resolved to a unit conversion in the supply-chain catalog (wonder_products) — no catalog\n"
+        "-- record, or the PO's vendor SKU isn't linked. Scoped to lines where supplier_uom differs from\n"
+        "-- consumable_uom (a conversion is actually required). Live query (daily/backfill): bq_finder.doc_sql.\n"
+        "WITH cat AS (\n"
+        "  SELECT hdr_product_sku AS hdr, ARRAY_CONCAT_AGG(vendor_product_skus) AS vendors,\n"
+        "         ARRAY_AGG(DISTINCT priority_vendor_product_sku IGNORE NULLS) AS pvendors\n"
+        "  FROM `wonder-dw-prod-brd.supply_chain_catalog.wonder_products`\n"
+        "  WHERE status = 'ACTIVE' AND hdr_product_sku IS NOT NULL GROUP BY hdr_product_sku)\n"
+        "SELECT p.consumable_sku, p.supplier_sku, p.supplier_name, p.consumable_uom, p.supplier_uom\n"
+        "FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` p\n"
+        "LEFT JOIN cat c ON p.consumable_sku = c.hdr\n"
+        "WHERE p.order_type = 'Purchase' AND p.consumable_sku IS NOT NULL AND p.supplier_sku IS NOT NULL\n"
+        "  AND (p.ims_sku_type IN ('WSKU','Pack SKU') OR REGEXP_CONTAINS(p.consumable_sku, r'^40[0-9]{5}$'))\n"
+        "  AND NOT REGEXP_CONTAINS(p.consumable_sku, r'^9[0-9]{6}$')  -- exclude smallwares/packaging (never in the food catalog)\n"
+        "  AND p.consumable_uom != p.supplier_uom\n"
+        "  AND (c.hdr IS NULL OR NOT (p.supplier_sku IN UNNEST(c.vendors) OR p.supplier_sku IN UNNEST(c.pvendors)))"
+     ), "enabled": True},
     {"id": "PO-11", "name": "Correction transaction references what it corrects", "primitive": "NOT_NULL",
      "error_type": "CORRECTION_MISSING_REF", "target_table": "consolidated_inventory_ledger",
      "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
@@ -693,6 +737,8 @@ ROUTING = [
      "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
     {"error_type": "CORRECTION_MISSING_REF", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_project": "WIQ", "jira_component": "Corrections"},
+    {"error_type": "PO_MISSING_UOM_CONVERSION", "team": "Procurement", "assignee": "Tom Becker",
+     "jira_project": "WIQ", "jira_component": "UoM / Conversions"},
     {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
      "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
     {"error_type": "PO_SKU_NOT_ON_PO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
