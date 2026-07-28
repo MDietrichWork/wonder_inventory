@@ -247,6 +247,31 @@ select:focus, input:focus, button:focus-visible, .nav-item:focus-visible, .row:f
 .run-card .err { color: #ffd7dc; font-size: 12.5px; background: var(--crit-bg); border: 1px solid var(--crit);
   border-radius: 8px; padding: 10px 12px; margin: 0 0 14px; word-break: break-word; }
 
+/* ---------- Admin password gate ---------- */
+.gate-overlay {
+  position: fixed; inset: 0; z-index: 2500;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(6,9,16,.55); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+.gate-card {
+  width: 360px; max-width: calc(100vw - 32px);
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 12px; padding: 22px 22px 18px;
+  box-shadow: 0 18px 60px rgba(0,0,0,.55);
+}
+.gate-card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 9px; }
+.gate-card .sub { margin: 0 0 16px; color: var(--text-dim); font-size: 12px; line-height: 1.4; }
+.gate-lock { font-size: 15px; }
+.gate-input {
+  width: 100%; box-sizing: border-box; background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 8px; color: var(--text);
+  font-size: 13px; padding: 10px 12px; font-family: var(--sans); outline: none;
+}
+.gate-input:focus { border-color: var(--accent); }
+.gate-input[aria-invalid="true"] { border-color: var(--bad); }
+.gate-error { color: #ffd7dc; font-size: 12px; margin-top: 8px; }
+.gate-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
 /* ---------- Drill-down chip bar ---------- */
 .drillbar { display: none; align-items: center; gap: 10px; padding: 8px 18px; border-bottom: 1px solid var(--line); background: var(--surface); }
 .drillbar.show { display: flex; }

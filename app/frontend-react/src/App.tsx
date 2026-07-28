@@ -8,6 +8,7 @@ import { Closed } from "./Closed";
 import { Drawer } from "./Drawer";
 import { Sla } from "./Sla";
 import { Admin } from "./Admin";
+import { AdminGate } from "./AdminGate";
 
 type View = "dashboard" | "workbench" | "closed" | "sla" | "admin";
 const VIEWS: View[] = ["dashboard", "workbench", "closed", "sla", "admin"];
@@ -44,6 +45,15 @@ export function App() {
   const [drill, setDrill] = useState<Drill>(null);
   const [openPk, setOpenPk] = useState<number | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Admin is behind a soft password gate (MVP has no real auth). Unlock persists for the browser
+  // session so the user isn't re-prompted every time they revisit the tab.
+  const [adminUnlocked, setAdminUnlocked] = useState<boolean>(() => {
+    try { return sessionStorage.getItem("admin_unlocked") === "1"; } catch { return false; }
+  });
+  const unlockAdmin = useCallback(() => {
+    try { sessionStorage.setItem("admin_unlocked", "1"); } catch { /* private mode — session-only */ }
+    setAdminUnlocked(true);
+  }, []);
 
   const load = useCallback(async () => {
     try { setData(await getBootstrap()); } catch (e) { setErr(String(e)); }
@@ -171,8 +181,12 @@ export function App() {
         {view === "workbench" && <Workbench data={data} drill={drill} clearDrill={() => setDrill(null)} onOpen={(e) => setOpenPk(e.pk)} refresh={load} />}
         {view === "closed" && <Closed data={data} onOpen={(e) => setOpenPk(e.pk)} />}
         {view === "sla" && <Sla data={data} drillTo={drillTo} ownerQueue={ownerQueue} openExc={openExc} />}
-        {view === "admin" && <Admin data={data} refresh={load} />}
+        {view === "admin" && adminUnlocked && <Admin data={data} refresh={load} />}
       </main>
+
+      {view === "admin" && !adminUnlocked && (
+        <AdminGate onUnlock={unlockAdmin} onCancel={() => setView("dashboard")} />
+      )}
 
       {openException && <Drawer data={data} exc={openException} onClose={() => setOpenPk(null)} refresh={load} />}
       {newRunDate && (
