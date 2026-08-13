@@ -53,7 +53,7 @@ def sync_catalog(db):
     for r in reference.ROUTING:
         if r["error_type"] not in have_routing:
             db.add(RoutingMap(error_type=r["error_type"], team=r["team"], assignee=r["assignee"],
-                              jira_project=r["jira_project"], jira_component=r["jira_component"]))
+                              jira_project=settings.jira_project_key, jira_component=r["jira_component"]))
             added["routing"] += 1
     have_th = {(t.error_type, t.facility_type) for t in db.scalars(select(FacilityThreshold))}
     for row in reference.default_threshold_rows():
@@ -88,7 +88,7 @@ def seed():
                         enabled=r["enabled"]))
         for r in reference.ROUTING:
             db.add(RoutingMap(error_type=r["error_type"], team=r["team"], assignee=r["assignee"],
-                              jira_project=r["jira_project"], jira_component=r["jira_component"]))
+                              jira_project=settings.jira_project_key, jira_component=r["jira_component"]))
         for sev, days in reference.SLA_TARGETS.items():
             db.add(SlaTarget(severity=sev, resolution_days=days))
         for row in reference.default_threshold_rows():

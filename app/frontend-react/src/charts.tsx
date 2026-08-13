@@ -33,6 +33,12 @@ export function Trend({ data }: { data: Bootstrap["trend"] }) {
   const autoPts = data.map((d, i) => `${x(i)},${y(d.autoClosed)}`).join(" ");
   const area = `M${x(0)},${padT + ih} L${pts.replace(/ /g, " L")} L${x(data.length - 1)},${padT + ih} Z`;
   const grid = [0, 1, 2, 3, 4].map((g) => Math.round((maxV * g) / 4));
+  // Evenly-spaced x-axis ticks (always incl. first & last) so labels don't crowd near the ends
+  // or bunch up when runs aren't contiguous. ~7 ticks, deduped for short series.
+  const nTicks = Math.min(7, data.length);
+  const tickIdx = new Set(
+    Array.from({ length: nTicks }, (_, k) => Math.round((k * (data.length - 1)) / (nTicks - 1)))
+  );
   return (
     <svg className="chart" viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label="Error trend">
       <defs><linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
@@ -50,8 +56,11 @@ export function Trend({ data }: { data: Bootstrap["trend"] }) {
       {data.map((d, i) => (
         <g key={i}>
           <circle className="pt" cx={x(i)} cy={y(d.count)} r="2.4"><title>{d.date}: {d.count} flagged</title></circle>
-          {(i % 3 === 0 || i === data.length - 1) && (
-            <text x={x(i)} y={H - 6} textAnchor="middle">{d.date.slice(5)}</text>
+          {tickIdx.has(i) && (
+            <text x={x(i)} y={H - 6}
+              textAnchor={i === 0 ? "start" : i === data.length - 1 ? "end" : "middle"}>
+              {d.date.slice(5)}
+            </text>
           )}
         </g>
       ))}

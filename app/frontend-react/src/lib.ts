@@ -23,6 +23,19 @@ export function labelFor(errorTypes: { type: string; label?: string }[], type: s
   return (m && m.label) || type;
 }
 
+// Turn a raw snake_case snapshot/field key into a friendly display label
+// ("order_type" → "Order Type"). Domain acronyms are cased explicitly; every
+// other word is Title Cased.
+const KEY_ACRONYMS: Record<string, string> = {
+  po: "PO", sku: "SKU", uom: "UoM", ims: "IMS", id: "ID", utc: "UTC", pct: "%",
+};
+export function humanizeKey(k: string): string {
+  return k
+    .split("_")
+    .map((w) => KEY_ACRONYMS[w] ?? w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 export function fmtNum(v: any): string {
   if (v == null) return "—";
   const n = Number(v);

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     # unit conversion in the supply-chain catalog (no catalog record, or the PO's vendor SKU isn't
     # linked). Daily flags items purchased on the run-date; only meaningful when units differ (a
     # conversion is genuinely needed). Backfill sweeps this many days of purchases; keeps the run small.
-    po_missing_uom_conversion_lookback_days: int = 30
+    po_missing_uom_conversion_lookback_days: int = 7
 
     # --- Waste thresholds ---
     # Daily facility waste $ thresholds are per-facility-type and live in

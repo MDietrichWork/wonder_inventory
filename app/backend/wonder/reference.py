@@ -523,7 +523,7 @@ RULES = [
         "FROM legs\n"
         "WHERE shipped_qty <> received_qty\n"
         "ORDER BY ABS(shipped_qty - received_qty) DESC"
-     ), "enabled": True},
+     ), "enabled": False},  # out of go-live scope (PO + COST only)
     {"id": "COMPLETE-02", "name": "On-hand non-negative", "primitive": "RANGE", "error_type": "NEGATIVE_ON_HAND",
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
@@ -543,13 +543,13 @@ RULES = [
         "FROM ledger\n"
         "WHERE running_on_hand < 0 AND DATE(datetime_utc) = run_date\n"
         "ORDER BY running_on_hand"
-     ), "enabled": True},
+     ), "enabled": False},  # out of go-live scope (PO + COST only)
     {"id": "WASTE-DAILY", "name": "Daily facility waste within threshold", "primitive": "RANGE",
      "error_type": "WASTE_DAILY_FACILITY", "target_table": "consolidated_inventory_ledger",
      "severity": "High", "fail_type": "Soft", "owner_group": "Field Ops",
      "params": {},  # thresholds come from reference.WASTE_DAILY_THRESHOLDS, banded by facility_type
      # Documentation only; the live console regenerates this from the current allowlist (contract.py).
-     "expression": waste_daily_sql(), "enabled": True},
+     "expression": waste_daily_sql(), "enabled": False},  # out of go-live scope (PO + COST only)
     {"id": "ADJ-DAILY", "name": "Daily facility adjustments within threshold", "primitive": "RANGE",
      "error_type": "ADJ_DAILY_FACILITY", "target_table": "consolidated_inventory_ledger",
      "severity": "High", "fail_type": "Soft", "owner_group": "Field Ops",
@@ -564,7 +564,7 @@ RULES = [
         "FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` JOIN <standard_cost>\n"
         "WHERE l1_action='Adjust' AND l2_action NOT IN ('Move From','Move To','Update Received Order','Shelf Life Extension')\n"
         "GROUP BY facility_name, facility_type, day"
-     ), "enabled": True},
+     ), "enabled": False},  # out of go-live scope (PO + COST only)
     {"id": "COST-01", "name": "Waste SKU has a standard-cost record", "primitive": "RECONCILIATION",
      "error_type": "WASTE_SKU_NO_COST", "target_table": "consolidated_inventory_ledger ⋈ erp standard cost",
      "severity": "High", "fail_type": "Hard", "owner_group": "Accounting (Cost Accountant)",
@@ -714,46 +714,50 @@ RULES = [
      ), "enabled": True},
 ]
 
+# Per-error-type routing. The Jira PROJECT is intentionally NOT set here — all findings land in the
+# single configured project (settings.jira_project_key, env JIRA_PROJECT_KEY), which is also what
+# tickets are actually created in. Seeding/display derive the project from that setting so the two
+# can never drift. Only `jira_component` varies per type.
 ROUTING = [
     {"error_type": "NULL_PO_NUMBER", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
-     "jira_project": "WIQ", "jira_component": "Ledger Ingest"},
+     "jira_component": "Ledger Ingest"},
     {"error_type": "PO_RECORD_MISSING", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
-     "jira_project": "WIQ", "jira_component": "PO Sync"},
+     "jira_component": "PO Sync"},
     {"error_type": "PO_OVER_RECEIPT", "team": "Field Ops", "assignee": "Diego Alvarez",
-     "jira_project": "WIQ", "jira_component": "Receiving"},
+     "jira_component": "Receiving"},
     {"error_type": "PO_IMPLAUSIBLE_QTY", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
-     "jira_project": "WIQ", "jira_component": "Data Integrity"},
+     "jira_component": "Data Integrity"},
     {"error_type": "PO_UOM_MISMATCH", "team": "Procurement", "assignee": "Lena Ortiz",
-     "jira_project": "WIQ", "jira_component": "UoM / Conversions"},
+     "jira_component": "UoM / Conversions"},
     {"error_type": "TRANSFER_WAREHOUSE_IMBALANCE", "team": "Field Ops", "assignee": "Priya Nair",
-     "jira_project": "WIQ", "jira_component": "Transfers"},
+     "jira_component": "Transfers"},
     {"error_type": "NEGATIVE_ON_HAND", "team": "SC Product (IMS)", "assignee": "Pavel Romanov",
-     "jira_project": "WIQ", "jira_component": "On-Hand Recon"},
+     "jira_component": "On-Hand Recon"},
     {"error_type": "PO_MISSING_PRICE", "team": "Procurement", "assignee": "Tom Becker",
-     "jira_project": "WIQ", "jira_component": "Vendor Pricing"},
+     "jira_component": "Vendor Pricing"},
     {"error_type": "PO_NO_RECEIPT_OVERDUE", "team": "Procurement", "assignee": "Tom Becker",
-     "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
+     "jira_component": "PO Fulfillment"},
     {"error_type": "PO_PARTIAL_NOT_CLOSED", "team": "Procurement", "assignee": "Tom Becker",
-     "jira_project": "WIQ", "jira_component": "PO Fulfillment"},
+     "jira_component": "PO Fulfillment"},
     {"error_type": "CORRECTION_MISSING_REF", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
-     "jira_project": "WIQ", "jira_component": "Corrections"},
+     "jira_component": "Corrections"},
     {"error_type": "PO_MISSING_UOM_CONVERSION", "team": "Procurement", "assignee": "Tom Becker",
-     "jira_project": "WIQ", "jira_component": "UoM / Conversions"},
+     "jira_component": "UoM / Conversions"},
     {"error_type": "PO_MISSING_NUMBER", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
-     "jira_project": "WIQ", "jira_component": "PO Master Integrity"},
+     "jira_component": "PO Master Integrity"},
     {"error_type": "PO_SKU_NOT_ON_PO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
-     "jira_project": "WIQ", "jira_component": "3-Way Match"},
+     "jira_component": "3-Way Match"},
     {"error_type": "TRANSFER_ORDER_MISSING", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
-     "jira_project": "WIQ", "jira_component": "Transfer Orders"},
+     "jira_component": "Transfer Orders"},
     # Fallback routing; overridden per-finding by facility_type in validate.py (Field Ops IKC/ProdCo).
     {"error_type": "WASTE_DAILY_FACILITY", "team": "Field Ops — ProdCo", "assignee": "Priya Nair",
-     "jira_project": "WIQ", "jira_component": "Daily Waste"},
+     "jira_component": "Daily Waste"},
     {"error_type": "ADJ_DAILY_FACILITY", "team": "Field Ops — ProdCo", "assignee": "Priya Nair",
-     "jira_project": "WIQ", "jira_component": "Daily Adjustments"},
+     "jira_component": "Daily Adjustments"},
     {"error_type": "WASTE_SKU_NO_COST", "team": "Accounting (Cost Accountant)", "assignee": "Mike Dietrich",
-     "jira_project": "WIQ", "jira_component": "Standard Cost"},
+     "jira_component": "Standard Cost"},
     {"error_type": "CONSUMABLE_ZERO_COST", "team": "Accounting (Cost Accountant)", "assignee": "Mike Dietrich",
-     "jira_project": "WIQ", "jira_component": "Standard Cost"},
+     "jira_component": "Standard Cost"},
 ]
 
 # Owner group -> Jira routing: a group (for permissions / @mentions / filtering by the team

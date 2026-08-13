@@ -98,8 +98,13 @@ def build_bootstrap(db) -> Dict:
     errors = list(db.scalars(select(Error).order_by(Error.id)))
     exceptions = [_exception(e, today) for e in errors]
 
-    runs = list(db.scalars(select(ValidationRun).order_by(ValidationRun.run_date)))
-    trend = [{"date": r.run_date, "count": r.error_count, "autoClosed": r.autoclosed_count} for r in runs]
+    # One trend point per calendar day. Multiple runs can share a run_date (re-runs, scheduler +
+    # manual); keep the latest run of each day (highest id = end-of-day state) so the "per day" chart
+    # isn't duplicated per run.
+    runs = list(db.scalars(select(ValidationRun).order_by(ValidationRun.run_date, ValidationRun.id)))
+    by_day = {r.run_date: r for r in runs}  # ascending id → last write wins = latest run that day
+    trend = [{"date": r.run_date, "count": r.error_count, "autoClosed": r.autoclosed_count}
+             for r in sorted(by_day.values(), key=lambda r: r.run_date)]
 
     # recurring leaderboard: top fingerprints by recurrence
     top = sorted(errors, key=lambda e: e.recurrence, reverse=True)[:6]
@@ -121,7 +126,7 @@ def build_bootstrap(db) -> Dict:
     } for r in db_rules]
     routing = [{
         "errorType": r["error_type"], "team": r["team"], "assignee": r["assignee"],
-        "project": r["jira_project"], "component": r["jira_component"],
+        "project": settings.jira_project_key, "component": r["jira_component"],
     } for r in reference.ROUTING]
 
     # Editable facility threshold bands (DB-backed). refresh() also loads them into reference so the

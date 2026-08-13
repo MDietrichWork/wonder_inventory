@@ -1,6 +1,6 @@
 import { useEffect, useState, Fragment } from "react";
 import type { Bootstrap, Exception } from "./types";
-import { fmtNum } from "./lib";
+import { fmtNum, humanizeKey } from "./lib";
 import { getBreakdown, jiraUrl, apiPost } from "./api";
 import { sevPill, statusPill } from "./Workbench";
 
@@ -30,9 +30,7 @@ export function Drawer({ data, exc, onClose, refresh }: {
   data: Bootstrap; exc: Exception; onClose: () => void; refresh: () => Promise<void>;
 }) {
   const notes = exc.notes || [];
-  const rule = data.rules.find((r) => r.id === exc.rule);
   const meta = data.errorTypes.find((t) => t.type === exc.errorType);
-  const route = data.routing.find((r) => r.errorType === exc.errorType);
   const snap = exc.snapshot || {};
   const [bd, setBd] = useState<any>(null);
   const [noteText, setNoteText] = useState("");
@@ -85,11 +83,11 @@ export function Drawer({ data, exc, onClose, refresh }: {
         <div className="drawer-body">
           {/* Offending snapshot */}
           <div className="section">
-            <h3>Offending {exc.table} snapshot</h3>
+            <h3>Offending {humanizeKey(exc.table)} snapshot</h3>
             <div className="kv">
               {Object.keys(snap).filter((k) => !SNAP_HIDE.has(k)).map((k) => {
                 const { text, neg } = snapValue(k, snap[k], snap);
-                return <Fragment key={k}><div className="k">{k}</div><div className={"v" + (neg ? " neg" : "")}>{text}</div></Fragment>;
+                return <Fragment key={k}><div className="k">{humanizeKey(k)}</div><div className={"v" + (neg ? " neg" : "")}>{text}</div></Fragment>;
               })}
             </div>
           </div>
@@ -105,7 +103,7 @@ export function Drawer({ data, exc, onClose, refresh }: {
                   <tbody>
                     {snap.resolution.fields.map((f: any, i: number) => (
                       <tr key={i}>
-                        <td>{f.label}</td>
+                        <td>{humanizeKey(f.label)}</td>
                         <td className="num neg">{fmtVal(f.was, f.unit)}</td>
                         <td className="num ok">{fmtVal(f.now, f.unit)}</td>
                       </tr>
@@ -128,10 +126,9 @@ export function Drawer({ data, exc, onClose, refresh }: {
           <div className="section">
             <h3>Ownership &amp; assignment</h3>
             <div className="kv">
-              <div className="k">primary_owner</div><div className="v">{exc.primaryOwner}  (accountable)</div>
-              <div className="k">currently_with</div><div className="v">{exc.currentHolder} · held {exc.heldDays}d (since {exc.heldSince})</div>
-              <div className="k">jira_project</div><div className="v">{route?.project || "WIQ"}</div>
-              <div className="k">recurrence_30d</div><div className="v">×{exc.recurrence}</div>
+              <div className="k">Primary Owner</div><div className="v">{exc.primaryOwner}  (accountable)</div>
+              <div className="k">Currently With</div><div className="v">{exc.currentHolder} · held {exc.heldDays}d (since {exc.heldSince})</div>
+              <div className="k">Recurrence (30d)</div><div className="v">×{exc.recurrence}</div>
             </div>
             {handed && exc.subAssign ? (
               <div className="subassign-box">
@@ -179,15 +176,6 @@ export function Drawer({ data, exc, onClose, refresh }: {
             </div>
           </div>
 
-          {/* Validation rule — last */}
-          <div className="section">
-            <h3>Validation rule that fired</h3>
-            <div className="rule-box">
-              <div className="rname">{(rule?.name || exc.errorType) + "  —  " + (rule?.type || meta?.ruleType || "")}</div>
-              <div className="tip">{meta?.desc || ""}</div>
-              <code>{rule?.expression || "(rule expression unavailable)"}</code>
-            </div>
-          </div>
         </div>
 
         {/* Action footer */}

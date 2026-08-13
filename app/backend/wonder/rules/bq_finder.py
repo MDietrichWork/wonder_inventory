@@ -16,9 +16,9 @@ from .. import reference
 
 MAX_GB = 60               # backfill scans more history; daily stays tiny
 RESULT_CAP = 500          # per-band ticket cap for a daily run (touched-set is normally far smaller)
-BACKFILL_CAP = 10         # per-band cap (genuine / implausible / UoM-mismatch) — ~30 tickets for the demo
+BACKFILL_CAP = 500         # per-band cap for the go-live backfill — high enough to capture the full 7-day backlog
 RECEIPT_LOOKBACK_DAYS = 30   # daily: how far back to sum cumulative received for a touched PO
-BACKFILL_LOOKBACK_DAYS = 14   # initial run: history to sweep for the existing backlog (2 weeks)
+BACKFILL_LOOKBACK_DAYS = 7   # go-live baseline: sweep the last 7 days for the existing backlog
 
 # Over-receipt — refined per Jonny Li (data analyst, final SQL sign-off): a TWO-WAY match keyed on
 # ims_sku (the raw system id sent to BOTH tables), not the translated consumable_sku.

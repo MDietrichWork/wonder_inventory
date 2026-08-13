@@ -4,6 +4,7 @@ import { HBars, Trend, SystemDonut } from "./charts";
 
 export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label: string, test: Drill extends null ? never : (e: any) => boolean) => void }) {
   const exc = data.exceptions;
+  const openExc = exc.filter((e) => e.isOpen);
   const m = metrics(exc, data.meta.runDate);
 
   const kpis = [
@@ -14,14 +15,16 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
     { label: "% within SLA", val: m.pctSla + "%", drill: { label: "Breaching SLA (open)", test: (e: any) => e.isOpen && !e.withinSla } },
   ];
 
-  const byType = countBy(exc, "errorType");
-  const byFac = countBy(exc, "facility");
-  const byMove = countBy(exc, movementOf);
+  // All breakdowns count OPEN exceptions only, so their totals tie to the Exception Workbench
+  // (which defaults to open-only). Closed/Resolved live on the Closed screen.
+  const byType = countBy(openExc, "errorType");
+  const byFac = countBy(openExc, "facility");
+  const byMove = countBy(openExc, movementOf);
 
   const typeEntries = Object.entries(byType).map(([k, v]) => [labelFor(data.errorTypes, k), v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]);
   const facEntries = Object.entries(byFac).map(([k, v]) => [k, v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]).slice(0, 10);
   const moveEntries = Object.entries(byMove).map(([k, v]) => [k, v, k] as [string, number, string]).sort((a, b) => b[1] - a[1]);
-  const sevEntries = ["Urgent", "High", "Medium", "Low"].map((s) => [s, exc.filter((e) => e.severity === s).length, s] as [string, number, string]);
+  const sevEntries = ["Urgent", "High", "Medium", "Low"].map((s) => [s, openExc.filter((e) => e.severity === s).length, s] as [string, number, string]);
 
   return (
     <section className="view active">
@@ -46,7 +49,7 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
 
         <div className="panels">
           <div className="card">
-            <h2>Error trend <span className="hint">flagged vs auto-closed / day · last 21 days</span></h2>
+            <h2>Error trend <span className="hint">flagged vs auto-closed / day</span></h2>
             <div id="trend-chart"><Trend data={data.trend} /></div>
             <div className="chart-legend">
               <span><i style={{ background: "var(--accent)" }} /> Errors flagged</span>
@@ -55,29 +58,29 @@ export function Dashboard({ data, drillTo }: { data: Bootstrap; drillTo: (label:
           </div>
           <div className="card">
             <h2>Errors by system of origin <span className="hint">click to drill</span></h2>
-            <SystemDonut counts={countBy(exc, "system")} onDrill={(s) => drillTo("System: " + s, ((e: any) => e.system === s) as any)} />
+            <SystemDonut counts={countBy(openExc, "system")} onDrill={(s) => drillTo("System: " + s, ((e: any) => e.isOpen && e.system === s) as any)} />
           </div>
         </div>
 
         <div className="panels equal">
           <div className="card">
             <h2>Errors by type <span className="hint">click a bar to drill</span></h2>
-            <div className="hbars"><HBars entries={typeEntries} onDrill={(v) => drillTo("Type: " + labelFor(data.errorTypes, v), ((e: any) => e.errorType === v) as any)} /></div>
+            <div className="hbars"><HBars entries={typeEntries} onDrill={(v) => drillTo("Type: " + labelFor(data.errorTypes, v), ((e: any) => e.isOpen && e.errorType === v) as any)} /></div>
           </div>
           <div className="card">
             <h2>Errors by facility <span className="hint">click a bar to drill</span></h2>
-            <div className="hbars"><HBars entries={facEntries} onDrill={(v) => drillTo("Facility: " + v, ((e: any) => e.facility === v) as any)} /></div>
+            <div className="hbars"><HBars entries={facEntries} onDrill={(v) => drillTo("Facility: " + v, ((e: any) => e.isOpen && e.facility === v) as any)} /></div>
           </div>
         </div>
 
         <div className="panels equal">
           <div className="card">
             <h2>Errors by inventory movement type <span className="hint">click a bar to drill</span></h2>
-            <div className="hbars"><HBars entries={moveEntries} onDrill={(v) => drillTo("Movement: " + v, ((e: any) => movementOf(e) === v) as any)} /></div>
+            <div className="hbars"><HBars entries={moveEntries} onDrill={(v) => drillTo("Movement: " + v, ((e: any) => e.isOpen && movementOf(e) === v) as any)} /></div>
           </div>
           <div className="card">
             <h2>Errors by severity</h2>
-            <div className="hbars"><HBars entries={sevEntries} onDrill={(v) => drillTo("Severity: " + v, ((e: any) => e.severity === v) as any)} /></div>
+            <div className="hbars"><HBars entries={sevEntries} onDrill={(v) => drillTo("Severity: " + v, ((e: any) => e.isOpen && e.severity === v) as any)} /></div>
           </div>
         </div>
 

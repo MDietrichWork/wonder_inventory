@@ -4,6 +4,7 @@ from sqlalchemy import String, Integer, Float, Boolean, JSON, ForeignKey, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
+from .config import settings
 
 
 class ValidationRun(Base):
@@ -40,7 +41,7 @@ class RoutingMap(Base):
     error_type: Mapped[str] = mapped_column(String(64), index=True)
     team: Mapped[str] = mapped_column(String(48))
     assignee: Mapped[str] = mapped_column(String(64))
-    jira_project: Mapped[str] = mapped_column(String(16), default="WIQ")
+    jira_project: Mapped[str] = mapped_column(String(16), default=lambda: settings.jira_project_key)
     jira_component: Mapped[str] = mapped_column(String(48), default="")
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
