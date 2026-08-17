@@ -20,6 +20,127 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-08-17 — TWH-01 drafted (Transfer Warehouse in/out balance) — DOCUMENTED, deliberately NOT live
+- User shared a real 4-row ledger excerpt (origin Transfer Out → DTW Transfer In → DTW Transfer
+  Out → destination Transfer In) as the pattern to replicate — this is the long-catalogued
+  **TWH-01** rule (separate family from XFER-0N), previously just a WIP stub. Scoped per explicit
+  direction: compare **only** the two legs recorded at the Digital Transfer Warehouse itself
+  (In vs Out), ignoring the origin and destination legs entirely — those are already covered by
+  XFER-02/XFER-05 and are out of scope here.
+- **Two corrections found before the numbers were trustworthy, both surfaced and confirmed with
+  the user before proceeding:**
+  1. A naive DTW-In-vs-Out comparison found 3.6M "left DTW, never arrived" cases — almost all
+     false alarms from a completely different flow (DTW acting as its own source for
+     retail/Pantry digital fulfillment, not a staging waypoint). Fix: require a real non-DTW
+     origin `Transfer Out` leg to exist first. Dropped to 35,230 all-time.
+  2. Even after that, "arrived at DTW, never left" stayed enormous (64,863/30d, barely dropping
+     with longer aging) — the user pushed back that this didn't sound plausible, which was the
+     right call: ~85% of a sample had a matching Out leg under a **suffixed variant of the same
+     `ims_sku`** — the identical XFER-05 case-multiplier-suffix bug, recurring on DTW's own two
+     legs. Fix: suffix-normalize before comparing. Dropped to 5,404/30d (~180/day) — a 92%
+     reduction, finally a believable number.
+- **Explicitly NOT put live**, per direct instruction: documented in full in
+  `docs/rule-sql-guide.md` (including both correction write-ups, open questions for the data
+  engineer, and real examples) and in `reference.py`'s `TWH-01` catalog entry (`enabled: False`,
+  and — unlike every other rule this session — deliberately **not** added to
+  `bq_finder._FINDERS`, so there's no live finder function for it at all; flipping the DB flag
+  alone can't make it fire). Holding for data-engineer sign-off on: the suffix-normalization
+  assumption, the origin-leg-required scoping, the 3-day aging cutoff, and Phase 2 (quantity
+  magnitude mismatch when both legs are present — 79,944/30d, not designed yet).
+
+### 2026-08-17 — XFER-04 & XFER-07: transfer-order aging (no pick activity / picked-but-not-received), first admin-editable rule thresholds
+- Fourth and fifth transfer rules, requested together since the user wasn't sure what "picked"
+  should mean for the no-pick-activity case and asked to use the picked-but-not-received rule's
+  clearer semantics to inform it. Both are `AGING` rules (Field Ops / Priya Nair / component
+  "Transfers"), and both ship with a day-threshold that's **admin-editable** (a new capability —
+  first rule params exposed as their own write-through Admin control, `Admin → Transfer order
+  aging`, backed by `app_setting` the same way closed-ticket retention already is) rather than a
+  `.env`/code constant like PO-07/PO-08's day thresholds.
+- **XFER-07 (picked but not received, Z days, default 2)** was straightforward: pick date + receipt
+  check both from the ledger, require the TO to exist (skip XFER-01's territory), exclude
+  cancelled/voided. Verified live: 0 of 76,035 picked, non-cancelled transfer orders in a 90-day
+  window lack a matching receiving-leg row — ledger-only is fully reliable here. Current backlog: 0
+  (a clean safety net, same shape as PO-13).
+- **XFER-04 (no pick activity, Y days, default 2)** needed a real design decision, surfaced to the
+  user before building: checking the ledger alone (same approach as every other transfer rule)
+  false-positived at scale — of Transfer Orders with **zero** matching `Transfer Out` ledger rows,
+  **~94% are already `status=CLOSED` or `RECEIVED`** in the orders table. One example, `PO-431527`
+  (status `CLOSED`), has zero rows in the ledger under any action, ever — a genuine gap in what
+  syncs into `consolidated_inventory_ledger` for a meaningful slice of transfers, not a fixable
+  join-key issue like the `ims_sku` cases on XFER-02/05. User confirmed (after an initial
+  false-start answer that got corrected): treat a TO as already-picked if EITHER a ledger pick row
+  exists OR its own status has advanced past picking (`SHIPPED`/`PARTIALLY_SHIPPED`/`RECEIVED`/
+  `PARTIALLY_RECEIVED`/`CLOSED`/`PICKED`/`PACKED`/`PACKING`/`PLACED`); dead orders (`CANCELLED`/
+  `CANCELED`/`VOIDED`/`VENDOR_REJECTED`) excluded entirely. With that filter, current backlog is
+  150 over a 30-day window (~10/day) — real, plausible, still-early-lifecycle orders sitting idle.
+- Wired end-to-end: `reference.py` (rules/error-types/labels/routing + the new
+  `set_xfer_day_thresholds`/`xfer_no_pick_days`/`xfer_not_received_days` live-value pattern,
+  mirroring the facility $ bands), new `wonder/xfer_aging.py` module (app_setting get/set, mirrors
+  `retention.py`), `thresholds.refresh(db)` now also loads these two into `reference`'s live state,
+  `bq_finder.py` finders + rechecks, `validate.py` auto-close dispatch, `PUT /api/xfer-aging`
+  endpoint + audit log, `bootstrap` settings blob (`xferNoPickDays`/`xferNotReceivedDays`), and a
+  new `TransferAgingEditor` card in the React Admin page (same pattern as the retention-days
+  editor). Verified the admin edit actually changes live finder output (Y=2 → 150 backlog, Y=10 →
+  98) before calling it done.
+
+### 2026-08-13 — XFER-05: received item not listed on its Transfer Order (a second, different join-key trap)
+- Third transfer rule. Receiving-side sibling of XFER-02: covers both receiving legs tagged
+  `ref_order_type='Transfer Order'` — `l2_action='Transfer In'` (DISH-type facilities) and
+  `l2_action='Received'` (Pantry/HDR selling units, ~180 of them). Note on numbering: the user
+  asked for this one right after XFER-02 and initially suggested calling it XFER-03, but the
+  framework catalog (`docs/validation-tests.csv`) already assigns XFER-03 to a quantity-mismatch
+  rule and XFER-05 to this one — built it as **XFER-05** to keep code ids matching the catalog.
+- **Found a second, different join-key trap, not fixable by reusing XFER-02's fix.** Naively
+  reusing XFER-02's plain `ims_sku` equality for receiving looked reasonable but false-positived
+  **15–70% of every single HDR selling unit** on live data (~180 stores, every day). Root cause:
+  **827,000 of 22.48M** transfer-order lines — concentrated in Pantry/HDR frozen "F" items — carry
+  a `-N` case-multiplier suffix on `ims_sku` (e.g. TO line `ims_sku='4200584F-2'` for a ledger
+  receiving row reporting the bare `ims_sku='4200584F'`).
+- Tested two fixes against live data before picking one: **stripping the suffix** on the TO side
+  fixed receiving (0 false positives) but, re-tested against XFER-02's already-shipped picking
+  query, **introduced 67,755 new false orphans** on the same 30-day window that was previously
+  clean — merging suffixed variants into one bucket is safe for receiving's sum-check but corrupts
+  picking's. **Matching exact-OR-suffixed per row** (`ims_sku = p.ims_sku OR ims_sku LIKE
+  p.ims_sku||'-%'`, summing only matching lines) fixed receiving with the same 0-false-positive
+  result and **zero effect on picking** (still 0/512,802 on the same window) — this is the
+  predicate shipped. XFER-02 itself was left untouched; it doesn't need this and already validated
+  clean.
+- Live volume: 40–200/day across DISH + all HDR selling units combined — a real, moderate-volume
+  defect rate (not systemic noise, unlike the Digital Transfer Warehouse issue on XFER-01).
+- Wired end-to-end: `reference.py` (rule/error-type/label/routing — **SC Product (IMS) / Marcus
+  Webb / component "3-Way Match"**, matching PO-14's routing since this is the transfer-side
+  3-way match on the receiving leg), `bq_finder.py` finder + recheck, `validate.py` auto-close
+  dispatch, `docs/rule-sql-guide.md`.
+
+### 2026-08-13 — XFER-02: picked item not listed on its Transfer Order (found the PO-03 lesson recurring)
+- Second transfer rule, same two tables as XFER-01. Requires the Transfer Order to **exist**
+  (otherwise it's XFER-01's job) and checks whether the TO's lines actually order the picked item —
+  the transfer-side sibling of PO-14's 3-way match.
+- **Found the same join-key trap PO-03 hit, on a different rule.** The obvious key — `consumable_sku`,
+  same as PO-14 uses for purchase orders — produced a **72% false-positive rate** on a live sample
+  day (14,679 of 20,228 DISH picks against real, existing transfer orders came back "not on the
+  TO"). Root cause: `consumable_sku` on the ledger is a per-system **translation** that doesn't line
+  up 1:1 with the TO table's `consumable_sku` for the same item. Re-keyed the join on **`ims_sku`**
+  (the raw id both tables share) — 0 false positives on the same sample day. Exact same fix already
+  applied to PO-03 (see the "Refined per Jonny Li" note in that rule's history); PO-14 was built on
+  `consumable_sku` and hasn't been re-checked for the same issue (not touched — existing rule, out
+  of scope here).
+- Also excludes Digital Transfer Warehouse, same as XFER-01.
+- Live volume: 0 in the last 30 days, 243 all-time across DISH/Arcadia/Millington — low-volume
+  safety net (same shape as PO-13), kept enabled rather than held back, since it's cheap to run and
+  catches real 3-way-match breaks (verified example: TO `TO-DISH_DTC1333` at Arcadia, 11 items
+  picked that weren't on the TO's lines, incl. `Marinara Sauce, 9 LB, Frozen`).
+- Wired end-to-end: `reference.py` (rule/error-type/label/routing — Field Ops / Priya Nair /
+  component "Transfers"), `bq_finder.py` finder + recheck (auto-closes once the item is added to the
+  TO's lines with qty > 0), `validate.py` auto-close dispatch, `docs/rule-sql-guide.md`.
+
+### 2026-08-13 — XFER-01 re-enabled: transfer order missing, scoped to exclude Digital Transfer Warehouse noise
+- Revisited **XFER-01** (disabled 2026-06-11 per Pavel: "transfer orders out of scope for now") to add the first transfer-family exception. Verified the join logic directly against live BigQuery before flipping it on, since the DB row (`Rule.enabled`) isn't touched by `sync_catalog`'s insert-missing-only sync — required a direct update alongside the `reference.py` change.
+- **Root cause of "out of scope" found:** on the actual daily production cadence (single run-date, not an all-time scan), the un-scoped rule fires **5–30 tickets every day**, almost entirely from the synthetic **Digital Transfer Warehouse** facility (`facility_id='FAC_DIGITAL_TRANSFER'`, `facility_type='In-Transit'`, `system_of_origin='digital_transfer_warehouse'`). That facility's `Transfer Out` rows use freetext ad hoc labels (`"Instacart"`, `"Sesame general"`, `"BRFC - <date>"`, `"... - recount PO"`) for digital-channel/recount movements that never get a master transfer-order record — every one of them is a false positive by construction, not a real defect. Pavel's pause was correct given the rule as originally written.
+- **Fix:** added `AND system_of_origin != 'digital_transfer_warehouse'` to both the catalog SQL and the live finder (`_build_transfer_order_missing_sql` in `bq_finder.py`). Real numbered transfer orders (`PO-######`, `G-#######` style ids) match the transfer population reliably when they exist — confirmed 0 false positives among those patterns. Post-exclusion daily volume: **0–19/day**, mostly at Arcadia, referencing real transferred food items (verified a live example: `DISH809` at Arcadia, 6 SKUs incl. Cookies & Cream, no matching transfer order) — genuine, actionable orphan-pick defects for SC Product (IMS).
+- Flipped `enabled: True` in `reference.py` + the live DB row; removed the "(WIP)" tag from `ERROR_TYPE_LABELS`; documented in `docs/rule-sql-guide.md` (new XFER-01 section + coverage tracker) and here.
+- **Next transfer rules to build:** XFER-02 through XFER-07 are cataloged in `docs/validation-tests.md`/`.csv` (class "5. Inter-network Transfers In & Out") but not yet wired — quantity mismatches, no-pick/no-receipt aging, and received-but-not-on-TO checks.
+
 ### 2026-06-12 — Cost-data rules: waste SKU without cost + zero-cost consumable (#66)
 - Two new **Accounting (Cost Accountant)** rules off the now-wired ERP standard cost, both with an explicit per-finding **`why_flagged`** explanation surfaced as a callout at the top of the drawer (and carried into the Jira body):
   - **`WASTE_SKU_NO_COST` (COST-01, High)** — a waste-active `consumable_sku` with **no** ERP cost record (no `ITEMID` match), so its waste can't be valued. Small population → **all** ticketed (5).

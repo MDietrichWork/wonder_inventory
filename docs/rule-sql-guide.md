@@ -62,6 +62,7 @@ Each rule is documented with the same six parts:
 | **Default assignee** | Sarah Chen |
 | **Jira** | Project **WIQ** · Component **Ledger Ingest** |
 | **Source table** | The Inventory Ledger (`consolidated_inventory_ledger`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | ✅ **Live — runs in the daily validation job, and it fires.** Identifying receipts by their movement action surfaces a real, ongoing problem: **Fishbowl / facility CK1** receipts land with both `ref_order_type` and the PO number blank (~13 in the last 30 days; 16–40/month for the past 8 months). The prior version keyed on `ref_order_type = 'Purchase Order'` and matched **0 rows in all of history** — it was watching the wrong column and missed every one of these. The filter covers both receipt actions — `'PO Receipt'` (Fishbowl/Extensiv/Shiphero/RMX) and Pantry's `'Received'` — so every source system's receipts are checked. |
 
 ### The SQL
@@ -218,15 +219,15 @@ hence the **Urgent** severity and same-day SLA.
 
 > **Status: awaiting sign-off.** This documents a July 2026 refinement of PO-03. It reflects Jonny's
 > two directions — (1) re-base off the **IMS SKU** rather than the translated *consumable* SKU, and
-> (2) make it a **two-way match** (the PO's own receipt count *and* the ledger cumulative) — plus one
-> deviation from the literal instruction that the live data forced (see ⚠️ below).
+> (2) make it a **two-way match** (the PO's own receipt count *and* the ledger cumulative) — plus two
+> deviations from the literal instruction that the live data forced (see ⚠️ below).
 
 **What changed**
 
 | | Before | After |
 |---|---|---|
 | **Item key / grain** | `consumable_sku` (a downstream translation) | **`ims_sku`** (raw id on both tables); one ticket per `(PO, IMS SKU)` |
-| **Signals** | one — ledger receipts vs ordered | **two** — Layer 1: PO's own `received_qty` vs `ims_sku_qty` (packaging); Layer 2: ledger `SUM(consumable_quantity_change)` vs `consumable_sku_qty` (base) |
+| **Signals** | one — ledger receipts vs ordered | **two** — Layer 1: PO's own `received_qty` vs `ims_sku_qty` (packaging); Layer 2: ledger `SUM(ims_quantity_change)` vs `consumable_sku_qty` (base) |
 | **Flag condition** | ledger over by >30% (or UoM mismatch) | **either** layer over by >30% (or UoM mismatch) |
 | **Threshold** | 30% High / 100% Urgent | unchanged (30% / 100%) |
 
@@ -241,23 +242,27 @@ hence the **Urgent** severity and same-day SLA.
    **ledger-only** cases where the PO's own count looks clean — the case the single-signal rule missed
    (see the `PO 61920` Roncadin example below).
 
-**⚠️ One deviation that needs your confirmation, Jonny**
+**⚠️ Two deviations from the literal instruction, both data-forced**
 
-The instruction was to use IMS quantities on both sides. On the ledger that isn't viable, so **Layer 2
-uses `consumable_quantity_change` (base units), not `ims_quantity_change`:**
+The instruction was to use IMS quantities on both sides. On the ledger that isn't fully viable, so
+**Layer 2 splits its two jobs across two different ledger columns**:
 
-- Ledger `ims_quantity_change` is actually stored in the **base** unit — it equals
-  `consumable_quantity_change` ~90% of rows, and for the same IMS SKU the ledger's `ims_uom` matches
-  the PO's `ims_uom` only ~5% of the time. Comparing ledger-IMS-qty to PO `ims_sku_qty` gives
-  base-vs-packaging nonsense (e.g. 50 cases ordered vs 8,400 oz received → a fake 168× overage).
+- **Deciding whether a pair is over** (the `led_received` total compared to `consumable_sku_qty`) sums
+  `ims_quantity_change`, not `consumable_quantity_change`. An earlier pass used
+  `consumable_quantity_change` for this total; Jonny's follow-up flagged that basis as over-flagging on
+  live data, so the received total now runs on `ims_quantity_change` instead.
+- **Timestamping when it started** (the `breach` CTE's running total, used only to find the first
+  receipt that crossed the threshold) still sums `consumable_quantity_change`. That's a lower-stakes use
+  — pinpointing *when* the total crossed the line, not deciding *whether* it did — where the two
+  columns' ~90% agreement is good enough.
+- Ledger `ims_quantity_change` is stored in the **base** unit — it equals `consumable_quantity_change`
+  ~90% of rows, and for the same IMS SKU the ledger's `ims_uom` matches the PO's `ims_uom` only ~5% of
+  the time. So it still can't be compared to PO `ims_sku_qty` (Layer 1's packaging-unit benchmark) —
+  it stays a Layer 2 (base-unit) measure, just a different base-unit column than originally documented.
 - Ledger `supplier_quantity_change` *is* in packaging units but is **NULL for 100% of Pantry
-  receipts** (the largest receiving flow), so it can't be used universally.
-- `consumable_quantity_change` is **100% populated** and is the only cross-system-reliable ledger
-  measure — hence Layer 2 runs in base units, while Layer 1 (PO-only) stays in packaging units. Each
-  layer therefore compares like-unit-to-like-unit and never crosses the base↔packaging boundary.
+  receipts** (the largest receiving flow), so it can't be used universally either.
 
-*Please confirm the `consumable_quantity_change` substitution for Layer 2, or tell us the column /
-conversion you'd prefer.*
+*Confirmed live — this is the column the finder SQL actually runs on (see below).*
 
 ### At a glance
 
@@ -271,6 +276,7 @@ conversion you'd prefer.*
 | **Default assignee** | Diego Alvarez |
 | **Jira** | Project **WIQ** · Component **Receiving** |
 | **Source tables** | Inventory Ledger **⋈** PO Table (joined on `ref_order_id` ⇄ `po` and **`ims_sku`** ⇄ `ims_sku`) |
+| **Jonny Signoff** | 2026-07-17 |
 | **Live status** | 🟢 **Live — runs daily.** Flagged **0** on 2026-07-13 (no over-receipts booked that day); a 14-day backfill window catches **5**, all confirmed by *both* layers. It fires whenever a PO's own receipts **or** its ledger cumulative cross the over-receipt threshold. |
 
 ### Why two layers — and why IMS, not consumable
@@ -284,7 +290,8 @@ The two tables record receiving in **different units**, and this is the crux of 
   ~90% of the time (both base units), and for the *same* IMS SKU the ledger's `ims_uom` matches the
   PO's `ims_uom` only ~5% of the time. So the ledger's "IMS quantity" is **not** in the PO's IMS
   packaging unit — comparing them directly would produce nonsense (e.g. 50 cases ordered vs 8,400 oz
-  received → a fake 168× "over-receipt").
+  received → a fake 168× "over-receipt"). It's still a base-unit column, though, so it can stand in
+  for `consumable_quantity_change` as Layer 2's received total (see the ⚠️ note above for why it does).
 
 So each layer is measured **entirely within its own unit system**, never across the base↔packaging
 boundary:
@@ -292,11 +299,12 @@ boundary:
 | Layer | Ordered | Received | Unit |
 |---|---|---|---|
 | **1 · PO's own books** | `ims_sku_qty` | `received_qty` | packaging (`cs`/`pk`/`ea`) — one table, no conversion |
-| **2 · Ledger cumulative** | `consumable_sku_qty` | `SUM(consumable_quantity_change)` | base (`oz`/`lb`/`g`) — the only cross-system-reliable ledger measure |
+| **2 · Ledger cumulative** | `consumable_sku_qty` | `SUM(ims_quantity_change)` | base (`oz`/`lb`/`g`) — the only cross-system-reliable ledger measure |
 
-Layer 2 uses `consumable_quantity_change` (which is **100% populated**) rather than the ledger's
-`supplier_quantity_change`, which *is* in packaging units but is **NULL for every Pantry receipt**
-(the largest receiving flow) and so can't be used universally.
+Layer 2's received total sums `ims_quantity_change` (per Jonny's follow-up — `consumable_quantity_change`
+over-flagged on live data) rather than the ledger's `supplier_quantity_change`, which *is* in packaging
+units but is **NULL for every Pantry receipt** (the largest receiving flow) and so can't be used
+universally. `consumable_quantity_change` still drives the breach-date calculation (see the ⚠️ note).
 
 ### The SQL
 
@@ -306,7 +314,7 @@ Layer 2 uses `consumable_quantity_change` (which is **100% populated**) rather t
 -- DAILY PO over-receipt — TWO-WAY match keyed on ims_sku. For every (po, ims_sku) that RECEIVED
 -- yesterday, compare TWO signals:
 --   LAYER 1 (PO's own books): PO.received_qty vs PO.ims_sku_qty        (packaging units cs/pk/ea)
---   LAYER 2 (ledger cumulative): SUM(consumable_quantity_change) vs PO.consumable_sku_qty  (base oz/lb/g)
+--   LAYER 2 (ledger cumulative): SUM(ims_quantity_change) vs PO.consumable_sku_qty  (base oz/lb/g)
 -- Flag if EITHER layer is over.
 DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);  -- yesterday
 WITH touched AS (   -- (po, ims_sku) received on run_date
@@ -317,10 +325,10 @@ WITH touched AS (   -- (po, ims_sku) received on run_date
 
 received AS (   -- LAYER 2: cumulative ledger receipts (base units), 30-day lookback
   SELECT
-    l.ref_order_id                    AS po,
+    l.ref_order_id               AS po,
     l.ims_sku,
-    SUM(l.consumable_quantity_change) AS led_received,
-    ANY_VALUE(l.consumable_uom)       AS received_uom
+    SUM(l.ims_quantity_change)   AS led_received,
+    ANY_VALUE(l.consumable_uom)  AS received_uom
   FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger` l
   JOIN touched t ON l.ref_order_id = t.po AND l.ims_sku = t.ims_sku
   WHERE l.ref_order_type = 'Purchase Order'
@@ -386,7 +394,7 @@ evt AS (
     l.ims_sku,
     l.consumable_sku,
     l.datetime_utc,
-    l.consumable_quantity_change AS q,
+    l.ims_quantity_change AS q,
     l.consumable_uom AS ruom,
     l.facility_name AS facility,
     l.facility_type,
@@ -548,15 +556,17 @@ documented form, and the **live version's thresholds are the ones actually in fo
    finds every `(po, ims_sku)` that *received something yesterday* (the small `JOIN (… DATE(datetime_utc)
    = run_date …)` sub-query) — we only re-examine orders that actually had activity, which keeps the
    query cheap. For each, it pulls **every** ledger line tied to that PO+IMS-SKU over the last **30
-   days** and adds a **running cumulative total** (`running_recv`) in **base units** — row by row in
-   time order, "how much have we received against this PO+item *so far*." Why include positive **and**
-   negative lines? Because if a receiver over-logs a receipt and a correction is later booked back
-   against the same PO, the two cancel out — so the running total is a **true net**, and we don't flag
-   a mistake that was already fixed.
+   days** and adds a **running cumulative total** (`running_recv`, off `consumable_quantity_change`) in
+   **base units** — row by row in time order, "how much have we received against this PO+item *so
+   far*." This running total only feeds the **breach date** below; it isn't the column the flag decision
+   runs on (see step 3). Why include positive **and** negative lines? Because if a receiver over-logs a
+   receipt and a correction is later booked back against the same PO, the two cancel out — so the
+   running total is a **true net**, and we don't flag a mistake that was already fixed.
 
 3. **`received` — Layer 2's bottom line.** Collapses `evt` to one row per `(po, ims_sku)` with the
-   **net ledger received quantity** (base units) and its unit, plus triage details (facility, system,
-   the dominant receiving action).
+   **net ledger received quantity** — `SUM(q)`, where `q` is `ims_quantity_change` (base units, see the
+   ⚠️ note above for why this column and not `consumable_quantity_change`) — and its unit, plus triage
+   details (facility, system, the dominant receiving action).
 
 4. **`ordered` — what the PO called for, in *both* units, plus its own count.** From the **PO Table**,
    per `(po, ims_sku)`: `ordered_pkg` (= `SUM(ims_sku_qty)`, packaging), `ordered_base`
@@ -607,7 +617,8 @@ so we can run both layers of the match.
 |---|---|---|
 | `ims_sku` (both) | The raw item id the source systems stamp on both tables. | **Join key & grain** — the item link, replacing the translated `consumable_sku`. |
 | `ref_order_id` (ledger) | The PO a receipt belongs to. | **Join key** to the PO table; identifies the order. |
-| `consumable_quantity_change` (ledger) | How much the item moved on that line, in **base units** (+ in, − out). | **Summed** into the Layer-2 net received quantity. |
+| `ims_quantity_change` (ledger) | How much the item moved on that line, in **base units** (+ in, − out). | **Summed** into the Layer-2 net received quantity (`led_received`) — decides `led_over`. |
+| `consumable_quantity_change` (ledger) | Same movement, in base units, from a different source column. | Drives the `running_recv` cumulative used **only** for the breach date — not the flag decision (see ⚠️ note above). |
 | `consumable_uom` (ledger) | The base unit the receipt was booked in. | Compared to the PO's base unit (UoM-mismatch check). |
 | `datetime_utc` (ledger) | When the movement happened. | Picks "touched yesterday", the 30-day window, and the breach date. |
 | `received_qty` (PO) | The PO's **own** running received count, in **packaging units**. | **Layer 1 numerator** — the "PO receipt" signal. |
@@ -659,6 +670,7 @@ exactly what the second layer exists to surface.
 | **Default assignee** | Tom Becker |
 | **Jira** | Project **WIQ** · Component **UoM / Conversions** |
 | **Source tables** | PO Table (`int_ledger_purchase_orders`) **⋈** Supply-chain product catalog (`supply_chain_catalog.wonder_products`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Grain** | **One ticket per (Consumable SKU, Vendor SKU)** — the vendor-item that can't be converted, not per PO line. |
 | **Key settings** | `po_missing_uom_conversion_lookback_days` = **30** (backfill window; daily flags items purchased that day) |
 | **Live status** | 🟢 **Live — runs daily.** Over a 30-day backfill it finds **134** unconvertible (consumable, vendor) pairs; the daily run flags the ones purchased that day. |
@@ -892,6 +904,7 @@ Procurement links the vendor SKU (or adds the catalog record), hence the **Urgen
 | **Default assignee** | Tom Becker |
 | **Jira** | Project **WIQ** · Component **PO Fulfillment** |
 | **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Grain** | **One ticket per PO** (not per line). |
 | **Key settings** | `po_no_receipt_overdue_days` = **2** (grace days past expected) · `po_no_receipt_overdue_lookback_days` = **7** (only recently-overdue POs; 0 = full backlog) |
 | **Live status** | 🟢 **Live — runs daily.** With the 7-day window it flagged **2** POs on the 2026-07-06 run (`KAN-1041`, `KAN-1042`). |
@@ -1053,6 +1066,7 @@ cancelled) 7 days later — Procurement needs to chase the delivery or cancel th
 | **Default assignee** | Tom Becker |
 | **Jira** | Project **WIQ** · Component **PO Fulfillment** |
 | **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Grain** | **One ticket per PO** (not per line). |
 | **Key settings** | `po_partial_not_closed_days` = **3** (grace days past expected) · `po_partial_not_closed_lookback_days` = **7** (only recently-overdue POs; 0 = full backlog) |
 | **Live status** | 🟢 **Live — runs daily.** With the 7-day window it flagged **1** PO on the 2026-07-06 run (`KAN-1043`). |
@@ -1217,6 +1231,7 @@ date the PO still hasn't been closed — Procurement needs to receive the balanc
 | **Default assignee** | Tom Becker |
 | **Jira** | Project **WIQ** · Component **Vendor Pricing** |
 | **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | 🟢 **Live — runs daily.** Flagged **0** on yesterday's data; it fires whenever a closed PO line dated that day is missing its vendor price. |
 
 ### The SQL
@@ -1349,6 +1364,7 @@ $0 — understating inventory and COGS until Procurement sets the real vendor pr
 | **Default assignee** | Sarah Chen |
 | **Jira** | Project **WIQ** · Component **Corrections** |
 | **Source table** | The Inventory Ledger (`consolidated_inventory_ledger`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Grain** | **One ticket per ledger row** (each correction event). |
 | **Key setting** | `po_correction_missing_ref_lookback_days` = **7** (only scan the last 7 days of ledger events; keeps the initial run small) |
 | **Live status** | 🟢 **Live — runs daily.** Flagged **29** correction rows on the 2026-07-06 run (`KAN-1044`–`KAN-1072`). |
@@ -1488,6 +1504,7 @@ wrong.
 | **Default assignee** | Marcus Webb |
 | **Jira** | Project **WIQ** · Component **PO Master Integrity** |
 | **Source table** | PO Table (`int_ledger_purchase_orders`) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | 🟢 **Live — safety-net.** Finds **0** on current data (every master PO row has a number); kept switched on so it catches the problem immediately if upstream ever degrades. PO-13 is the **PO-table twin of PO-01** (which checks the *ledger* side). |
 
 ### The SQL
@@ -1602,6 +1619,7 @@ matched to anything — it's a broken record that points to an upstream ingestio
 | **Default assignee** | Marcus Webb |
 | **Jira** | Project **WIQ** · Component **3-Way Match** |
 | **Source tables** | Inventory Ledger **⋈** PO Table (joined) |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | 🟢 **Live — runs daily.** Fires whenever a SKU is received against a PO that orders none of it (not on the PO, or on a zero-order line). The zero-order-line case is a safety-net per Jonny Li: **0 such lines exist in the PO master today** (checked over 90 days, all source systems), so it adds no tickets right now, but catches the Ship Hero zero-order receive-line the moment one syncs in. (Live version of framework catalog rule PO-02.) |
 
 ### The SQL
@@ -1831,6 +1849,7 @@ explained once here and not repeated in each walkthrough.
 | **Default assignee** | Mike Dietrich |
 | **Jira** | Project **WIQ** · Component **Standard Cost** |
 | **Source tables** | Inventory Ledger **⋈** ERP standard-cost table |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | 🟢 **Live — runs daily.** Flagged **1** on yesterday's data; it fires whenever a wasted item has no ERP cost record. |
 
 ### The SQL
@@ -1995,6 +2014,7 @@ Accounting needs to set up a standard cost for the item in Dynamics.
 | **Default assignee** | Mike Dietrich |
 | **Jira** | Project **WIQ** · Component **Standard Cost** |
 | **Source tables** | Inventory Ledger **⋈** ERP standard-cost table |
+| **Jonny Signoff** | 2026-07-15 |
 | **Live status** | 🟢 **Live — runs daily.** Flagged **4** on yesterday's data. There's a large standing backlog (600+ items); the daily run tickets a **sample of up to 5** of the day's active zero-cost items while the program works through it. |
 
 ### The SQL
@@ -2140,6 +2160,1118 @@ Dynamics. (One of 600+ in the standing backlog; a daily sample is ticketed.)
 
 ---
 
+## XFER-01 · Transfer Order Missing
+
+> **In one sentence:** find items picked (Transfer Out) against a Transfer Order id that has no
+> matching record in the orders table — picking against a transfer order that doesn't exist.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | XFER-01 |
+| **Rule type** | `REFERENTIAL` (a "this value must exist in the other table" check) |
+| **Severity** | **High** — 1-day SLA |
+| **Owner / routed team** | SC Product (IMS) |
+| **Default assignee** | Sarah Chen |
+| **Jira** | Component **Transfer Orders** |
+| **Source tables** | Inventory Ledger **⋈** PO Table (joined; transfer orders share the PO table, keyed by `order_type='Transfer'`) |
+| **Live status** | 🟢 **Live — runs daily.** Re-enabled 2026-08-13. Was paused ("per Pavel: transfer orders are out of scope for now") because the naive join fired on every Transfer Out from the synthetic **Digital Transfer Warehouse** facility (`system_of_origin='digital_transfer_warehouse'`) — an in-transit staging facility whose freetext ad hoc labels (`"Instacart"`, `"Sesame general"`, `"BRFC - <date>"`, recount tags) never get a master transfer-order record, so **100% of them false-positived** (verified live: ~5–30/day of pure noise). Excluding that facility drops daily volume to **0–19/day** of genuine orphan picks — mostly at Arcadia, referencing real transferred items with no matching transfer order. |
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Catalog XFER-01: a Transfer Out pick references a Transfer Order id not in the
+-- transfer-order population (orders table, order_type='Transfer'). Excludes the synthetic
+-- Digital Transfer Warehouse facility (freetext ad hoc labels never get a master TO record).
+WITH picks AS (
+  SELECT DISTINCT ref_order_id AS to_id
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+),
+
+to_pop AS (   -- every transfer-order id that actually exists
+  SELECT DISTINCT po AS to_id
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+)
+
+SELECT p.to_id
+FROM picks p
+LEFT JOIN to_pop t USING (to_id)
+WHERE t.to_id IS NULL
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- XFER-01: a Transfer Out pick references a Transfer Order id not in the transfer-order
+-- population (orders table, order_type='Transfer'). One row per orphan transfer order.
+WITH picks AS (
+  SELECT
+    ref_order_id                    AS to_id,
+    COUNT(DISTINCT consumable_sku)  AS skus_picked,
+    ANY_VALUE(item_name)            AS sample_item,
+    ANY_VALUE(facility_name)        AS facility,
+    ANY_VALUE(system_of_origin)     AS system,
+    SUM(consumable_quantity_change) AS net_qty,
+    DATE(MIN(datetime_utc))         AS first_seen,
+    DATE(MAX(datetime_utc))         AS last_seen,
+    ANY_VALUE(l1_action)            AS move_l1,
+    ANY_VALUE(l2_action)            AS move_l2
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+    AND DATE(datetime_utc) = @run_date
+  GROUP BY to_id
+),
+
+to_pop AS (   -- every transfer-order id that actually exists
+  SELECT DISTINCT po AS to_id
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+),
+
+flagged AS (
+  SELECT p.*
+  FROM picks p
+  LEFT JOIN to_pop t USING (to_id)
+  WHERE t.to_id IS NULL
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_seen DESC)  AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY last_seen DESC
+```
+
+### Plain-English walkthrough
+
+This rule answers: *"this item was picked against Transfer Order #XYZ — but does Transfer Order
+#XYZ actually exist?"* Transfer orders don't have their own table; they live in the PO table
+(`int_ledger_purchase_orders`) alongside purchase orders, distinguished by `order_type='Transfer'`
+(vs `'Purchase'`), with the transfer-order id in the same `po` column.
+
+1. **`picks` — every Transfer Out yesterday, grouped by transfer-order id.** From the ledger,
+   filter to `ref_order_type='Transfer Order'` and `l2_action='Transfer Out'` (the pick leg, not
+   the receiving leg) with a non-null `ref_order_id`. **Excludes `system_of_origin =
+   'digital_transfer_warehouse'`** — see the note below on why.
+
+2. **`to_pop` — every transfer-order id that actually exists.** The set of `po` values in the PO
+   table where `order_type='Transfer'`.
+
+3. **`flagged` — `LEFT JOIN … WHERE t.to_id IS NULL`.** A pick whose transfer-order id has no
+   match in `to_pop` is an orphan — items are moving against a transfer order that was never
+   created (or never synced).
+
+4. **`ranked` + final line — count, cap at 500, newest-first.**
+
+**Why the Digital Transfer Warehouse exclusion matters.** `Digital Transfer Warehouse` is a
+synthetic in-transit staging facility (`facility_id='FAC_DIGITAL_TRANSFER'`,
+`facility_type='In-Transit'`), not a physical location. Its Transfer Out rows use freetext,
+human-entered labels — `"Instacart"`, `"Sesame general"`, `"BRFC - August 12, 2026 (3)"`,
+`"Mayonnaise (1 gal) - recount PO"` — for digital-channel and recount movements that are never
+going to get a master transfer-order record, because there isn't a real transfer order behind
+them. Checked live: every single one of these is an "orphan" by construction, and they made up
+the large majority of daily hits before the exclusion. Real, numbered transfer orders (e.g.
+`PO-390894`, `G-2625238` style ids) match the population reliably when they exist — this is a
+targeted exclusion of one non-transfer facility, not a weakening of the underlying check.
+
+### Tables & columns used
+
+**Tables:** Inventory Ledger (`consolidated_inventory_ledger`) **⋈** PO Table
+(`int_ledger_purchase_orders`, filtered to `order_type='Transfer'`).
+**Join key:** `ref_order_id` (ledger) ⇄ `po` (PO table).
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `ref_order_type` (ledger) | What kind of order this movement references. | **Filter** — `'Transfer Order'`. |
+| `l2_action` (ledger) | The specific movement type. | **Filter** — `'Transfer Out'` (the pick leg). |
+| `ref_order_id` (ledger) | The transfer-order id the pick was booked against. | **Join key** — must exist in the PO table's transfer population. |
+| `system_of_origin` (ledger) | Which system produced the row. | **Exclusion filter** — drops `'digital_transfer_warehouse'` (ad hoc, no master TO record by design). |
+| `po` (PO table) | The order id. | **Join key** — the transfer-order population. |
+| `order_type` (PO table) | `'Purchase'` or `'Transfer'`. | **Filter** — scopes the population to real transfer orders. |
+
+### Example of a flagged record (from live data)
+
+Live BigQuery, 2026-08-07, Arcadia:
+
+| Field | Value |
+|---|---|
+| `to_id` (transfer order) | `DISH809` (no match in the transfer population ✗) |
+| Items picked | 6 distinct SKUs, incl. `Cookies & Cream 8/14oz` |
+| `facility` | `Arcadia` |
+| `move` | Transfer Out |
+
+**Why it's flagged:** items were picked and moved out against transfer order `DISH809`, but no
+transfer order with that id exists in `int_ledger_purchase_orders`. Either the transfer order was
+never created before the pick happened, or it never synced — SC Product (IMS) needs to reconcile
+which.
+
+---
+
+## XFER-02 · SKU Not on Transfer Order
+
+> **In one sentence:** find items picked (Transfer Out) against a Transfer Order that **exists**,
+> but that orders **none of this item** — a 3-way-match break, the transfer-order sibling of PO-14.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | XFER-02 |
+| **Rule type** | `REFERENTIAL` (a "this value must exist in the other table" check) |
+| **Severity** | **High** — 1-day SLA |
+| **Owner / routed team** | Field Ops |
+| **Default assignee** | Priya Nair |
+| **Jira** | Component **Transfers** |
+| **Source tables** | Inventory Ledger **⋈** PO Table (joined; transfer orders share the PO table, keyed by `order_type='Transfer'`) |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-13, right after XFER-01. Excludes Digital Transfer Warehouse and TOs that don't exist at all (that's XFER-01's job — this rule requires the TO to exist first). **Joined on `ims_sku`, not `consumable_sku`** — see below. Currently finds **0 in the last 30 days** on live data (243 all-time, spread thin across DISH/Arcadia/Millington) — a low-volume safety net, kept live to catch it the moment it recurs, same pattern as PO-13. |
+
+### Why `ims_sku`, not `consumable_sku`
+
+The obvious join key — `consumable_sku`, same as PO-14 uses for purchase orders — is a **trap**
+here. Checked live on one sample day (2026-08-07, DISH): joining Transfer Out picks to TO lines on
+`consumable_sku` produced **14,679 "orphans" out of 20,228 picks (72%)** where the transfer order
+unambiguously existed. Spot-checking one: a pick against `PO-425282` for `consumable_sku='4000997'`
+had no line for that sku on the TO — but the TO *did* have a line for `ims_sku='4200434'` at
+`consumable_sku='4200434'`, and the ledger pick's own `ims_sku` was also `4200434`. The ledger's
+`consumable_sku` is a per-system **translation** that doesn't line up 1:1 with the TO table's
+`consumable_sku` for the same item; `ims_sku` is the raw id both tables share, and re-running the
+exact same day's check keyed on `ims_sku` found **0** false positives. This is the identical lesson
+already learned on PO-03 (see the "Refined per Jonny Li" note in that section) — it just hadn't
+been applied to the transfer side yet.
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Catalog XFER-02: a Transfer Out pick against a Transfer Order that EXISTS, but the TO
+-- orders none of that item (not on its lines, or on a line ordered for 0). Excludes Digital
+-- Transfer Warehouse and TOs that don't exist at all (XFER-01's job). Joined on ims_sku, not
+-- consumable_sku — verified live that consumable_sku is a per-system translation that doesn't
+-- line up 1:1 between the ledger and the TO table (72% false-positive rate on one sample day);
+-- ims_sku is the raw shared id and matches cleanly. Same lesson as PO-03's ims_sku re-key.
+WITH picks AS (
+  SELECT DISTINCT ref_order_id AS to_id, ims_sku
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+),
+
+to_lines AS (   -- how much of each item each transfer order actually orders
+  SELECT
+    po,
+    ims_sku,
+    SUM(consumable_sku_qty) AS ordered_qty
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+    AND ims_sku IS NOT NULL
+  GROUP BY po, ims_sku
+),
+
+to_exists AS (   -- the set of real transfer-order ids
+  SELECT DISTINCT po
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+)
+
+SELECT p.to_id, p.ims_sku
+FROM picks p
+JOIN to_exists e ON p.to_id = e.po
+LEFT JOIN to_lines l ON p.to_id = l.po AND p.ims_sku = l.ims_sku
+WHERE COALESCE(l.ordered_qty, 0) <= 0
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- XFER-02: an item picked (Transfer Out) against a Transfer Order that EXISTS, but the TO
+-- orders none of that item. One row per (transfer order, ims_sku).
+WITH picks AS (
+  SELECT
+    ref_order_id                    AS to_id,
+    ims_sku,
+    ANY_VALUE(consumable_sku)       AS consumable_sku,
+    ANY_VALUE(item_name)            AS item_name,
+    ANY_VALUE(facility_name)        AS facility,
+    ANY_VALUE(system_of_origin)     AS system,
+    SUM(consumable_quantity_change) AS net_qty,
+    DATE(MIN(datetime_utc))         AS first_seen,
+    DATE(MAX(datetime_utc))         AS last_seen,
+    ANY_VALUE(l1_action)            AS move_l1,
+    ANY_VALUE(l2_action)            AS move_l2
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+    AND DATE(datetime_utc) = @run_date
+  GROUP BY to_id, ims_sku
+),
+
+to_lines AS (   -- how much of each item each transfer order actually orders
+  SELECT
+    po,
+    ims_sku,
+    SUM(consumable_sku_qty) AS ordered_qty
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+    AND ims_sku IS NOT NULL
+  GROUP BY po, ims_sku
+),
+
+to_exists AS (   -- the set of real transfer-order ids
+  SELECT DISTINCT po
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+),
+
+flagged AS (
+  SELECT
+    p.*,
+    (l.ims_sku IS NOT NULL) AS on_to,
+    l.ordered_qty
+  FROM picks p
+  JOIN to_exists e ON p.to_id = e.po
+  LEFT JOIN to_lines l ON p.to_id = l.po AND p.ims_sku = l.ims_sku
+  WHERE COALESCE(l.ordered_qty, 0) <= 0
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_seen DESC)  AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY last_seen DESC
+```
+
+### Plain-English walkthrough
+
+This rule answers: *"this item was picked against Transfer Order #XYZ, and #XYZ is real — but did
+#XYZ actually order this item?"*
+
+1. **`picks` — every (transfer order, ims_sku) picked yesterday.** Same filter as XFER-01
+   (`ref_order_type='Transfer Order'`, `l2_action='Transfer Out'`, excludes Digital Transfer
+   Warehouse), but keyed on `ims_sku` instead of `ref_order_id` alone.
+
+2. **`to_lines` — how much of each item each transfer order actually orders.** Summed
+   `consumable_sku_qty` per `(po, ims_sku)` on the TO's lines.
+
+3. **`to_exists`** — the set of real transfer-order ids, same population XFER-01 checks against.
+
+4. **`flagged` — the match logic, identical shape to PO-14's:**
+   - `JOIN to_exists … ON to_id = po` — require the TO to be **real** first. If it weren't, that's
+     XFER-01's problem, not this rule's — this prevents the two rules from double-ticketing the
+     same root cause.
+   - `LEFT JOIN to_lines … WHERE COALESCE(ordered_qty, 0) <= 0` — the TO orders zero or none of
+     this item (not on its lines at all, or on a line ordered for 0).
+
+5. **`ranked` + final line** — count, cap at 500, newest-first.
+
+### Tables & columns used
+
+**Tables:** Inventory Ledger (`consolidated_inventory_ledger`) **⋈** PO Table
+(`int_ledger_purchase_orders`, filtered to `order_type='Transfer'`).
+**Join keys:** `ref_order_id` ⇄ `po` (the order) and **`ims_sku` ⇄ `ims_sku`** (the item — not
+`consumable_sku`, see above).
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `ref_order_id` (ledger) | The transfer order the pick was booked against. | **Join key** — must exist (`to_exists`). |
+| `ims_sku` (ledger) | The raw system item id. | **Join key** — must have a positive-qty line on the TO. |
+| `consumable_sku` (ledger) | The translated item id. | **Not used for joining** — shown on the ticket for context only. |
+| `system_of_origin` (ledger) | Which system produced the row. | **Exclusion filter** — drops `'digital_transfer_warehouse'`. |
+| `po`, `ims_sku` (PO table) | The TO's lines (what was ordered). | The "guest list" the picked item is matched against. |
+| `consumable_sku_qty` (PO table) | Quantity ordered on the TO line. | **The check** — summed per (TO, `ims_sku`); `<= 0` (or no line) is a break. |
+
+### Example of a flagged record (from live data)
+
+Live BigQuery, 2026-05-23, Arcadia — Transfer Order `TO-DISH_DTC1333`:
+
+| Field | Value |
+|---|---|
+| `to_id` (transfer order) | `TO-DISH_DTC1333` (exists ✓) |
+| `ims_sku` / `item_name` | `W34625` / `Marinara Sauce, 9 LB, Frozen` |
+| On the TO's lines? | **No** ← **the problem** |
+| `net_qty_change` | `-979,758.72` (base unit) |
+| `system` | `Shiphero` |
+
+**Why it's flagged:** the transfer order is valid, but this item was never ordered on it — the
+same 3-way-match break PO-14 catches on the purchase side, just for transfers. This TO had **11**
+items flagged this way the same day, all against the same TO id — worth a single reconciliation
+pass rather than 11 separate tickets' worth of digging.
+
+---
+
+## XFER-05 · Received SKU Not on Transfer Order
+
+> **In one sentence:** find items **received** (Transfer In, or Received at Pantry/HDR) against a
+> Transfer Order that **exists**, but that orders **none of this item** — the receiving-side
+> sibling of XFER-02.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | XFER-05 (framework catalog numbering — not built in numeric order; XFER-03/04 are quantity/aging checks, not yet built) |
+| **Rule type** | `REFERENTIAL` (a "this value must exist in the other table" check) |
+| **Severity** | **High** — 1-day SLA |
+| **Owner / routed team** | SC Product (IMS) |
+| **Default assignee** | Marcus Webb |
+| **Jira** | Component **3-Way Match** |
+| **Source tables** | Inventory Ledger **⋈** PO Table (joined; transfer orders share the PO table, keyed by `order_type='Transfer'`) |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-13. Covers both receiving legs tagged `ref_order_type='Transfer Order'`: `l2_action='Transfer In'` (DISH-type facilities) and `l2_action='Received'` (Pantry/HDR selling units). Excludes Digital Transfer Warehouse and TOs that don't exist (XFER-01's job). **Uses a different join predicate than XFER-02** — see below, this one is not a simple `ims_sku` equality. Live volume: **40–200/day** across ~180 HDR selling units plus DISH — a real, moderate-volume defect rate (not systemic noise). |
+
+### Why this rule needed a different join than XFER-02 (the "-N" suffix)
+
+XFER-02 (picking) joins cleanly on plain `ims_sku` equality. Naively reusing that same join for
+receiving looked reasonable — but checked live, it produced a **15–70% false-positive rate at
+literally every one of ~180 HDR selling units**, every day. Root cause: **827,000 of 22.48M**
+transfer-order lines (concentrated in Pantry/HDR frozen "F" items) carry a **`-N` case-multiplier
+suffix** on `ims_sku` — e.g. a TO line reads `ims_sku='4200584F-2'` for an item the ledger's
+receiving leg reports as the bare `ims_sku='4200584F'`. Two candidate fixes were tested against
+live data before picking one:
+
+- **Strip the suffix on the TO side** (`GROUP BY REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '')`) —
+  fixed receiving completely (0 false positives), **but retested against XFER-02's picking-side
+  query and broke it**: 67,755 new false orphans on the same 30-day window that was previously
+  clean. Stripping merges genuinely distinct suffixed lines into one bucket, which is safe for
+  receiving's aggregate-sum check but corrupts picking's.
+- **Match exact-OR-suffixed per row** (`l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku,
+  '-%')`), summing only the matching lines — fixed receiving (0 false positives, same result as
+  stripping) **with zero effect on picking** (still 0/512,802 false positives on the same 30-day
+  window, because it never merges unrelated lines together). This is the predicate XFER-05 uses.
+  XFER-02 doesn't need it and wasn't changed.
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Catalog XFER-05: an item RECEIVED (Transfer In, or Received at Pantry/HDR) against a
+-- Transfer Order that EXISTS, but the TO orders none of that item. Receiving-side sibling
+-- of XFER-02. Excludes Digital Transfer Warehouse and TOs that don't exist (XFER-01's job).
+-- Join is exact-OR-suffixed ims_sku (l.ims_sku = p.ims_sku OR l.ims_sku LIKE p.ims_sku||'-%'),
+-- NOT plain ims_sku and NOT a stripped-suffix match — see the write-up above.
+WITH picks AS (
+  SELECT DISTINCT ref_order_id AS to_id, ims_sku
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action IN ('Transfer In', 'Received')
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+),
+
+to_exists AS (   -- the set of real transfer-order ids
+  SELECT DISTINCT po
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+)
+
+SELECT p.to_id, p.ims_sku
+FROM picks p
+JOIN to_exists e ON p.to_id = e.po
+WHERE COALESCE((
+  SELECT SUM(l.consumable_sku_qty)
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` l
+  WHERE l.po = p.to_id
+    AND l.order_type = 'Transfer'
+    AND (l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku, '-%'))
+), 0) <= 0
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- XFER-05: an item received (Transfer In / Received) against a real Transfer Order that
+-- orders none of this item. One row per (transfer order, ims_sku).
+WITH picks AS (
+  SELECT
+    ref_order_id                    AS to_id,
+    ims_sku,
+    ANY_VALUE(consumable_sku)       AS consumable_sku,
+    ANY_VALUE(item_name)            AS item_name,
+    ANY_VALUE(facility_name)        AS facility,
+    ANY_VALUE(system_of_origin)     AS system,
+    SUM(consumable_quantity_change) AS net_qty,
+    DATE(MIN(datetime_utc))         AS first_seen,
+    DATE(MAX(datetime_utc))         AS last_seen,
+    ANY_VALUE(l1_action)            AS move_l1,
+    ANY_VALUE(l2_action)            AS move_l2
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action IN ('Transfer In', 'Received')
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse'
+    AND DATE(datetime_utc) = @run_date
+  GROUP BY to_id, ims_sku
+),
+
+to_exists AS (   -- the set of real transfer-order ids
+  SELECT DISTINCT po
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+),
+
+joined AS (   -- exact-or-suffixed ims_sku match against the TO's lines (see write-up above)
+  SELECT
+    p.to_id, p.ims_sku, p.consumable_sku, p.item_name, p.facility, p.system, p.net_qty,
+    p.first_seen, p.last_seen, p.move_l1, p.move_l2,
+    l.consumable_sku_qty
+  FROM picks p
+  JOIN to_exists e ON p.to_id = e.po
+  LEFT JOIN `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` l
+    ON l.po = p.to_id
+    AND l.order_type = 'Transfer'
+    AND (l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku, '-%'))
+),
+
+agg AS (   -- re-aggregate: the exact-or-suffixed join can match more than one line per pick
+  SELECT
+    to_id,
+    ims_sku,
+    ANY_VALUE(consumable_sku)                  AS consumable_sku,
+    ANY_VALUE(item_name)                       AS item_name,
+    ANY_VALUE(facility)                        AS facility,
+    ANY_VALUE(system)                          AS system,
+    ANY_VALUE(net_qty)                         AS net_qty,
+    ANY_VALUE(first_seen)                      AS first_seen,
+    ANY_VALUE(last_seen)                       AS last_seen,
+    ANY_VALUE(move_l1)                         AS move_l1,
+    ANY_VALUE(move_l2)                         AS move_l2,
+    SUM(consumable_sku_qty)                    AS ordered_qty,
+    LOGICAL_OR(consumable_sku_qty IS NOT NULL) AS on_to
+  FROM joined
+  GROUP BY to_id, ims_sku
+),
+
+flagged AS (
+  SELECT *
+  FROM agg
+  WHERE COALESCE(ordered_qty, 0) <= 0
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY last_seen DESC)  AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY last_seen DESC
+```
+
+### Plain-English walkthrough
+
+1. **`picks`** — every (transfer order, `ims_sku`) received yesterday, either leg
+   (`Transfer In` at DISH-type facilities, or `Received` at Pantry/HDR selling units), excluding
+   Digital Transfer Warehouse.
+
+2. **`to_exists`** — the same real-transfer-order population XFER-01/02 check against.
+
+3. **`joined` + `agg`** — for each pick, `LEFT JOIN` the TO's lines using the **exact-or-suffixed**
+   predicate, then re-aggregate (`SUM`/`ANY_VALUE`) back down to one row per (transfer order,
+   `ims_sku`), since the join can match more than one line (e.g. a line at the bare id and another
+   at a suffixed variant that both happen to apply — summing keeps the "total ordered" check
+   correct rather than picking one arbitrarily).
+
+4. **`flagged`** — `COALESCE(ordered_qty, 0) <= 0`: the TO orders zero or none of this item.
+
+5. **`ranked` + final line** — count, cap at 500, newest-first.
+
+### Tables & columns used
+
+**Tables:** Inventory Ledger (`consolidated_inventory_ledger`) **⋈** PO Table
+(`int_ledger_purchase_orders`, filtered to `order_type='Transfer'`).
+**Join keys:** `ref_order_id` ⇄ `po` (the order) and **`ims_sku` ⇄ `ims_sku` (exact OR
+`ims_sku` LIKE `ims_sku`+`'-%'`)** — not a plain equality, see above.
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `l2_action` (ledger) | The specific movement type. | **Filter** — `'Transfer In'` or `'Received'` (the two receiving legs). |
+| `ref_order_id` (ledger) | The transfer order the receipt was booked against. | **Join key** — must exist (`to_exists`). |
+| `ims_sku` (ledger) | The raw system item id, unsuffixed on this leg. | **Join key** — matched against the TO's lines, suffix-tolerant. |
+| `system_of_origin` (ledger) | Which system produced the row. | **Exclusion filter** — drops `'digital_transfer_warehouse'`. |
+| `po`, `ims_sku` (PO table) | The TO's lines. `ims_sku` here may carry a `-N` case-multiplier suffix. | The "guest list" the received item is matched against. |
+| `consumable_sku_qty` (PO table) | Quantity ordered on the TO line. | **The check** — summed across all matching (exact + suffixed) lines; `<= 0` is a break. |
+
+### Example of a flagged record (from live data)
+
+Live BigQuery, 2026-08-07, DISH:
+
+| Field | Value |
+|---|---|
+| `to_id` (transfer order) | `260806CK1-SHIP00029` (exists ✓) |
+| `ims_sku` / `item_name` | `4200781-20` / `Steamed Jasmine Rice (270 g)` |
+| On the TO's lines? | **No** ← **the problem** |
+| `net_qty_change` | `+194,400` (base unit) |
+| `system` | `Shiphero` |
+| `movement` | Add / Transfer In |
+
+**Why it's flagged:** the transfer order is valid, but this item — a large received quantity —
+was never ordered on it. 76 items flagged this way across DISH and Pantry/HDR selling units the
+same day, a moderate steady-state rate worth routing to SC Product (IMS) for reconciliation.
+
+---
+
+## XFER-04 · Transfer Order No Pick Activity
+
+> **In one sentence:** find Transfer Orders still in an early lifecycle status (not yet shipped,
+> not cancelled) that have had **zero pick activity** more than **Y days** (default 2,
+> **Admin-editable**) after being created.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | XFER-04 |
+| **Rule type** | `AGING` (a "too much time has passed with nothing happening" check) |
+| **Severity** | **Medium** — 2-day SLA |
+| **Owner / routed team** | Field Ops |
+| **Default assignee** | Priya Nair |
+| **Jira** | Component **Transfers** |
+| **Source tables** | PO Table (population, `order_type='Transfer'`) **⋈** Inventory Ledger (activity check) |
+| **Threshold** | **Y = 2 days**, editable in **Admin → Transfer order aging** (`PUT /api/xfer-aging`, `app_setting.xfer_no_pick_days`) — takes effect on the next validation run, no restart needed. |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17. Current backlog: **150** (30-day lookback window), a believable ~10/day rate. |
+
+### Why "picked" can't be judged from the ledger alone here
+
+Every other transfer rule (XFER-01/02/05) treats "a ledger row with `l2_action='Transfer Out'`
+exists" as the sole truth for "picked." Reusing that here looked reasonable but checked live, it
+false-positived at scale: of Transfer Orders with **zero** matching ledger rows, **~94% are
+already `status=CLOSED` or `RECEIVED`** in the orders table — i.e. they obviously already shipped,
+they just never got a row in `consolidated_inventory_ledger` under that transfer-order id. One
+example, `PO-431527` (status `CLOSED`), has **zero rows in the ledger under any action, ever** —
+not a join-key formatting issue like the `ims_sku` cases on XFER-02/05, a genuine gap in what
+syncs into the ledger for a meaningful slice of transfers. Flagging on ledger absence alone would
+have produced ~300+/day of pure noise.
+
+**The fix:** a Transfer Order counts as already-picked if **either** a ledger Transfer Out row
+exists **or** its own status has already advanced past picking (`SHIPPED`, `PARTIALLY_SHIPPED`,
+`RECEIVED`, `PARTIALLY_RECEIVED`, `CLOSED`, `PICKED`, `PACKED`, `PACKING`, `PLACED`). Dead orders
+(`CANCELLED`, `CANCELED`, `VOIDED`, `VENDOR_REJECTED`) are excluded from consideration entirely —
+not a "no pick activity" case, just not a candidate either way. With that filter, the genuinely
+still-early-lifecycle population (statuses like `PENDING`, `PLANNED`, `VENDOR_ACCEPTED`,
+`NOT_RECEIVED`, `EXCEPTION`) with real zero pick activity is a believable ~10/day.
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Catalog XFER-04: a Transfer Order still in an early lifecycle status (not yet shipped,
+-- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days after it
+-- was created. A TO is also treated as already-picked if its own status has advanced past
+-- picking — see the write-up above. Y defaults to 2, admin-editable.
+WITH to_agg AS (
+  SELECT
+    po,
+    MAX(DATE(po_date_utc))                  AS order_date,
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+    AND po IS NOT NULL
+    AND TRIM(po) <> ''
+  GROUP BY po
+),
+
+picked AS (   -- transfer orders with at least one real ledger Transfer Out row
+  SELECT DISTINCT ref_order_id AS po
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+)
+
+SELECT t.po
+FROM to_agg t
+LEFT JOIN picked p USING (po)
+WHERE p.po IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM UNNEST(t.statuses) s
+    WHERE UPPER(s) IN (
+      'CANCELLED', 'CANCELED', 'VOIDED', 'VENDOR_REJECTED',
+      'SHIPPED', 'PARTIALLY_SHIPPED', 'RECEIVED', 'PARTIALLY_RECEIVED',
+      'CLOSED', 'PICKED', 'PACKED', 'PACKING', 'PLACED'
+    )
+  )
+  AND t.order_date IS NOT NULL
+  AND t.order_date < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- XFER-04: current backlog of still-early-status Transfer Orders with no pick activity.
+WITH to_agg AS (
+  SELECT
+    po,
+    MAX(DATE(po_date_utc))                  AS order_date,
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    ANY_VALUE(destination_name)             AS facility,
+    ANY_VALUE(destination_id)               AS facility_id,
+    ANY_VALUE(po_source_system)             AS system
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+    AND po IS NOT NULL
+    AND TRIM(po) <> ''
+  GROUP BY po
+),
+
+picked AS (   -- transfer orders with at least one real ledger Transfer Out row
+  SELECT DISTINCT ref_order_id AS po
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+),
+
+flagged AS (
+  SELECT
+    t.*,
+    DATE_ADD(t.order_date, INTERVAL @no_pick_days DAY) AS breach_date,
+    DATE_DIFF(@run_date, t.order_date, DAY)            AS days_since_order
+  FROM to_agg t
+  LEFT JOIN picked p USING (po)
+  WHERE p.po IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM UNNEST(t.statuses) s
+      WHERE UPPER(s) IN (
+        'CANCELLED', 'CANCELED', 'VOIDED', 'VENDOR_REJECTED',
+        'SHIPPED', 'PARTIALLY_SHIPPED', 'RECEIVED', 'PARTIALLY_RECEIVED',
+        'CLOSED', 'PICKED', 'PACKED', 'PACKING', 'PLACED'
+      )
+    )
+    AND t.order_date IS NOT NULL
+    AND t.order_date < DATE_SUB(@run_date, INTERVAL @no_pick_days DAY)
+    AND t.order_date >= DATE_SUB(@run_date, INTERVAL 30 DAY)
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                          AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY order_date ASC)    AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY order_date ASC
+```
+
+### Plain-English walkthrough
+
+1. **`to_agg`** — every Transfer Order, one row per `po`, with its most recent creation date and
+   the full set of distinct statuses seen across its lines.
+2. **`picked`** — the set of transfer-order ids with at least one real ledger Transfer Out row.
+3. **`flagged`** — `LEFT JOIN … WHERE p.po IS NULL` (no ledger pick), **and** none of the order's
+   statuses fall in the "already advanced or dead" list, **and** it's old enough
+   (`order_date < run_date - Y days`) and recent enough to matter (`order_date >= run_date - 30
+   days`, so the rule stays on the current backlog rather than the full historical population).
+4. **`ranked` + final line** — count, cap at 500, oldest-first (the longest-waiting orders surface
+   first, same convention as PO-07).
+
+State-based, like PO-07/PO-08: this returns the **current** backlog each run, not just "new
+today" — dedup on the app side prevents re-tickets, and the recheck auto-closes once a pick
+appears or the status advances.
+
+### Tables & columns used
+
+**Tables:** PO Table (`int_ledger_purchase_orders`, `order_type='Transfer'`) **⋈** Inventory Ledger
+(`consolidated_inventory_ledger`, activity check only).
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `po` (PO table) | The transfer order id. | Grain of the check; join key against the ledger. |
+| `po_date_utc` (PO table) | When the order was created. | **The clock** — `order_date`, the aging baseline. |
+| `status` (PO table) | The order's lifecycle status. | **The safety filter** — excludes dead and already-advanced orders (see write-up above). |
+| `ref_order_type`, `l2_action`, `ref_order_id` (ledger) | Movement type and the order it references. | **The check** — `ref_order_type='Transfer Order'`, `l2_action='Transfer Out'`; absence = no pick. |
+
+### Example of a flagged record (from live data)
+
+Live BigQuery, run date 2026-08-16:
+
+| Field | Value |
+|---|---|
+| `transfer_order` | `PO-390835` |
+| `facility` | Arcadia |
+| `to_status` | `NOT_RECEIVED` |
+| `order_date` | 2026-07-17 |
+| `days_since_order` | 30 |
+
+**Why it's flagged:** created 30 days ago, still in an early (`NOT_RECEIVED`) status, and no
+Transfer Out ledger row has ever been recorded against it — well past the 2-day threshold.
+
+---
+
+## XFER-07 · Transfer Picked — Not Received
+
+> **In one sentence:** find real Transfer Orders that **were** picked but have had **zero
+> receiving activity** more than **Z days** (default 2, **Admin-editable**) after the first pick.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | XFER-07 |
+| **Rule type** | `AGING` |
+| **Severity** | **Medium** — 2-day SLA |
+| **Owner / routed team** | Field Ops |
+| **Default assignee** | Priya Nair |
+| **Jira** | Component **Transfers** |
+| **Source tables** | Inventory Ledger (pick + receipt activity) **⋈** PO Table (existence + status check) |
+| **Threshold** | **Z = 2 days**, editable in **Admin → Transfer order aging** (`PUT /api/xfer-aging`, `app_setting.xfer_not_received_days`). |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17. Current backlog: **0** — a clean safety net, same shape as PO-13 (kept live even at zero so it catches it the moment it happens). |
+
+### Why this one doesn't need the same status-based safety net as XFER-04
+
+XFER-04's ledger-only definition broke because a real fraction of transfer orders complete their
+whole lifecycle without ever touching the ledger. The receiving side doesn't have that problem:
+checked live, **0 of 76,035** picked, non-cancelled transfer orders in a 90-day window lack a
+matching `Transfer In` / `Received` ledger row. So XFER-07 stays ledger-only — pick date from the
+ledger, receipt check from the ledger — with just a `status NOT IN ('CANCELLED','CANCELED',
+'VOIDED')` filter (a cancelled-after-picking order is resolved, not stuck) and a requirement that
+the transfer order actually exists (so this doesn't double-ticket XFER-01's job).
+
+### The SQL
+
+#### Catalog SQL (the documented definition)
+
+```sql
+-- Catalog XFER-07: a real Transfer Order (exists in the population) that WAS picked (a
+-- Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z
+-- days after the first pick. Excludes cancelled/voided orders. Z defaults to 2, admin-editable.
+WITH picked AS (
+  SELECT
+    ref_order_id            AS po,
+    MIN(DATE(datetime_utc)) AS first_pick
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+  GROUP BY ref_order_id
+),
+
+received AS (   -- transfer orders with at least one Transfer In / Received ledger row
+  SELECT DISTINCT ref_order_id AS po
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action IN ('Transfer In', 'Received')
+    AND ref_order_id IS NOT NULL
+),
+
+to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + carries status
+  SELECT
+    po,
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+  GROUP BY po
+)
+
+SELECT pk.po
+FROM picked pk
+JOIN to_exists e USING (po)
+LEFT JOIN received r USING (po)
+WHERE r.po IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM UNNEST(e.statuses) s
+    WHERE UPPER(s) IN ('CANCELLED', 'CANCELED', 'VOIDED')
+  )
+  AND pk.first_pick < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+```
+
+#### Live finder SQL (what runs daily)
+
+```sql
+-- XFER-07: current backlog of picked Transfer Orders with no receipt.
+WITH picked AS (
+  SELECT
+    ref_order_id                AS po,
+    MIN(DATE(datetime_utc))     AS first_pick,
+    ANY_VALUE(facility_name)    AS facility,
+    ANY_VALUE(system_of_origin) AS system
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+  GROUP BY ref_order_id
+),
+
+received AS (   -- transfer orders with at least one Transfer In / Received ledger row
+  SELECT DISTINCT ref_order_id AS po
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE ref_order_type = 'Transfer Order'
+    AND l2_action IN ('Transfer In', 'Received')
+    AND ref_order_id IS NOT NULL
+),
+
+to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + carries status
+  SELECT
+    po,
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
+  WHERE order_type = 'Transfer'
+  GROUP BY po
+),
+
+flagged AS (
+  SELECT
+    pk.*,
+    DATE_ADD(pk.first_pick, INTERVAL @not_received_days DAY) AS breach_date,
+    DATE_DIFF(@run_date, pk.first_pick, DAY)                 AS days_since_pick
+  FROM picked pk
+  JOIN to_exists e USING (po)
+  LEFT JOIN received r USING (po)
+  WHERE r.po IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM UNNEST(e.statuses) s
+      WHERE UPPER(s) IN ('CANCELLED', 'CANCELED', 'VOIDED')
+    )
+    AND pk.first_pick < DATE_SUB(@run_date, INTERVAL @not_received_days DAY)
+    AND pk.first_pick >= DATE_SUB(@run_date, INTERVAL 30 DAY)
+),
+
+ranked AS (
+  SELECT
+    *,
+    COUNT(*)     OVER ()                        AS total_matches,
+    ROW_NUMBER() OVER (ORDER BY first_pick ASC)  AS rn
+  FROM flagged
+)
+
+SELECT * EXCEPT (rn)
+FROM ranked
+WHERE rn <= 500
+ORDER BY first_pick ASC
+```
+
+### Plain-English walkthrough
+
+1. **`picked`** — every transfer order with a real ledger Transfer Out row, and the date of its
+   first one.
+2. **`received`** — the set of transfer-order ids with at least one `Transfer In` / `Received`
+   ledger row.
+3. **`to_exists`** — requires the order to be real (skips XFER-01's territory) and carries status
+   for the cancelled-order exclusion.
+4. **`flagged`** — picked, not received, not cancelled, and old enough
+   (`first_pick < run_date - Z days`) / recent enough (`>= run_date - 30 days`) to matter.
+5. **`ranked` + final line** — count, cap at 500, oldest-first.
+
+State-based like XFER-04/PO-07/PO-08 — current backlog each run; recheck auto-closes once a
+receiving-leg ledger row appears.
+
+### Tables & columns used
+
+**Tables:** Inventory Ledger (`consolidated_inventory_ledger`) **⋈** PO Table
+(`int_ledger_purchase_orders`, `order_type='Transfer'`, existence + status only).
+
+| Column (table) | Plain meaning | Role in this rule |
+|---|---|---|
+| `ref_order_type`, `l2_action='Transfer Out'` (ledger) | The pick leg. | **The clock start** — `first_pick`. |
+| `ref_order_id` (ledger) | The transfer order. | Join key against `to_exists` and `received`. |
+| `l2_action IN ('Transfer In','Received')` (ledger) | The receiving leg. | **The check** — absence = not received. |
+| `status` (PO table) | The order's lifecycle status. | **Exclusion filter** — drops cancelled/voided. |
+
+### Example
+
+Currently 0 in the live backlog — see the "why this doesn't need a safety net" note above for the
+0/76,035 validation. When it does fire, the shape is identical to XFER-04's (transfer order,
+facility, days since the triggering event, breach date).
+
+---
+
+## TWH-01 · Transfer Warehouse In/Out Balance
+
+> **DRAFTED — NOT LIVE.** This rule is documented and query-tested against live BigQuery data, but
+> deliberately **not enabled** and **not wired into the daily finder**. It's here for a data
+> engineer to confirm the flow assumptions below before it goes anywhere near real tickets.
+
+> **In one sentence:** find an item that shows up on **one** of the two Digital Transfer
+> Warehouse legs (arrived / left) but is **completely missing** from the other — the pattern in
+> the "starting warehouse → 2 digital movements → final warehouse" reference example, but looking
+> **only** at the two middle (digital) legs, not the starting or ending warehouse.
+
+### At a glance
+
+| | |
+|---|---|
+| **Rule number** | TWH-01 (framework catalog — this is a separate family from XFER-0N, not one of the transfer-order rules built so far) |
+| **Rule type** | `RECON_TRANSFER` (a two-leg reconciliation, not a referential or aging check) |
+| **Severity** | High (proposed — not yet confirmed) |
+| **Owner / routed team** | Field Ops / Priya Nair (proposed, matches the other Transfers-component routing) |
+| **Source table** | Inventory Ledger only (`consolidated_inventory_ledger`) — no PO/TO table join |
+| **Status** | 🔵 **Drafted, not live.** `Rule.enabled = False` in both `reference.py` and the DB; not present in `bq_finder._FINDERS`. Cannot fire even if something else flips the DB flag, because there is no finder function wired to it. |
+| **Current (draft) numbers** | 30-day window, existence mismatch only, aged 3+ days: **5,404** "arrived, never left" (~180/day), **6,313** "left, never arrived" (~210/day). See the two correction write-ups below for how much these numbers moved during investigation — read those before trusting any number here. |
+
+### What this is comparing (and why it's narrower than it sounds)
+
+The reference example (a real 4-row ledger excerpt a data engineer shared) shows one transfer as
+four ledger rows: **origin** facility Transfer Out → **DTW** Transfer In → **DTW** Transfer Out →
+**destination** facility Transfer In. This rule compares **only the middle two** — DTW's own
+Transfer In vs. its own Transfer Out, for the same `(ref_order_id, item)` — and ignores what the
+origin shipped and what the destination received. That's a deliberate scope decision: the other
+two legs are a different, already-covered question (XFER-02 covers what was picked at the origin
+not being on the TO; XFER-05 covers what was received at the destination not being on the TO).
+This rule is specifically about whether the **warehouse's own bookkeeping** balances.
+
+### Correction #1 — most "digital transfer warehouse" activity isn't part of this pattern at all
+
+A naive version of this query (compare DTW In vs DTW Out for every item, no other filter) found
+**3,616,977** "left DTW, never arrived" cases all-time — which turned out to be almost entirely
+false alarms. Checked live: those items have **no non-DTW origin leg at all** for the same
+`(ref_order_id, item)` — DTW isn't a staging waypoint for them, it's acting as its **own
+originating warehouse** for a completely different flow (retail/Pantry-bound digital fulfillment).
+**Fix:** require a real, non-DTW `Transfer Out` to exist for the same order + item before this
+rule even looks at it — i.e. confirm "there's a starting warehouse" first. That dropped the
+false-alarm population from 3.6M to **35,230** all-time (and further, once Correction #2 below is
+applied, to a number consistent with the table above).
+
+### Correction #2 — the same `ims_sku` suffix bug from XFER-05, recurring inside DTW itself
+
+Even after Correction #1, the "arrived at DTW, never left" bucket was still enormous — **64,863**
+in a 30-day/3-day-aged window, and it barely shrank with longer aging (still 20,413 at 21 days),
+which doesn't behave like a real backlog. Investigated a sample of 200: **~85%** had a matching
+`Transfer Out` at DTW under a **suffixed variant of the same `ims_sku`** (e.g. `Transfer In` posts
+as `4200785-25`, `Transfer Out` posts as the bare `4200785`, or vice versa) — the identical
+"-N case-multiplier suffix" issue already documented on XFER-05, just occurring on DTW's own two
+legs instead of DTW-vs-TO-table. **Fix:** normalize both legs to a base sku
+(`REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '')`) before comparing. This is a safe within-order strip
+here (unlike XFER-02's TO-table case) — checked and confirmed each `(ref_order_id, base_sku)` has
+at most a small number of distinct suffixed variants, not the kind of fan-out that broke XFER-02's
+attempt at the same fix — but this is exactly the kind of assumption a data engineer should
+double-check before this goes live. Applying it dropped "arrived, never left" from 64,863 to
+**5,404** in the same window — an 92% reduction, and a number that finally looks like a real,
+believable backlog rather than a data-matching artifact.
+
+### Open questions for the data engineer (this is why it's not live)
+
+1. Is the suffix-normalization assumption in Correction #2 actually correct and exhaustive — are
+   there other id-format quirks between DTW's two legs we haven't hit yet?
+2. Is "requires a real non-DTW origin `Transfer Out` leg" (Correction #1) the right way to isolate
+   genuine 4-leg staged transfers from the digital-fulfillment population, or is there a cleaner
+   signal (a flag, a different `ref_order_type`, something else)?
+3. Is a 3-day aging window the right cutoff before flagging "stuck" / "left without arriving"? (Not
+   deeply calibrated yet — chosen because normal DTW transit time for *balanced* pairs is 0-2 days
+   in the vast majority of cases.)
+4. **Phase 2, not designed yet:** what to do about the **79,944** pairs (same 30-day window) where
+   *both* legs are present but the quantities don't match — a magnitude/percentage question,
+   deliberately deferred until Phase 1 (existence-only) is confirmed correct.
+
+### The SQL (documented in `reference.py`, not wired to a live finder)
+
+```sql
+-- Catalog rule (framework TWH-01) — DRAFTED, NOT LIVE, pending data-engineer confirmation.
+-- Compares ONLY the two ledger legs recorded AT the Digital Transfer Warehouse itself
+-- (Transfer In = arrived; Transfer Out = left) for the same (ref_order_id, item) — deliberately
+-- ignoring the origin and destination facilities' own legs. Requires a real non-DTW origin
+-- 'Transfer Out' leg to exist first (excludes the ~3.6M pure digital-fulfillment DTW-as-source
+-- population that never has a matching origin leg and isn't part of this pattern at all).
+-- ims_sku is compared suffix-normalized (strip a trailing '-N') — the exact-vs-suffixed id
+-- mismatch already found on XFER-05 recurs here between the DTW In and Out legs themselves.
+-- Phase 1 (this query): existence-only — flags an item present on one DTW leg but completely
+-- absent from the other. Phase 2 (not designed yet): both legs present but quantities differ
+-- by more than X% — deferred pending Phase 1 sign-off.
+WITH dtw AS (
+  SELECT
+    ref_order_id,
+    REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '')                            AS base_sku,
+    SUM(IF(l2_action = 'Transfer In', consumable_quantity_change, 0))   AS dtw_in,
+    SUM(IF(l2_action = 'Transfer Out', -consumable_quantity_change, 0)) AS dtw_out,
+    MAX(DATE(datetime_utc))                                             AS last_activity
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE system_of_origin = 'digital_transfer_warehouse'
+    AND ref_order_type = 'Transfer Order'
+    AND l2_action IN ('Transfer In', 'Transfer Out')
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+  GROUP BY ref_order_id, base_sku
+),
+
+origin AS (   -- confirms a real non-DTW starting-warehouse leg exists for this order + item
+  SELECT DISTINCT
+    ref_order_id,
+    REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '') AS base_sku
+  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`
+  WHERE system_of_origin != 'digital_transfer_warehouse'
+    AND ref_order_type = 'Transfer Order'
+    AND l2_action = 'Transfer Out'
+    AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL
+)
+
+SELECT
+  dtw.ref_order_id,
+  dtw.base_sku,
+  dtw.dtw_in,
+  dtw.dtw_out,
+  IF(dtw.dtw_in > 0, 'STUCK_AT_WAREHOUSE', 'LEFT_WITHOUT_ARRIVING') AS failure_mode
+FROM dtw
+JOIN origin USING (ref_order_id, base_sku)
+WHERE (dtw.dtw_in > 0) != (dtw.dtw_out > 0)   -- exactly one side present
+  AND dtw.last_activity < DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
+```
+
+### Tables & columns used
+
+**Table:** Inventory Ledger (`consolidated_inventory_ledger`) only — no PO/TO table join.
+
+| Column | Plain meaning | Role in this rule |
+|---|---|---|
+| `system_of_origin` | Which system produced the row. | **Scope filter** — `'digital_transfer_warehouse'` for the two legs being compared; `!=` that for confirming a real origin leg exists. |
+| `ref_order_type`, `ref_order_id` | Transfer-order tag and id. | Filter + join key. |
+| `l2_action` | `'Transfer In'` (arrived) vs `'Transfer Out'` (left). | **The two legs being compared.** |
+| `ims_sku` | Raw item id — sometimes suffixed with `-N`. | **Join key, suffix-normalized** — see Correction #2. |
+| `consumable_quantity_change` | Signed quantity. | Summed per leg to get `dtw_in` / `dtw_out`. |
+| `datetime_utc` | When the movement happened. | **Aging** — `last_activity` vs. the 3-day floor. |
+
+### Example (drafted, from live data)
+
+**Arrived at DTW, never left** — `PO-410376`, Veggie Burger Patty FZN (5 ea): 5 units arrived at
+DTW from DISH on 2026-07-28, no matching `Transfer Out` since. `PO-429986`, Lime Juice (32 fl oz):
+907 units arrived from DISH on 2026-08-10, still sitting.
+
+**Left DTW, never arrived** — `PO-416356`, Diet Dr. Pepper (12 can): 36 units left DTW on
+2026-08-03 (originated at Shawnee) with no matching `Transfer In` ever recorded. `PO-422761`,
+Jarritos Lime Soda (24 ea): same pattern, originated at Shawnee, left DTW 2026-08-06.
+
+---
+
 <!-- ───────────────────────────────────────────────────────────────────────────
      REMAINING RULES — to be authored. Each follows the identical six-part structure.
      ─────────────────────────────────────────────────────────────────────────── -->
@@ -2150,7 +3282,10 @@ Where each rule stands, and whether it's been written up in this guide yet.
 
 **Status legend:** 🟢 **Live** = enabled *and* its detection query is wired in, so it runs daily and
 creates tickets · 🟡 **Catalog-only** = enabled but no detection query is wired yet, so it silently
-finds nothing · ⚪ **Paused** = query exists but the rule is toggled off.
+finds nothing · ⚪ **Paused** = query exists but the rule is toggled off · 🔵 **Drafted, not live** =
+query written and validated against live data, documented here in full, but deliberately not
+enabled and not wired into any finder — waiting on a specific person's confirmation before going
+further.
 
 | Rule | Error type | Status | Documented here |
 |---|---|---|---|
@@ -2163,15 +3298,19 @@ finds nothing · ⚪ **Paused** = query exists but the rule is toggled off.
 | PO-11 | Correction Missing Ref ID | 🟢 Live | ✅ |
 | PO-13 | PO Table Missing PO Number | 🟢 Live | ✅ |
 | PO-14 | SKU Not on PO | 🟢 Live | ✅ |
-| TWH-01 | Transfer Warehouse Imbalance (WIP) | 🟡 Catalog-only (needs transfer-order pairing) | — (catalog) |
-| XFER-01 | Transfer Order Missing (WIP) | ⚪ Paused (transfer work on hold) | — |
+| TWH-01 | Transfer Warehouse In/Out Balance | 🔵 Drafted, not live — pending data-engineer confirmation | ✅ |
+| XFER-01 | Transfer Order Missing | 🟢 Live | ✅ |
+| XFER-02 | SKU Not on Transfer Order | 🟢 Live | ✅ |
+| XFER-04 | Transfer Order No Pick Activity | 🟢 Live | ✅ |
+| XFER-05 | Received SKU Not on Transfer Order | 🟢 Live | ✅ |
+| XFER-07 | Transfer Picked — Not Received | 🟢 Live | ✅ |
 | COMPLETE-02 | Negative On-Hand | 🟡 Catalog-only (needs cumulative cross-day balance) | — (catalog) |
 | WASTE-DAILY | Daily Waste (Facility) | 🟢 Live | ◻ to do |
 | ADJ-DAILY | Daily Adjustments (Facility) | 🟢 Live | ◻ to do |
 | COST-01 | Waste SKU Without Cost | 🟢 Live | ✅ |
 | COST-02 | Consumable Missing Cost | 🟢 Live | ✅ |
 
-The PO family and both cost rules are fully documented above. Still **to do** (live, not yet written
-up): the two daily facility-dollar rules — **WASTE-DAILY** and **ADJ-DAILY**. The **catalog-only**
-rules (PO-02, TWH-01, COMPLETE-02) and the **paused** XFER-01 will be written up when their detectors
-are wired / work resumes.
+The PO family, **XFER-01**, **XFER-02**, **XFER-04**, **XFER-05**, **XFER-07**, **TWH-01**
+(drafted, not live), and both cost rules are fully documented above. Still **to do** (live,
+not yet written up): the two daily facility-dollar rules — **WASTE-DAILY** and **ADJ-DAILY**. The
+**catalog-only** rules (PO-02, COMPLETE-02) will be written up when their detectors are wired.

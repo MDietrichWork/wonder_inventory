@@ -6,7 +6,11 @@ is capped via maximum_bytes_billed so a misfire can never run up a large bill.
 
 Currently implemented: PO-03 over-receipt and PO-01 null-PO-on-receipt both fire on real
 data (PO-01 catches Fishbowl/CK1 blank-PO receipts). PO-02 is kept in the catalog but finds
-nothing on current data; transfer/on-hand rules need cross-partition cumulative logic (later).
+nothing on current data. XFER-01 (transfer order missing) also fires on real data, scoped to
+exclude the synthetic Digital Transfer Warehouse facility (see _build_transfer_order_missing_sql).
+XFER-02 (SKU not on the transfer order) is joined on ims_sku, not consumable_sku — see
+_build_sku_not_on_to_sql for why that matters. XFER-05 (received SKU not on the transfer order)
+needs a different join still (exact-or-suffixed ims_sku) — see _build_received_sku_not_on_to_sql.
 """
 from typing import List, Tuple
 
@@ -19,6 +23,7 @@ RESULT_CAP = 500          # per-band ticket cap for a daily run (touched-set is 
 BACKFILL_CAP = 500         # per-band cap for the go-live backfill — high enough to capture the full 7-day backlog
 RECEIPT_LOOKBACK_DAYS = 30   # daily: how far back to sum cumulative received for a touched PO
 BACKFILL_LOOKBACK_DAYS = 7   # go-live baseline: sweep the last 7 days for the existing backlog
+XFER_AGING_LOOKBACK_DAYS = 30  # XFER-04/07: only consider TOs created/picked within this window
 
 # Over-receipt — refined per Jonny Li (data analyst, final SQL sign-off): a TWO-WAY match keyed on
 # ims_sku (the raw system id sent to BOTH tables), not the translated consumable_sku.
@@ -930,7 +935,16 @@ def recheck_sku_on_po(ds, pairs):
 
 def _build_transfer_order_missing_sql(backfill: bool, lookback: int, cap: int) -> str:
     """XFER-01: a Transfer Out pick references a Transfer Order id not in the transfer-order
-    population (orders table, order_type='Transfer'). One row per orphan transfer order."""
+    population (orders table, order_type='Transfer'). One row per orphan transfer order.
+
+    Excludes the synthetic "Digital Transfer Warehouse" facility (system_of_origin=
+    'digital_transfer_warehouse', facility_type='In-Transit'): its Transfer Out rows use
+    freetext ad hoc labels (e.g. "Instacart", "Sesame general", "BRFC - <date>") for
+    digital-channel/recount movements that never get a master transfer-order record, so
+    every one of them would otherwise false-positive as an orphan (verified live: ~80% of
+    daily hits before this exclusion, 0 genuine defects). Confirmed live 2026-08-13 — see
+    PROCESS.md.
+    """
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
     date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
@@ -944,7 +958,8 @@ def _build_transfer_order_missing_sql(backfill: bool, lookback: int, cap: int) -
          DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen,
          ANY_VALUE(l1_action) AS move_l1, ANY_VALUE(l2_action) AS move_l2
   FROM `{proj}.{dset}.{led}`
-  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL {date_filter}
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL
+    AND system_of_origin != 'digital_transfer_warehouse' {date_filter}
   GROUP BY to_id),
 to_pop AS (SELECT DISTINCT po AS to_id FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer'),
 flagged AS (SELECT p.* FROM picks p LEFT JOIN to_pop t USING (to_id) WHERE t.to_id IS NULL),
@@ -991,6 +1006,374 @@ def recheck_to_exists(ds, to_ids):
     cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
                             query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
     return {r.id for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def _build_sku_not_on_to_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """XFER-02: an item picked (Transfer Out) against a Transfer Order that EXISTS, but the TO
+    orders none of that item — either it isn't on the TO's lines at all, or it's on a line ordered
+    for 0. Excludes Digital Transfer Warehouse (see _build_transfer_order_missing_sql) and TOs that
+    don't exist at all (that's XFER-01's job, not this one's).
+
+    Joined on ims_sku, NOT consumable_sku: verified live that consumable_sku is a per-system
+    translation that doesn't line up 1:1 between the ledger and the PO/TO table for the same item —
+    keying on it produced a ~72% false-positive rate (14,679/20,228 picks on one sample day).
+    ims_sku is the raw id shared by both tables and matches cleanly (0 false positives on the same
+    day). This is the same lesson as PO-03's ims_sku re-key — see docs/rule-sql-guide.md."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH picks AS (
+  SELECT ref_order_id AS to_id, ims_sku,
+         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system,
+         SUM(consumable_quantity_change) AS net_qty,
+         DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen,
+         ANY_VALUE(l1_action) AS move_l1, ANY_VALUE(l2_action) AS move_l2
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL AND system_of_origin != 'digital_transfer_warehouse' {date_filter}
+  GROUP BY to_id, ims_sku),
+to_lines AS (SELECT po, ims_sku, SUM(consumable_sku_qty) AS ordered_qty
+             FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer' AND ims_sku IS NOT NULL
+             GROUP BY po, ims_sku),
+to_exists AS (SELECT DISTINCT po FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer'),
+flagged AS (
+  SELECT p.*, (l.ims_sku IS NOT NULL) AS on_to, l.ordered_qty
+  FROM picks p JOIN to_exists e ON p.to_id = e.po
+  LEFT JOIN to_lines l ON p.to_id = l.po AND p.ims_sku = l.ims_sku
+  WHERE COALESCE(l.ordered_qty, 0) <= 0),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_seen DESC"""
+
+
+def _sku_not_on_to(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """SKU_NOT_ON_TO (High, Field Ops) — picked against a real Transfer Order that orders none of
+    this item: not on the TO's lines, or on a line ordered for 0."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_sku_not_on_to_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        ek = f"{r.to_id}:{r.ims_sku}"
+        snap = {
+            "transfer_order": r.to_id, "ims_sku": r.ims_sku, "consumable_sku": r.consumable_sku,
+            "item_name": r.item_name, "on_transfer_order": bool(r.on_to),
+            "net_qty_change": r.net_qty, "facility": r.facility or "—", "system": r.system or "—",
+            "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if r.move_l1 else None,
+            "first_receipt": _d(r.first_seen), "last_receipt": _d(r.last_seen),
+            "breached_at": _d(r.first_seen),
+        }
+        if r.on_to:
+            snap["ordered_qty"] = r.ordered_qty if r.ordered_qty is not None else 0
+        findings.append(Finding("XFER-02", "SKU_NOT_ON_TO", "High", src, ek, snap))
+    return findings, total
+
+
+def recheck_sku_on_to(ds, pairs):
+    """Which (transfer_order, ims_sku) tickets are NOW genuinely ordered on the TO (ordered qty
+    > 0) — those can be auto-closed. Requires a POSITIVE ordered qty; a zero-order line is the very
+    thing this rule flags, so its mere presence must not close the ticket."""
+    if not pairs:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    keys = ["%s~~%s" % (t, s) for (t, s) in pairs if t is not None and s is not None]
+    if not keys:
+        return set()
+    sql = f"""SELECT CONCAT(po, '~~', ims_sku) AS key
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Transfer' AND CONCAT(po, '~~', ims_sku) IN UNNEST(@keys)
+    GROUP BY po, ims_sku
+    HAVING SUM(consumable_sku_qty) > 0"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("keys", "STRING", keys)])
+    return {r.key for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def _build_received_sku_not_on_to_sql(backfill: bool, lookback: int, cap: int) -> str:
+    """XFER-05: an item RECEIVED (Transfer In, or Received-at-Pantry/HDR) against a Transfer Order
+    that EXISTS, but the TO orders none of that item. The receiving-side sibling of XFER-02.
+
+    Join predicate is `l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku, '-%')`, NOT a plain
+    ims_sku match and NOT a stripped-suffix match. Verified live: a meaningful slice of TO lines
+    (827k/22.48M, concentrated in Pantry/HDR frozen "F" items) carry a "-N" case-multiplier suffix
+    on ims_sku (e.g. line ims_sku "4200584F-2" for a bare ledger ims_sku "4200584F") that the
+    receiving leg reports without. Without this, EVERY HDR selling unit false-positived at a
+    15-70% rate on live data. But blindly stripping the suffix on the TO side (GROUP BY the base
+    sku) also broke the picking side (XFER-02): it merges genuinely distinct suffixed lines into
+    one bucket and introduced 67,755 new false orphans on a 30-day picking-side test. The
+    exact-OR-prefix join fixes receiving (0 false positives, same as stripping) without merging
+    anything, and is a no-op on the picking side (still 0/512,802 on the same 30-day window) —
+    so it's the correct predicate for this direction; XFER-02 doesn't need it and wasn't changed."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    date_filter = ("AND DATE(datetime_utc) = @run_date" if not backfill else
+                   f"AND DATE(datetime_utc) <= @run_date "
+                   f"AND datetime_utc >= TIMESTAMP_SUB(TIMESTAMP(@run_date), INTERVAL {lookback} DAY)")
+    return f"""WITH picks AS (
+  SELECT ref_order_id AS to_id, ims_sku,
+         ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system,
+         SUM(consumable_quantity_change) AS net_qty,
+         DATE(MIN(datetime_utc)) AS first_seen, DATE(MAX(datetime_utc)) AS last_seen,
+         ANY_VALUE(l1_action) AS move_l1, ANY_VALUE(l2_action) AS move_l2
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL
+    AND ims_sku IS NOT NULL AND system_of_origin != 'digital_transfer_warehouse' {date_filter}
+  GROUP BY to_id, ims_sku),
+to_exists AS (SELECT DISTINCT po FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer'),
+joined AS (
+  SELECT p.to_id, p.ims_sku, p.consumable_sku, p.item_name, p.facility, p.system, p.net_qty,
+         p.first_seen, p.last_seen, p.move_l1, p.move_l2, l.consumable_sku_qty
+  FROM picks p JOIN to_exists e ON p.to_id = e.po
+  LEFT JOIN `{proj}.{dset}.{po}` l ON l.po = p.to_id AND l.order_type='Transfer'
+    AND (l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku, '-%'))),
+agg AS (
+  SELECT to_id, ims_sku, ANY_VALUE(consumable_sku) AS consumable_sku, ANY_VALUE(item_name) AS item_name,
+         ANY_VALUE(facility) AS facility, ANY_VALUE(system) AS system, ANY_VALUE(net_qty) AS net_qty,
+         ANY_VALUE(first_seen) AS first_seen, ANY_VALUE(last_seen) AS last_seen,
+         ANY_VALUE(move_l1) AS move_l1, ANY_VALUE(move_l2) AS move_l2,
+         SUM(consumable_sku_qty) AS ordered_qty, LOGICAL_OR(consumable_sku_qty IS NOT NULL) AS on_to
+  FROM joined GROUP BY to_id, ims_sku),
+flagged AS (SELECT * FROM agg WHERE COALESCE(ordered_qty, 0) <= 0),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY last_seen DESC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY last_seen DESC"""
+
+
+def _received_sku_not_on_to(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """RECEIVED_SKU_NOT_ON_TO (High, SC Product (IMS)) — received (Transfer In / Received) against
+    a real Transfer Order that orders none of this item: not on the TO's lines, or on a line
+    ordered for 0."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    lookback = BACKFILL_LOOKBACK_DAYS if backfill else RECEIPT_LOOKBACK_DAYS
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    sql = _build_received_sku_not_on_to_sql(backfill, lookback, cap)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        ek = f"{r.to_id}:{r.ims_sku}"
+        snap = {
+            "transfer_order": r.to_id, "ims_sku": r.ims_sku, "consumable_sku": r.consumable_sku,
+            "item_name": r.item_name, "on_transfer_order": bool(r.on_to),
+            "net_qty_change": r.net_qty, "facility": r.facility or "—", "system": r.system or "—",
+            "movement": ("%s / %s" % (r.move_l1, r.move_l2)) if r.move_l1 else None,
+            "first_receipt": _d(r.first_seen), "last_receipt": _d(r.last_seen),
+            "breached_at": _d(r.first_seen),
+        }
+        if r.on_to:
+            snap["ordered_qty"] = r.ordered_qty if r.ordered_qty is not None else 0
+        findings.append(Finding("XFER-05", "RECEIVED_SKU_NOT_ON_TO", "High", src, ek, snap))
+    return findings, total
+
+
+def recheck_received_sku_on_to(ds, pairs):
+    """Which (transfer_order, ims_sku) receiving tickets are NOW genuinely ordered on the TO
+    (ordered qty > 0, exact-or-suffixed ims_sku match) — those can be auto-closed."""
+    if not pairs:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    po = settings.bq_po_table
+    pairs = [(t, s) for (t, s) in pairs if t is not None and s is not None]
+    if not pairs:
+        return set()
+    to_ids = list({t for t, _ in pairs})
+    sql = f"""SELECT po, ims_sku, SUM(consumable_sku_qty) AS ordered_qty
+    FROM `{proj}.{dset}.{po}`
+    WHERE order_type = 'Transfer' AND po IN UNNEST(@to_ids)
+    GROUP BY po, ims_sku
+    HAVING SUM(consumable_sku_qty) > 0"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("to_ids", "STRING", to_ids)])
+    lines = list(ds.client.query(sql, job_config=cfg).result())
+    resolved = set()
+    for (to_id, ims_sku) in pairs:
+        for r in lines:
+            if r.po == to_id and (r.ims_sku == ims_sku or r.ims_sku.startswith(ims_sku + "-")):
+                resolved.add("%s~~%s" % (to_id, ims_sku))
+                break
+    return resolved
+
+
+# Statuses that mean a Transfer Order has already moved past "waiting to be picked" — treated as
+# already-picked even with zero matching ledger rows (see _build_no_pick_activity_sql docstring for
+# why ledger presence alone false-positives ~94% of the time). Terminal/dead statuses are excluded
+# from consideration entirely (not "no pick activity", just not a candidate either way).
+_TO_ALREADY_PICKED_STATUSES = ("SHIPPED", "PARTIALLY_SHIPPED", "RECEIVED", "PARTIALLY_RECEIVED",
+                               "CLOSED", "PICKED", "PACKED", "PACKING", "PLACED")
+_TO_DEAD_STATUSES = ("CANCELLED", "CANCELED", "VOIDED", "VENDOR_REJECTED")
+_TO_EXCLUDED_STATUSES = _TO_ALREADY_PICKED_STATUSES + _TO_DEAD_STATUSES
+
+
+def _build_no_pick_activity_sql(cap: int, no_pick_days: int, lookback_days: int = 30) -> str:
+    """XFER-04: a Transfer Order still in an early lifecycle status with ZERO Transfer Out ledger
+    activity more than `no_pick_days` after it was created.
+
+    Ledger presence alone is NOT reliable: verified live that ~94% of TOs with zero matching
+    Transfer-Out rows are already status=CLOSED or RECEIVED — a real gap in what syncs into
+    consolidated_inventory_ledger for a meaningful slice of transfers (one example, PO-431527,
+    status CLOSED, has ZERO rows in the ledger under any action, ever — not a join-key formatting
+    issue like the ims_sku cases, a genuine feed-coverage gap). So a TO counts as already-picked if
+    EITHER a ledger Transfer Out row exists OR its own status has advanced past picking
+    (_TO_ALREADY_PICKED_STATUSES); dead orders (_TO_DEAD_STATUSES) are excluded entirely. With that
+    filter, live volume is a believable ~10/day (current backlog: 150 over a 30-day window)."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    excluded = ",".join("'%s'" % s for s in _TO_EXCLUDED_STATUSES)
+    window = (f"\n    AND t.order_date >= DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)"
+              if lookback_days and lookback_days > 0 else "")
+    return f"""WITH to_agg AS (
+  SELECT po, MAX(DATE(po_date_utc)) AS order_date,
+         ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+         ANY_VALUE(destination_name) AS facility, ANY_VALUE(destination_id) AS facility_id,
+         ANY_VALUE(po_source_system) AS system
+  FROM `{proj}.{dset}.{po}`
+  WHERE order_type='Transfer' AND po IS NOT NULL AND TRIM(po) <> ''
+  GROUP BY po),
+picked AS (SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL),
+flagged AS (
+  SELECT t.*, DATE_ADD(t.order_date, INTERVAL {no_pick_days} DAY) AS breach_date,
+         DATE_DIFF(@run_date, t.order_date, DAY) AS days_since_order
+  FROM to_agg t LEFT JOIN picked p USING(po)
+  WHERE p.po IS NULL
+    AND NOT EXISTS (SELECT 1 FROM UNNEST(t.statuses) s WHERE UPPER(s) IN ({excluded}))
+    AND t.order_date IS NOT NULL
+    AND t.order_date < DATE_SUB(@run_date, INTERVAL {no_pick_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY order_date ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY order_date ASC"""
+
+
+def _no_pick_activity(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """TRANSFER_NO_PICK_ACTIVITY (Medium, Field Ops) — framework XFER-04. Current backlog of
+    still-early-status Transfer Orders with no pick activity `no_pick_days` after creation."""
+    bq = ds._bq
+    src = settings.bq_po_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    days = reference.xfer_no_pick_days()
+    sql = _build_no_pick_activity_sql(cap, days, XFER_AGING_LOOKBACK_DAYS)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "transfer_order": r.po, "facility": r.facility or "—", "system": r.system,
+            "to_status": ", ".join(r.statuses) if r.statuses else None,
+            "order_date": r.order_date.isoformat() if r.order_date else None,
+            "days_since_order": r.days_since_order, "no_pick_days_threshold": days,
+            "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
+        }
+        if r.facility_id:
+            snap["facility_id"] = r.facility_id
+        findings.append(Finding("XFER-04", "TRANSFER_NO_PICK_ACTIVITY", "Medium", src, r.po, snap))
+    return findings, total
+
+
+def recheck_no_pick_activity(ds, to_ids):
+    """Which transfer orders NOW have pick activity (a ledger Transfer Out row) or a status that's
+    advanced past picking — those can be auto-closed."""
+    if not to_ids:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    ids = [str(i) for i in to_ids if i is not None]
+    if not ids:
+        return set()
+    excluded = ",".join("'%s'" % s for s in _TO_ALREADY_PICKED_STATUSES)
+    sql = f"""WITH picked AS (SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IN UNNEST(@ids)),
+advanced AS (SELECT DISTINCT po FROM `{proj}.{dset}.{po}`
+  WHERE order_type='Transfer' AND po IN UNNEST(@ids) AND UPPER(status) IN ({excluded}))
+SELECT po FROM picked UNION DISTINCT SELECT po FROM advanced"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
+    return {r.po for r in ds.client.query(sql, job_config=cfg).result()}
+
+
+def _build_picked_not_received_sql(cap: int, not_received_days: int, lookback_days: int = 30) -> str:
+    """XFER-07: a real Transfer Order (exists in the population) that WAS picked (a Transfer Out
+    ledger row exists) but has no Transfer In / Received ledger row more than `not_received_days`
+    after the first pick. Excludes cancelled/voided orders. Unlike XFER-04, ledger-only is reliable
+    here: verified live that 0 of 76,035 picked, non-cancelled transfer orders in a 90-day window
+    lack a matching receiving-leg row."""
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led, po = settings.bq_ledger_table, settings.bq_po_table
+    window = (f"\n    AND pk.first_pick >= DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)"
+              if lookback_days and lookback_days > 0 else "")
+    return f"""WITH picked AS (
+  SELECT ref_order_id AS po, MIN(DATE(datetime_utc)) AS first_pick,
+         ANY_VALUE(facility_name) AS facility, ANY_VALUE(system_of_origin) AS system
+  FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL
+  GROUP BY ref_order_id),
+received AS (SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
+  WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL),
+to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+  FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer' GROUP BY po),
+flagged AS (
+  SELECT pk.*, DATE_ADD(pk.first_pick, INTERVAL {not_received_days} DAY) AS breach_date,
+         DATE_DIFF(@run_date, pk.first_pick, DAY) AS days_since_pick
+  FROM picked pk JOIN to_exists e USING(po) LEFT JOIN received r USING(po)
+  WHERE r.po IS NULL
+    AND NOT EXISTS (SELECT 1 FROM UNNEST(e.statuses) s WHERE UPPER(s) IN ('CANCELLED','CANCELED','VOIDED'))
+    AND pk.first_pick < DATE_SUB(@run_date, INTERVAL {not_received_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY first_pick ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY first_pick ASC"""
+
+
+def _picked_not_received(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
+    """TRANSFER_PICKED_NOT_RECEIVED (Medium, Field Ops) — framework XFER-07. Current backlog of
+    picked Transfer Orders with no receipt `not_received_days` after the first pick."""
+    bq = ds._bq
+    src = settings.bq_ledger_table
+    cap = BACKFILL_CAP if backfill else RESULT_CAP
+    days = reference.xfer_not_received_days()
+    sql = _build_picked_not_received_sql(cap, days, XFER_AGING_LOOKBACK_DAYS)
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("run_date", "DATE", run_date)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    findings, total = [], (rows[0].total_matches if rows else 0)
+    for r in rows:
+        snap = {
+            "transfer_order": r.po, "facility": r.facility or "—", "system": r.system or "—",
+            "first_pick": r.first_pick.isoformat() if r.first_pick else None,
+            "days_since_pick": r.days_since_pick, "not_received_days_threshold": days,
+            "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
+        }
+        findings.append(Finding("XFER-07", "TRANSFER_PICKED_NOT_RECEIVED", "Medium", src, r.po, snap))
+    return findings, total
+
+
+def recheck_picked_not_received(ds, to_ids):
+    """Which picked transfer orders NOW have a Transfer In / Received ledger row — those can be
+    auto-closed."""
+    if not to_ids:
+        return set()
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    ids = [str(i) for i in to_ids if i is not None]
+    if not ids:
+        return set()
+    sql = f"""SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
+    WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received')
+      AND ref_order_id IN UNNEST(@ids)"""
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ArrayQueryParameter("ids", "STRING", ids)])
+    return {r.po for r in ds.client.query(sql, job_config=cfg).result()}
 
 
 # Daily ADJUSTMENT churn (ADJ_DAILY_FACILITY) + the waste-SKU-without-cost rule still scope to all
@@ -1491,6 +1874,22 @@ def doc_sql(rule_id):
     if rule_id == "XFER-01":
         return _standalone("-- A Transfer Out pick against a Transfer Order id absent from the transfer population.\n",
                            _build_transfer_order_missing_sql(False, lb, cap))
+    if rule_id == "XFER-02":
+        return _standalone("-- A Transfer Out pick against a real Transfer Order that orders none of this item\n"
+                           "-- (not on the TO's lines, OR on a line ordered for 0). Joined on ims_sku.\n",
+                           _build_sku_not_on_to_sql(False, lb, cap))
+    if rule_id == "XFER-05":
+        return _standalone("-- An item received (Transfer In / Received) against a real Transfer Order that\n"
+                           "-- orders none of this item. Joined on ims_sku, exact-or-suffixed (see docstring).\n",
+                           _build_received_sku_not_on_to_sql(False, lb, cap))
+    if rule_id == "XFER-04":
+        return _standalone("-- A still-early-status Transfer Order with zero Transfer Out ledger activity\n"
+                           "-- more than Y days after creation (also already-picked-per-status is excluded).\n",
+                           _build_no_pick_activity_sql(cap, reference.xfer_no_pick_days(), XFER_AGING_LOOKBACK_DAYS))
+    if rule_id == "XFER-07":
+        return _standalone("-- A picked Transfer Order with no Transfer In / Received ledger row more than\n"
+                           "-- Z days after the first pick.\n",
+                           _build_picked_not_received_sql(cap, reference.xfer_not_received_days(), XFER_AGING_LOOKBACK_DAYS))
     if rule_id == "WASTE-DAILY":
         return _banded_daily_doc("WASTE_DAILY_FACILITY", _daily_waste_sql(False),
                                  "Daily facility NET waste $ (net over the editable waste-action allowlist, "
@@ -1512,7 +1911,9 @@ _FINDERS = {"PO-01": _null_po_ledger, "PO-03": _over_receipt, "PO-06": _missing_
             "PO-07": _no_receipt_overdue,
             "PO-08": _partial_not_closed, "PO-09": _missing_price, "PO-11": _correction_missing_ref,
             "PO-13": _null_po,
-            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing,
+            "PO-14": _sku_not_on_po, "XFER-01": _transfer_order_missing, "XFER-02": _sku_not_on_to,
+            "XFER-05": _received_sku_not_on_to,
+            "XFER-04": _no_pick_activity, "XFER-07": _picked_not_received,
             "WASTE-DAILY": _daily_waste_facility, "ADJ-DAILY": _daily_adjust_facility,
             "COST-01": _waste_sku_no_cost, "COST-02": _consumable_zero_cost}
 
@@ -1568,6 +1969,33 @@ def breakdown(ds, po: str, ims_sku: str, system: str = None):
     rows = list(ds.client.query(sql, job_config=cfg).result())
     return [{"source": r.source, "qty": r.qty, "uom": r.uom, "order_type": r.order_type, "l1_action": r.l1_action,
              "l2_action": r.l2_action, "status": r.status, "facility": r.facility,
+             "ts": str(r.ts) if r.ts else None} for r in rows]
+
+
+def transfer_breakdown(ds, transfer_order: str):
+    """Every ledger movement against one Transfer Order — every Transfer Out ('picked') row
+    followed by every Transfer In / Received ('received') row — the 'what went out vs what came
+    in' detail shown in the drawer for XFER-family tickets."""
+    bq = ds._bq
+    proj, dset = settings.gcp_project, settings.bq_dataset
+    led = settings.bq_ledger_table
+    sql = f"""
+    SELECT
+      CASE WHEN l2_action = 'Transfer Out' THEN 'OUT' ELSE 'IN' END AS leg,
+      item_name, consumable_sku, ims_sku, consumable_quantity_change AS qty, consumable_uom AS uom,
+      facility_name AS facility, system_of_origin AS system, l1_action, l2_action, datetime_utc AS ts
+    FROM `{proj}.{dset}.{led}`
+    WHERE ref_order_type = 'Transfer Order' AND ref_order_id = @to_id
+      AND l2_action IN ('Transfer Out', 'Transfer In', 'Received')
+    ORDER BY (l2_action != 'Transfer Out'), datetime_utc ASC
+    LIMIT 500
+    """
+    cfg = bq.QueryJobConfig(maximum_bytes_billed=int(MAX_GB * 1024 ** 3),
+                            query_parameters=[bq.ScalarQueryParameter("to_id", "STRING", transfer_order)])
+    rows = list(ds.client.query(sql, job_config=cfg).result())
+    return [{"leg": r.leg, "item_name": r.item_name, "consumable_sku": r.consumable_sku,
+             "ims_sku": r.ims_sku, "qty": r.qty, "uom": r.uom, "facility": r.facility,
+             "system": r.system, "movement": ("%s / %s" % (r.l1_action, r.l2_action)) if r.l1_action else None,
              "ts": str(r.ts) if r.ts else None} for r in rows]
 
 

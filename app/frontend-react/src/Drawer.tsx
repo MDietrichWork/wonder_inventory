@@ -1,7 +1,7 @@
 import { useEffect, useState, Fragment } from "react";
 import type { Bootstrap, Exception } from "./types";
 import { fmtNum, humanizeKey } from "./lib";
-import { getBreakdown, jiraUrl, apiPost } from "./api";
+import { getBreakdown, getTransferBreakdown, jiraUrl, apiPost } from "./api";
 import { sevPill, statusPill } from "./Workbench";
 
 const SNAP_HIDE = new Set(["tolerance_pct", "uom_match", "status", "ordered_uom", "received_uom", "breached_at", "first_receipt", "last_receipt", "consumable_uom", "resolution"]);
@@ -33,12 +33,19 @@ export function Drawer({ data, exc, onClose, refresh }: {
   const meta = data.errorTypes.find((t) => t.type === exc.errorType);
   const snap = exc.snapshot || {};
   const [bd, setBd] = useState<any>(null);
+  const [xbd, setXbd] = useState<any>(null);
   const [noteText, setNoteText] = useState("");
   const isReceipt = exc.errorType === "PO_OVER_RECEIPT" || exc.errorType === "PO_IMPLAUSIBLE_QTY";
+  const isXfer = exc.rule.startsWith("XFER");
 
   useEffect(() => {
     setBd(null);
     if (isReceipt) getBreakdown(exc.pk).then(setBd).catch(() => setBd({ available: false }));
+  }, [exc.pk]);
+
+  useEffect(() => {
+    setXbd(null);
+    if (isXfer) getTransferBreakdown(exc.pk).then(setXbd).catch(() => setXbd({ available: false }));
   }, [exc.pk]);
 
   const since: string[] = [];
@@ -65,7 +72,7 @@ export function Drawer({ data, exc, onClose, refresh }: {
   return (
     <>
       <div className="drawer-scrim show" onClick={onClose} />
-      <aside className="drawer show" role="dialog" aria-label="Exception detail">
+      <aside className={"drawer show" + (isXfer ? " drawer-xfer" : "")} role="dialog" aria-label="Exception detail">
         <div className="drawer-head">
           <div>
             <div className="drawer-title">{exc.id} · {meta?.label || exc.errorType}</div>
@@ -119,6 +126,14 @@ export function Drawer({ data, exc, onClose, refresh }: {
             <div className="section">
               <h3>Why this flagged — contributing records</h3>
               <Breakdown bd={bd} />
+            </div>
+          )}
+
+          {/* Transfer order comparison — every Out row, then every In row */}
+          {isXfer && (
+            <div className="section">
+              <h3>Transfer order comparison — Out vs In</h3>
+              <TransferBreakdown bd={xbd} />
             </div>
           )}
 
@@ -237,6 +252,44 @@ function Breakdown({ bd }: { bd: any }) {
             <td className="num">{fmtNum(bd.received_qty)}{ruom ? " " + ruom : ""}</td>
           </tr>
         </tfoot>
+      </table>
+    </>
+  );
+}
+
+function TransferBreakdown({ bd }: { bd: any }) {
+  if (!bd) return <div className="tip">Loading everything picked (Out) and received (In) against this transfer order…</div>;
+  if (!bd.available) return <div className="tip">{bd.error ? "Transfer breakdown unavailable: " + bd.error : "Live record breakdown is available when connected to BigQuery."}</div>;
+  const rows = bd.rows || [];
+  if (rows.length === 0) return <div className="tip">No Transfer Out / Transfer In / Received ledger activity found for transfer order {bd.transfer_order}.</div>;
+  return (
+    <>
+      <div className="tip" style={{ marginBottom: 8 }}>
+        Transfer order <span className="mono">{bd.transfer_order}</span> — {bd.out_count} Out row{bd.out_count === 1 ? "" : "s"}, {bd.in_count} In row{bd.in_count === 1 ? "" : "s"}, every Out row listed before every In row.
+      </div>
+      <table className="mini">
+        <thead><tr><th>Leg</th><th>Item</th><th className="num">Qty</th><th>UoM</th><th>Facility</th><th>System</th><th>Movement</th><th>When</th></tr></thead>
+        <tbody>
+          {rows.map((r: any, i: number) => {
+            const q = Number(r.qty) || 0;
+            const prevLeg = i > 0 ? rows[i - 1].leg : r.leg;
+            return (
+              <Fragment key={i}>
+                {i > 0 && r.leg !== prevLeg && <tr className="bd-total"><td colSpan={8}>↓ In — received against this transfer order</td></tr>}
+                <tr>
+                  <td><span className={"tag" + (r.leg === "OUT" ? " neg" : " ok")}>{r.leg}</span></td>
+                  <td>{r.item_name || r.consumable_sku || "—"}</td>
+                  <td className={"num" + (q < 0 ? " neg" : "")}>{fmtNum(r.qty)}</td>
+                  <td>{r.uom || "—"}</td>
+                  <td>{r.facility || "—"}</td>
+                  <td>{r.system || "—"}</td>
+                  <td>{r.movement || "—"}</td>
+                  <td className="mono" style={{ fontSize: 11 }}>{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
+                </tr>
+              </Fragment>
+            );
+          })}
+        </tbody>
       </table>
     </>
   );

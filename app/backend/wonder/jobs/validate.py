@@ -127,7 +127,10 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                                         recheck_partial_not_closed, recheck_correction_missing_ref,
                                         recheck_missing_uom_conversion,
                                         recheck_null_po, recheck_null_po_ledger,
-                                        recheck_sku_on_po, recheck_to_exists, recheck_daily_waste_facility,
+                                        recheck_sku_on_po, recheck_to_exists, recheck_sku_on_to,
+                                        recheck_received_sku_on_to,
+                                        recheck_no_pick_activity, recheck_picked_not_received,
+                                        recheck_daily_waste_facility,
                                         recheck_daily_adjust_facility,
                                         recheck_waste_sku_no_cost, recheck_consumable_cost)
         OVER_TYPES = ("PO_OVER_RECEIPT", "PO_IMPLAUSIBLE_QTY", "PO_UOM_MISMATCH")
@@ -141,6 +144,10 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
         nullpo_led_errs = [e for e in open_errs if e.error_type == "NULL_PO_NUMBER"]
         sku_errs = [e for e in open_errs if e.error_type == "PO_SKU_NOT_ON_PO"]
         to_errs = [e for e in open_errs if e.error_type == "TRANSFER_ORDER_MISSING"]
+        to_sku_errs = [e for e in open_errs if e.error_type == "SKU_NOT_ON_TO"]
+        to_recv_errs = [e for e in open_errs if e.error_type == "RECEIVED_SKU_NOT_ON_TO"]
+        to_nopick_errs = [e for e in open_errs if e.error_type == "TRANSFER_NO_PICK_ACTIVITY"]
+        to_notrecv_errs = [e for e in open_errs if e.error_type == "TRANSFER_PICKED_NOT_RECEIVED"]
         dwf_errs = [e for e in open_errs if e.error_type == "WASTE_DAILY_FACILITY"]
         adj_errs = [e for e in open_errs if e.error_type == "ADJ_DAILY_FACILITY"]
         nocost_errs = [e for e in open_errs if e.error_type == "WASTE_SKU_NO_COST"]
@@ -264,6 +271,52 @@ def run_validation(db, run_date: str, ds, sink, backfill: bool = False) -> Valid
                 _auto_close(db, e, as_of, sink,
                             "Re-check on run %s: transfer order now exists — auto-closed." % run_date,
                             resolution=resolution.populated(run_date, "Transfer order now exists in the population."))
+                autoclosed += 1
+
+        # picked item not on the TO: close once the item appears on the TO's lines (ims_sku, qty > 0)
+        tspairs = list({((e.data_snapshot or {}).get("transfer_order"), (e.data_snapshot or {}).get("ims_sku"))
+                        for e in to_sku_errs if (e.data_snapshot or {}).get("transfer_order")})
+        now_on_to = recheck_sku_on_to(ds, tspairs) if tspairs else set()
+        for e in to_sku_errs:
+            snap = e.data_snapshot or {}
+            if "%s~~%s" % (snap.get("transfer_order"), snap.get("ims_sku")) in now_on_to:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: item now ordered on the Transfer Order (qty > 0) — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Item now ordered on the Transfer Order's lines (order qty > 0)."))
+                autoclosed += 1
+
+        # received item not on the TO: close once the item appears on the TO's lines (ims_sku, qty > 0)
+        trpairs = list({((e.data_snapshot or {}).get("transfer_order"), (e.data_snapshot or {}).get("ims_sku"))
+                        for e in to_recv_errs if (e.data_snapshot or {}).get("transfer_order")})
+        now_recv_on_to = recheck_received_sku_on_to(ds, trpairs) if trpairs else set()
+        for e in to_recv_errs:
+            snap = e.data_snapshot or {}
+            if "%s~~%s" % (snap.get("transfer_order"), snap.get("ims_sku")) in now_recv_on_to:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: item now ordered on the Transfer Order (qty > 0) — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Item now ordered on the Transfer Order's lines (order qty > 0)."))
+                autoclosed += 1
+
+        # transfer order no pick activity: close once a pick appears or status advances past picking
+        nopick_ids = list({(e.data_snapshot or {}).get("transfer_order") for e in to_nopick_errs
+                           if (e.data_snapshot or {}).get("transfer_order")})
+        now_picked = recheck_no_pick_activity(ds, nopick_ids) if nopick_ids else set()
+        for e in to_nopick_errs:
+            if (e.data_snapshot or {}).get("transfer_order") in now_picked:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: transfer order now has pick activity — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Transfer order now has pick activity (or its status advanced past picking)."))
+                autoclosed += 1
+
+        # transfer picked but not received: close once a Transfer In / Received ledger row appears
+        notrecv_ids = list({(e.data_snapshot or {}).get("transfer_order") for e in to_notrecv_errs
+                            if (e.data_snapshot or {}).get("transfer_order")})
+        now_received = recheck_picked_not_received(ds, notrecv_ids) if notrecv_ids else set()
+        for e in to_notrecv_errs:
+            if (e.data_snapshot or {}).get("transfer_order") in now_received:
+                _auto_close(db, e, as_of, sink,
+                            "Re-check on run %s: transfer order now has a receiving ledger row — auto-closed." % run_date,
+                            resolution=resolution.populated(run_date, "Transfer order now has a Transfer In / Received ledger row."))
                 autoclosed += 1
 
         # daily facility waste: close once the facility-day NET waste $ is back under its High threshold

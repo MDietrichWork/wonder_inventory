@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import type { Bootstrap } from "./types";
 import { sevPill } from "./Workbench";
 import { labelFor } from "./lib";
-import { apiPatch, putThresholds, putWasteCombos, putRetention, purgeClosed } from "./api";
+import { apiPatch, putThresholds, putWasteCombos, putRetention, purgeClosed, putXferAging } from "./api";
 
 // A rule's live status. Two switches decide whether it actually produces tickets: the Enabled
 // toggle (user-controlled) AND whether a detector query is wired into the engine (data.wired).
@@ -103,6 +103,8 @@ export function Admin({ data, refresh }: { data: Bootstrap; refresh: () => Promi
         <ThresholdEditor data={data} refresh={refresh} />
 
         <RetentionEditor data={data} refresh={refresh} />
+
+        <TransferAgingEditor data={data} refresh={refresh} />
 
         <div className="card" style={{ marginTop: 12 }}>
           <h2>SLA targets per severity</h2>
@@ -442,6 +444,58 @@ function RetentionEditor({ data, refresh }: { data: Bootstrap; refresh: () => Pr
           title={saved === 0 ? "Retention is off (keep forever)" : pastWindow === 0 ? "Nothing past the window" : "Delete closed tickets older than the window"}>
           {busy === "purge" ? "Purging…" : "Purge now"}
         </button>
+        {msg && <span className="tip">{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+// XFER-04 / XFER-07 aging thresholds: how many days a transfer order can go with no pick activity
+// (XFER-04) / with no receipt after being picked (XFER-07) before it's flagged. PUT /api/xfer-aging;
+// the next validation run picks up the new values via reference's live thresholds.
+function TransferAgingEditor({ data, refresh }: { data: Bootstrap; refresh: () => Promise<void> | void }) {
+  const savedNoPick = data.settings?.xferNoPickDays ?? 2;
+  const savedNotReceived = data.settings?.xferNotReceivedDays ?? 2;
+  const [noPickDays, setNoPickDays] = useState(savedNoPick);
+  const [notReceivedDays, setNotReceivedDays] = useState(savedNotReceived);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const dirty = noPickDays !== savedNoPick || notReceivedDays !== savedNotReceived;
+
+  const save = async () => {
+    if (!dirty) return;
+    setBusy(true); setMsg(null);
+    try {
+      const res = await putXferAging(noPickDays, notReceivedDays);
+      await refresh();
+      setMsg(`Saved — XFER-04 flags after ${res.noPickDays}d, XFER-07 flags after ${res.notReceivedDays}d.`);
+    } catch (e) { setMsg(`Save failed: ${String(e)}`); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 12 }}>
+      <h2>Transfer order aging <span className="hint">XFER-04 / XFER-07 day-thresholds — editable &amp; persisted</span></h2>
+      <div className="muted-note" style={{ marginBottom: 10 }}>
+        A Transfer Order is flagged if it has no pick activity this many days after being created (XFER-04),
+        or if it was picked but has no receiving activity this many days after the pick (XFER-07).
+      </div>
+      <FormRow label="No pick activity after">
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input type="number" min={0} max={365} step={1} value={noPickDays}
+            onChange={(e) => setNoPickDays(Math.max(0, Math.floor(Number(e.target.value) || 0)))} style={inp} />
+          <span className="tip">days (XFER-04)</span>
+        </span>
+      </FormRow>
+      <FormRow label="Picked but not received after">
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input type="number" min={0} max={365} step={1} value={notReceivedDays}
+            onChange={(e) => setNotReceivedDays(Math.max(0, Math.floor(Number(e.target.value) || 0)))} style={inp} />
+          <span className="tip">days (XFER-07)</span>
+        </span>
+      </FormRow>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4 }}>
+        <button className="btn primary sm" disabled={busy || !dirty} onClick={save}>{busy ? "Saving…" : "Save"}</button>
         {msg && <span className="tip">{msg}</span>}
       </div>
     </div>

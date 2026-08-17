@@ -144,6 +144,35 @@ def daily_threshold(error_type, facility_type):
     return glob
 
 
+# ---- Transfer-order aging day-thresholds (XFER-04 / XFER-07) ---------------------------------------
+# How many days a transfer order can go with no pick activity (XFER-04) / with no receipt after being
+# picked (XFER-07) before it's flagged. Code defaults; DB-backed + editable in the Admin UI
+# (app_setting table — xfer_no_pick_days / xfer_not_received_days keys), same live-override pattern as
+# the facility $ bands above (wonder.thresholds.refresh loads app_setting into this at run/bootstrap
+# time so Admin edits take effect without a restart).
+XFER_NO_PICK_DAYS_DEFAULT = 2
+XFER_NOT_RECEIVED_DAYS_DEFAULT = 2
+
+_XFER_DAY_THRESHOLDS = {"XFER-04": XFER_NO_PICK_DAYS_DEFAULT, "XFER-07": XFER_NOT_RECEIVED_DAYS_DEFAULT}
+
+
+def set_xfer_day_thresholds(no_pick_days=None, not_received_days=None):
+    """Replace the live day-thresholds (falls back to the code default for any value not given)."""
+    global _XFER_DAY_THRESHOLDS
+    _XFER_DAY_THRESHOLDS = {
+        "XFER-04": int(no_pick_days) if no_pick_days is not None else XFER_NO_PICK_DAYS_DEFAULT,
+        "XFER-07": int(not_received_days) if not_received_days is not None else XFER_NOT_RECEIVED_DAYS_DEFAULT,
+    }
+
+
+def xfer_no_pick_days() -> int:
+    return _XFER_DAY_THRESHOLDS["XFER-04"]
+
+
+def xfer_not_received_days() -> int:
+    return _XFER_DAY_THRESHOLDS["XFER-07"]
+
+
 # ---- Daily-waste action allowlist -----------------------------------------------------------------
 # The explicit set of ledger (l1_action, l2_action) movements that count as "waste" for the Daily
 # Waste rule, approved by Pavel 2026-06-17. This REPLACES the earlier definition (l1_action='Adjust'
@@ -320,8 +349,8 @@ ERROR_TYPES = [
      "owner": "SC Product (IMS)", "desc": "DEPRECATED — folded into PO_OVER_RECEIPT (≥100% over → Urgent) as of the facility-routing change. Kept so historical tickets still render; no longer emitted."},
     {"type": "PO_UOM_MISMATCH", "rule": "PO/ledger consumable UoM match", "ruleType": "RECONCILIATION",
      "owner": "Procurement", "desc": "Consumable UoM on the PO differs from the ledger receipt — ordered vs received aren't comparable until the UoM/conversion is reconciled (excluded from the over-receipt % rule)."},
-    {"type": "TRANSFER_WAREHOUSE_IMBALANCE", "rule": "Transfer Warehouse balances", "ruleType": "RECONCILIATION",
-     "owner": "Field Ops", "desc": "Shipped vs received quantity mismatch leaves aged stock in the Transfer Warehouse."},
+    {"type": "TRANSFER_WAREHOUSE_IMBALANCE", "rule": "Transfer Warehouse in/out balance", "ruleType": "RECONCILIATION",
+     "owner": "Field Ops", "desc": "An item is present on one Digital Transfer Warehouse leg (Transfer In or Transfer Out) but completely absent from the other, for a transfer that has a real origin leg. DRAFTED, not live — pending data-engineer confirmation of the suffix-normalization and origin-leg-required scoping (see docs/rule-sql-guide.md). (Framework catalog TWH-01.)"},
     {"type": "NEGATIVE_ON_HAND", "rule": "On-hand >= 0", "ruleType": "RANGE",
      "owner": "SC Product (IMS)", "desc": "Cumulative on-hand quantity went negative for an item / location."},
     {"type": "PO_MISSING_PRICE", "rule": "Vendor SKU price present", "ruleType": "NOT_NULL",
@@ -339,7 +368,15 @@ ERROR_TYPES = [
     {"type": "PO_SKU_NOT_ON_PO", "rule": "Received SKU listed on the PO", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "A consumable SKU was received against a PO (ledger ref_order_id) that exists, but the PO orders none of it — the SKU isn't on the PO's lines, OR it's on a line ordered for 0 (Ship Hero can auto-create a zero-order receive-line for an unexpected item, which risks never invoicing the vendor). A 3-way-match break: wrong item received, an undocumented substitution, or a line never properly ordered. (Framework catalog PO-02.)"},
     {"type": "TRANSFER_ORDER_MISSING", "rule": "Picked Transfer Order exists", "ruleType": "REFERENTIAL",
-     "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. (Framework catalog XFER-01.)"},
+     "owner": "SC Product (IMS)", "desc": "Items were picked (Transfer Out) against a Transfer Order whose ID is not in the transfer-order population (the orders table, order_type='Transfer') — picking against a non-existent transfer order. Excludes the synthetic Digital Transfer Warehouse facility, whose freetext ad hoc movement labels (Instacart, recounts, etc.) never get a master TO record and would otherwise all false-positive. (Framework catalog XFER-01.)"},
+    {"type": "SKU_NOT_ON_TO", "rule": "Picked item listed on the Transfer Order", "ruleType": "REFERENTIAL",
+     "owner": "Field Ops", "desc": "An item was picked (Transfer Out) against a Transfer Order that exists, but the TO orders none of it — not on the TO's lines, or on a line ordered for 0. Joined on ims_sku (not consumable_sku, which is a per-system translation that doesn't line up 1:1 and produced a 72% false-positive rate in testing). Excludes Digital Transfer Warehouse. (Framework catalog XFER-02.)"},
+    {"type": "RECEIVED_SKU_NOT_ON_TO", "rule": "Received item listed on the Transfer Order", "ruleType": "REFERENTIAL",
+     "owner": "SC Product (IMS)", "desc": "An item was received (Transfer In, or Received at Pantry/HDR) against a Transfer Order that exists, but the TO orders none of it. The receiving-side sibling of XFER-02. Joined on ims_sku, exact-or-suffixed (l.ims_sku = p.ims_sku OR l.ims_sku LIKE p.ims_sku||'-%') — a plain match false-positived 15-70% of every HDR selling unit because TO lines for Pantry frozen items carry a '-N' case-multiplier suffix the receiving leg omits. Excludes Digital Transfer Warehouse. (Framework catalog XFER-05.)"},
+    {"type": "TRANSFER_NO_PICK_ACTIVITY", "rule": "Transfer order has pick activity within Y days", "ruleType": "AGING",
+     "owner": "Field Ops", "desc": "A Transfer Order still in an early lifecycle status (not shipped, not cancelled/rejected) has zero Transfer Out ledger activity more than Y days (default 2, admin-editable) after it was created. Ledger presence alone isn't reliable — ~94% of TOs with no matching ledger row are already CLOSED/RECEIVED per their own status (a real ledger sync gap) — so a TO also counts as already-picked if its status has advanced past picking. (Framework catalog XFER-04.)"},
+    {"type": "TRANSFER_PICKED_NOT_RECEIVED", "rule": "Picked transfer order received within Z days", "ruleType": "AGING",
+     "owner": "Field Ops", "desc": "A real Transfer Order was picked (a Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z days (default 2, admin-editable) after the first pick. Excludes cancelled/voided orders. (Framework catalog XFER-07.)"},
     {"type": "WASTE_DAILY_FACILITY", "rule": "Daily facility waste within threshold", "ruleType": "RANGE",
      "owner": "Field Ops", "desc": "A facility's total NET waste $ for a day exceeds its facility-type threshold (small for IKC/HDR selling units, larger for CK/DISH/Production). NET over an editable allowlist of (l1_action, l2_action) movements that count as waste — approved by Pavel and editable in Admin (Add/remove/toggle combos under the Daily Waste rule) — so losses (Lost, Expiration, Damage, Recall, spoilage, cycle-count shrink, …) net against Found / cycle-count recoveries of the same item; valued at standard cost. Two bands: over the High threshold → High, over the Urgent threshold → Urgent. The drawer lists the top loss-contributing SKUs (sorted) — investigation is the team's job. Routed by facility type (HDR → Field Ops/IKC; CK/DISH/PRODUCTION → Field Ops/ProdCo)."},
     {"type": "ADJ_DAILY_FACILITY", "rule": "Daily facility adjustments within threshold", "ruleType": "RANGE",
@@ -368,7 +405,11 @@ ERROR_TYPE_LABELS = {
     "PO_MISSING_UOM_CONVERSION": "Missing Unit Conversion (Consumable ↔ Vendor SKU)",
     "PO_MISSING_NUMBER": "PO Table Missing PO Number",
     "PO_SKU_NOT_ON_PO": "SKU Not on PO",
-    "TRANSFER_ORDER_MISSING": "Transfer Order Missing (WIP)",
+    "TRANSFER_ORDER_MISSING": "Transfer Order Missing",
+    "SKU_NOT_ON_TO": "SKU Not on Transfer Order",
+    "RECEIVED_SKU_NOT_ON_TO": "Received SKU Not on Transfer Order",
+    "TRANSFER_NO_PICK_ACTIVITY": "Transfer Order No Pick Activity",
+    "TRANSFER_PICKED_NOT_RECEIVED": "Transfer Picked — Not Received",
     "WASTE_DAILY_FACILITY": "Daily Waste (Facility)",
     "ADJ_DAILY_FACILITY": "Daily Adjustments (Facility)",
     "WASTE_SKU_NO_COST": "Waste SKU Without Cost",
@@ -400,6 +441,10 @@ ERROR_TYPE_PLAIN = {
     "PO_MISSING_NUMBER": "A row in the purchase-order master table has no PO number at all — a broken record with nothing to receive against.",
     "PO_SKU_NOT_ON_PO": "An item was received against a real purchase order, but the PO orders none of it — the item isn't on the PO, or it's on a line ordered for zero. Either way it may never get invoiced to the vendor: a wrong item, an undocumented substitution, or a line never properly ordered.",
     "TRANSFER_ORDER_MISSING": "Items were picked for a transfer order that doesn't exist in our records.",
+    "SKU_NOT_ON_TO": "This item was picked for a transfer order, but that transfer order doesn't list this item.",
+    "RECEIVED_SKU_NOT_ON_TO": "This item was received against a transfer order, but that transfer order doesn't list this item.",
+    "TRANSFER_NO_PICK_ACTIVITY": "This transfer order hasn't had anything picked against it in a while.",
+    "TRANSFER_PICKED_NOT_RECEIVED": "This transfer order was picked, but nothing has been received against it in a while.",
     "WASTE_DAILY_FACILITY": "One facility's net waste in dollars for a single day is unusually high — above what's normal for that type of facility.",
     "ADJ_DAILY_FACILITY": "A facility made an unusually large dollar amount of inventory adjustments in one day (even ones that cancel out) — a sign of abnormal counting or correction activity.",
     "WASTE_SKU_NO_COST": "An item that's being wasted has no standard cost set up, so we can't put a dollar value on its waste — it silently drops out of the totals.",
@@ -502,28 +547,42 @@ RULES = [
         "     OR (o.ordered_base > 0 AND r.led_received > o.ordered_base * 1.30) )\n"
         "ORDER BY led_over DESC, po_over DESC"
      ), "enabled": True},
-    {"id": "TWH-01", "name": "Transfer Warehouse balances", "primitive": "RECON_TRANSFER",
-     "error_type": "TRANSFER_WAREHOUSE_IMBALANCE", "target_table": "unified_ledger", "severity": "High",
+    {"id": "TWH-01", "name": "Transfer Warehouse in/out balance", "primitive": "RECON_TRANSFER",
+     "error_type": "TRANSFER_WAREHOUSE_IMBALANCE", "target_table": "consolidated_inventory_ledger", "severity": "High",
      "fail_type": "Soft", "owner_group": "Field Ops",
-     "params": {"facility": "TW-001"},
+     "params": {"system": "digital_transfer_warehouse", "aging_days": 3},
      "expression": (
-        "-- Catalog rule (framework TWH-01) — WIP: transfer-warehouse shipped-vs-received reconciliation.\n"
-        "-- NOT yet wired into the daily finder (needs the full transfer-matching model). A transfer whose\n"
-        "-- Out and In legs don't balance leaves aged stock in transit.\n"
-        "DECLARE run_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);\n"
-        "WITH legs AS (\n"
-        "  SELECT ref_order_id AS transfer_id,\n"
-        "         SUM(IF(l2_action = 'Transfer Out', -consumable_quantity_change, 0)) AS shipped_qty,\n"
-        "         SUM(IF(l2_action = 'Transfer In',   consumable_quantity_change, 0)) AS received_qty\n"
+        "-- Catalog rule (framework TWH-01) — DRAFTED, NOT LIVE, pending data-engineer confirmation.\n"
+        "-- Compares ONLY the two ledger legs recorded AT the Digital Transfer Warehouse itself\n"
+        "-- (Transfer In = arrived; Transfer Out = left) for the same (ref_order_id, item) — deliberately\n"
+        "-- ignoring the origin and destination facilities' own legs. Requires a real non-DTW origin\n"
+        "-- 'Transfer Out' leg to exist first (excludes the ~3.6M pure digital-fulfillment DTW-as-source\n"
+        "-- population that never has a matching origin leg and isn't part of this pattern at all).\n"
+        "-- ims_sku is compared suffix-normalized (strip a trailing '-N') — the exact-vs-suffixed id\n"
+        "-- mismatch already found on XFER-05 recurs here between the DTW In and Out legs themselves.\n"
+        "-- Phase 1 (this query): existence-only — flags an item present on one DTW leg but completely\n"
+        "-- absent from the other. Phase 2 (not designed yet): both legs present but quantities differ\n"
+        "-- by more than X% — deferred pending Phase 1 sign-off.\n"
+        "WITH dtw AS (\n"
+        "  SELECT ref_order_id, REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '') AS base_sku,\n"
+        "         SUM(IF(l2_action='Transfer In', consumable_quantity_change, 0)) AS dtw_in,\n"
+        "         SUM(IF(l2_action='Transfer Out', -consumable_quantity_change, 0)) AS dtw_out,\n"
+        "         MAX(DATE(datetime_utc)) AS last_activity\n"
         "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
-        "  WHERE ref_order_type = 'Transfer Order' AND ref_order_id IS NOT NULL\n"
-        "  GROUP BY transfer_id\n"
-        ")\n"
-        "SELECT transfer_id, shipped_qty, received_qty, (shipped_qty - received_qty) AS imbalance_qty\n"
-        "FROM legs\n"
-        "WHERE shipped_qty <> received_qty\n"
-        "ORDER BY ABS(shipped_qty - received_qty) DESC"
-     ), "enabled": False},  # out of go-live scope (PO + COST only)
+        "  WHERE system_of_origin='digital_transfer_warehouse' AND ref_order_type='Transfer Order'\n"
+        "    AND l2_action IN ('Transfer In','Transfer Out') AND ref_order_id IS NOT NULL AND ims_sku IS NOT NULL\n"
+        "  GROUP BY ref_order_id, base_sku),\n"
+        "origin AS (\n"
+        "  SELECT DISTINCT ref_order_id, REGEXP_REPLACE(ims_sku, r'-[0-9]+$', '') AS base_sku\n"
+        "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE system_of_origin != 'digital_transfer_warehouse' AND ref_order_type='Transfer Order'\n"
+        "    AND l2_action = 'Transfer Out' AND ref_order_id IS NOT NULL AND ims_sku IS NOT NULL)\n"
+        "SELECT dtw.ref_order_id, dtw.base_sku, dtw.dtw_in, dtw.dtw_out,\n"
+        "       IF(dtw.dtw_in > 0, 'STUCK_AT_WAREHOUSE', 'LEFT_WITHOUT_ARRIVING') AS failure_mode\n"
+        "FROM dtw JOIN origin USING (ref_order_id, base_sku)\n"
+        "WHERE (dtw.dtw_in > 0) != (dtw.dtw_out > 0)  -- exactly one side present\n"
+        "  AND dtw.last_activity < DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)"
+     ), "enabled": False},  # DRAFTED — pending data-engineer confirmation, see docs/rule-sql-guide.md
     {"id": "COMPLETE-02", "name": "On-hand non-negative", "primitive": "RANGE", "error_type": "NEGATIVE_ON_HAND",
      "target_table": "unified_ledger", "severity": "Urgent", "fail_type": "Soft", "owner_group": "SC Product (IMS)",
      "params": {"column": "running_on_hand", "op": "<", "value": 0},
@@ -593,14 +652,122 @@ RULES = [
      "params": {},
      "expression": (
         "-- Catalog XFER-01: a Transfer Out pick references a Transfer Order id not in the\n"
-        "-- transfer-order population (orders table, order_type='Transfer').\n"
+        "-- transfer-order population (orders table, order_type='Transfer'). Excludes the\n"
+        "-- synthetic Digital Transfer Warehouse facility (system_of_origin='digital_transfer_warehouse')\n"
+        "-- whose freetext ad hoc labels (Instacart, recounts, etc.) never get a master TO record.\n"
         "WITH picks AS (\n"
         "  SELECT DISTINCT ref_order_id AS to_id\n"
         "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
-        "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL),\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL\n"
+        "    AND system_of_origin != 'digital_transfer_warehouse'),\n"
         "to_pop AS (SELECT DISTINCT po AS to_id FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer')\n"
         "SELECT p.to_id FROM picks p LEFT JOIN to_pop t USING (to_id) WHERE t.to_id IS NULL"
-     ), "enabled": False},   # per Pavel: transfer orders are out of scope for now
+     ), "enabled": True},   # re-enabled 2026-08-13 after live verification; see PROCESS.md
+    {"id": "XFER-02", "name": "Picked item listed on the Transfer Order", "primitive": "REFERENTIAL", "error_type": "SKU_NOT_ON_TO",
+     "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "Field Ops",
+     "params": {},
+     "expression": (
+        "-- Catalog XFER-02: a Transfer Out pick against a Transfer Order that EXISTS, but the TO\n"
+        "-- orders none of that item (not on its lines, or on a line ordered for 0). Excludes Digital\n"
+        "-- Transfer Warehouse and TOs that don't exist at all (XFER-01's job). Joined on ims_sku, not\n"
+        "-- consumable_sku — verified live that consumable_sku is a per-system translation that doesn't\n"
+        "-- line up 1:1 between the ledger and the TO table (72% false-positive rate on one sample day);\n"
+        "-- ims_sku is the raw shared id and matches cleanly. Same lesson as PO-03's ims_sku re-key.\n"
+        "WITH picks AS (\n"
+        "  SELECT DISTINCT ref_order_id AS to_id, ims_sku\n"
+        "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL\n"
+        "    AND ims_sku IS NOT NULL AND system_of_origin != 'digital_transfer_warehouse'),\n"
+        "to_lines AS (SELECT po, ims_sku, SUM(consumable_sku_qty) AS ordered_qty\n"
+        "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer' AND ims_sku IS NOT NULL\n"
+        "  GROUP BY po, ims_sku),\n"
+        "to_exists AS (SELECT DISTINCT po FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer')\n"
+        "SELECT p.to_id, p.ims_sku FROM picks p\n"
+        "JOIN to_exists e ON p.to_id = e.po\n"
+        "LEFT JOIN to_lines l ON p.to_id = l.po AND p.ims_sku = l.ims_sku\n"
+        "WHERE COALESCE(l.ordered_qty, 0) <= 0"
+     ), "enabled": True},
+    {"id": "XFER-05", "name": "Received item listed on the Transfer Order", "primitive": "REFERENTIAL", "error_type": "RECEIVED_SKU_NOT_ON_TO",
+     "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
+     "params": {},
+     "expression": (
+        "-- Catalog XFER-05: an item RECEIVED (Transfer In, or Received at Pantry/HDR) against a\n"
+        "-- Transfer Order that EXISTS, but the TO orders none of that item. Receiving-side sibling\n"
+        "-- of XFER-02. Excludes Digital Transfer Warehouse and TOs that don't exist (XFER-01's job).\n"
+        "-- Join is exact-OR-suffixed ims_sku (l.ims_sku = p.ims_sku OR l.ims_sku LIKE p.ims_sku||'-%'),\n"
+        "-- NOT plain ims_sku and NOT a stripped-suffix match: verified live that ~827k/22.48M TO\n"
+        "-- lines (mostly Pantry/HDR frozen items) carry a '-N' case-multiplier suffix the receiving\n"
+        "-- leg reports without; plain match false-positived 15-70% of every HDR selling unit, and\n"
+        "-- blindly stripping the suffix broke XFER-02's picking-side match instead (67,755 new false\n"
+        "-- orphans on a 30-day test). The exact-or-prefix join fixes receiving with no picking-side\n"
+        "-- impact — see bq_finder.py docstring.\n"
+        "WITH picks AS (\n"
+        "  SELECT DISTINCT ref_order_id AS to_id, ims_sku\n"
+        "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL\n"
+        "    AND ims_sku IS NOT NULL AND system_of_origin != 'digital_transfer_warehouse'),\n"
+        "to_exists AS (SELECT DISTINCT po FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer')\n"
+        "SELECT p.to_id, p.ims_sku FROM picks p\n"
+        "JOIN to_exists e ON p.to_id = e.po\n"
+        "WHERE COALESCE((\n"
+        "  SELECT SUM(l.consumable_sku_qty) FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` l\n"
+        "  WHERE l.po = p.to_id AND l.order_type='Transfer'\n"
+        "    AND (l.ims_sku = p.ims_sku OR l.ims_sku LIKE CONCAT(p.ims_sku, '-%'))\n"
+        "), 0) <= 0"
+     ), "enabled": True},
+    {"id": "XFER-04", "name": "Transfer order has pick activity within Y days", "primitive": "AGING", "error_type": "TRANSFER_NO_PICK_ACTIVITY",
+     "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "Medium", "fail_type": "Soft", "owner_group": "Field Ops",
+     "params": {"days": XFER_NO_PICK_DAYS_DEFAULT},  # admin-editable; live value in app_setting.xfer_no_pick_days
+     "expression": (
+        "-- Catalog XFER-04: a Transfer Order still in an early lifecycle status (not yet shipped,\n"
+        "-- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days after it\n"
+        "-- was created. 'Picked' = a ledger row with ref_order_type='Transfer Order',\n"
+        "-- l2_action='Transfer Out', ref_order_id = this TO's id.\n"
+        "-- NOTE: ledger presence alone is NOT reliable here — verified live that ~94% of TOs with zero\n"
+        "-- matching ledger rows are already status=CLOSED or RECEIVED (a real ledger sync gap for a\n"
+        "-- meaningful slice of transfers, not a fixable join). So a TO is also treated as already-picked\n"
+        "-- if its own status has advanced past picking (SHIPPED/PARTIALLY_SHIPPED/RECEIVED/\n"
+        "-- PARTIALLY_RECEIVED/CLOSED/PICKED/PACKED/PACKING/PLACED), and excluded entirely if dead\n"
+        "-- (CANCELLED/CANCELED/VOIDED/VENDOR_REJECTED). Y defaults to 2, admin-editable.\n"
+        "WITH to_agg AS (\n"
+        "  SELECT po, MAX(DATE(po_date_utc)) AS order_date, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses\n"
+        "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
+        "  WHERE order_type='Transfer' AND po IS NOT NULL AND TRIM(po) <> ''\n"
+        "  GROUP BY po),\n"
+        "picked AS (SELECT DISTINCT ref_order_id AS po FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL)\n"
+        "SELECT t.po FROM to_agg t LEFT JOIN picked p USING(po)\n"
+        "WHERE p.po IS NULL\n"
+        "  AND NOT EXISTS (SELECT 1 FROM UNNEST(t.statuses) s WHERE UPPER(s) IN\n"
+        "    ('CANCELLED','CANCELED','VOIDED','VENDOR_REJECTED','SHIPPED','PARTIALLY_SHIPPED',\n"
+        "     'RECEIVED','PARTIALLY_RECEIVED','CLOSED','PICKED','PACKED','PACKING','PLACED'))\n"
+        "  AND t.order_date IS NOT NULL\n"
+        "  AND t.order_date < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
+     ), "enabled": True},
+    {"id": "XFER-07", "name": "Picked transfer order received within Z days", "primitive": "AGING", "error_type": "TRANSFER_PICKED_NOT_RECEIVED",
+     "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "Medium", "fail_type": "Soft", "owner_group": "Field Ops",
+     "params": {"days": XFER_NOT_RECEIVED_DAYS_DEFAULT},  # admin-editable; live value in app_setting.xfer_not_received_days
+     "expression": (
+        "-- Catalog XFER-07: a real Transfer Order (exists in the population) that WAS picked (a\n"
+        "-- Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z\n"
+        "-- days after the first pick. Excludes cancelled/voided orders (dead, not stuck). Unlike\n"
+        "-- XFER-04, ledger-only is reliable here: verified live that 0 of 76,035 picked, non-cancelled\n"
+        "-- transfer orders in a 90-day window lack a matching receiving-leg row. Z defaults to 2,\n"
+        "-- admin-editable.\n"
+        "WITH picked AS (\n"
+        "  SELECT ref_order_id AS po, MIN(DATE(datetime_utc)) AS first_pick\n"
+        "  FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL\n"
+        "  GROUP BY ref_order_id),\n"
+        "received AS (SELECT DISTINCT ref_order_id AS po FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
+        "  WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL),\n"
+        "to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses\n"
+        "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer' GROUP BY po)\n"
+        "SELECT pk.po FROM picked pk JOIN to_exists e USING(po) LEFT JOIN received r USING(po)\n"
+        "WHERE r.po IS NULL\n"
+        "  AND NOT EXISTS (SELECT 1 FROM UNNEST(e.statuses) s WHERE UPPER(s) IN ('CANCELLED','CANCELED','VOIDED'))\n"
+        "  AND pk.first_pick < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
+     ), "enabled": True},
     {"id": "PO-14", "name": "Received SKU listed on the PO", "primitive": "REFERENTIAL", "error_type": "PO_SKU_NOT_ON_PO",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",
      "params": {},  # BigQuery 3-way-match join; runs via the SQL finder, skipped by the fixtures engine
@@ -749,6 +916,14 @@ ROUTING = [
      "jira_component": "3-Way Match"},
     {"error_type": "TRANSFER_ORDER_MISSING", "team": "SC Product (IMS)", "assignee": "Sarah Chen",
      "jira_component": "Transfer Orders"},
+    {"error_type": "SKU_NOT_ON_TO", "team": "Field Ops", "assignee": "Priya Nair",
+     "jira_component": "Transfers"},
+    {"error_type": "RECEIVED_SKU_NOT_ON_TO", "team": "SC Product (IMS)", "assignee": "Marcus Webb",
+     "jira_component": "3-Way Match"},
+    {"error_type": "TRANSFER_NO_PICK_ACTIVITY", "team": "Field Ops", "assignee": "Priya Nair",
+     "jira_component": "Transfers"},
+    {"error_type": "TRANSFER_PICKED_NOT_RECEIVED", "team": "Field Ops", "assignee": "Priya Nair",
+     "jira_component": "Transfers"},
     # Fallback routing; overridden per-finding by facility_type in validate.py (Field Ops IKC/ProdCo).
     {"error_type": "WASTE_DAILY_FACILITY", "team": "Field Ops — ProdCo", "assignee": "Priya Nair",
      "jira_component": "Daily Waste"},

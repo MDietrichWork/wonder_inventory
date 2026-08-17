@@ -110,6 +110,18 @@ class RetentionBody(BaseModel):
         return v
 
 
+class XferAgingBody(BaseModel):
+    noPickDays: int
+    notReceivedDays: int
+
+    @field_validator("noPickDays", "notReceivedDays")
+    @classmethod
+    def _valid_days(cls, v: int) -> int:
+        if v < 0 or v > 365:
+            raise ValueError("days must be between 0 and 365")
+        return v
+
+
 @router.get("/health")
 def health():
     return {"ok": True}
@@ -275,6 +287,23 @@ def purge_retention(db=Depends(get_db)):
     return {"purged": n, "olderThanDays": days}
 
 
+@router.put("/xfer-aging")
+def update_xfer_aging(body: XferAgingBody, db=Depends(get_db)):
+    """Set the XFER-04 (no pick activity) / XFER-07 (picked but not received) day-thresholds.
+    Persists to app_setting + an audit log; the next validation run / bootstrap picks up the new
+    values via reference's live thresholds (thresholds.refresh)."""
+    from .. import xfer_aging, thresholds as _thresholds
+    before = {"noPickDays": xfer_aging.get_no_pick_days(db), "notReceivedDays": xfer_aging.get_not_received_days(db)}
+    after = {"noPickDays": xfer_aging.set_no_pick_days(db, body.noPickDays),
+             "notReceivedDays": xfer_aging.set_not_received_days(db, body.notReceivedDays)}
+    if before != after:
+        db.add(AuditLog(actor="admin", action="edit_xfer_aging", entity="app_setting",
+                        entity_id="xfer_aging", before=before, after=after, at=_now()))
+    db.commit()
+    _thresholds.refresh(db)
+    return after
+
+
 @router.post("/sync")
 def sync(db=Depends(get_db)):
     """Pull status / assignee / resolution changes made directly in Jira back into the app."""
@@ -324,6 +353,36 @@ def breakdown(pk: int, db=Depends(get_db)):
         "duplicate_suspected": any(c >= 2 for c in add_qtys.values()),
     }
     _BREAKDOWN_CACHE[pk] = result
+    return result
+
+
+_TRANSFER_BREAKDOWN_CACHE = {}  # pk -> result; the live BigQuery lookup is slow, so cache per session
+
+
+@router.get("/exceptions/{pk}/transfer-breakdown")
+def transfer_breakdown_route(pk: int, db=Depends(get_db)):
+    """Transfer order comparison for XFER-family tickets: every ledger Transfer Out ('picked') row
+    on this exception's transfer order, followed by every Transfer In / Received ('received') row."""
+    if pk in _TRANSFER_BREAKDOWN_CACHE:
+        return _TRANSFER_BREAKDOWN_CACHE[pk]
+    e = _get_error(db, pk)
+    snap = e.data_snapshot or {}
+    to_id = snap.get("transfer_order")
+    if settings.data_source != "bigquery" or not to_id:
+        return {"available": False, "rows": []}
+    from ..rules.bq_finder import transfer_breakdown as bq_transfer_breakdown
+    try:
+        ds = get_datasource([e.last_seen_run])
+        rows = bq_transfer_breakdown(ds, to_id)
+    except Exception as ex:  # pragma: no cover - network/perm
+        return {"available": False, "error": str(ex)[:200], "rows": []}
+    result = {
+        "available": True, "transfer_order": to_id,
+        "out_count": sum(1 for r in rows if r["leg"] == "OUT"),
+        "in_count": sum(1 for r in rows if r["leg"] == "IN"),
+        "rows": rows,
+    }
+    _TRANSFER_BREAKDOWN_CACHE[pk] = result
     return result
 
 

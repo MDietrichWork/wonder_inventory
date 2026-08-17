@@ -173,11 +173,18 @@ def build_bootstrap(db) -> Dict:
     from .. import retention
     retention_days = retention.get_retention_days(db)
 
+    # XFER-04 / XFER-07 aging day-thresholds (DB-backed, Admin-editable).
+    from .. import xfer_aging
+    xfer_no_pick_days = xfer_aging.get_no_pick_days(db)
+    xfer_not_received_days = xfer_aging.get_not_received_days(db)
+
     return {
         "meta": {"today": today, "runDate": today, "jiraProject": settings.jira_project_key,
                  "jiraBaseUrl": (settings.jira_base_url if settings.ticket_sink == "jira" else None)},
         "settings": {"closedRetentionDays": retention_days,
-                     "closedPastWindow": retention.closed_past_window(db, retention_days)},
+                     "closedPastWindow": retention.closed_past_window(db, retention_days),
+                     "xferNoPickDays": xfer_no_pick_days,
+                     "xferNotReceivedDays": xfer_not_received_days},
         "facilities": reference.FACILITIES,
         "systems": reference.SYSTEMS,
         "sourceTables": ["unified_ledger", "po_table"],

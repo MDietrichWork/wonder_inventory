@@ -74,8 +74,23 @@ export async function purgeClosed(): Promise<{ purged: number; olderThanDays: nu
   return r.json();
 }
 
+export async function putXferAging(noPickDays: number, notReceivedDays: number): Promise<{ noPickDays: number; notReceivedDays: number }> {
+  const r = await fetch(`${API}/xfer-aging`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ noPickDays, notReceivedDays }),
+  });
+  if (!r.ok) throw new Error(`xfer aging update failed: ${r.status}`);
+  return r.json();
+}
+
 export async function getBreakdown(pk: number): Promise<any> {
   const r = await fetch(`${API}/exceptions/${pk}/breakdown`);
+  return r.json();
+}
+
+export async function getTransferBreakdown(pk: number): Promise<any> {
+  const r = await fetch(`${API}/exceptions/${pk}/transfer-breakdown`);
   return r.json();
 }
 
